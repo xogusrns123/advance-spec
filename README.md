@@ -93,14 +93,98 @@ scripts/
 
 ## Setup
 
+### Prerequisites
+
+- NVIDIA GPU (RTX 4090 x4 권장, CUDA 12.2+)
+- Docker + Docker Compose + NVIDIA Container Toolkit
+- HuggingFace 토큰 ([생성](https://huggingface.co/settings/tokens))
+
+### Docker 환경 구성 (권장)
+
 ```bash
-# Install uv (if not installed)
+# 1. HF 토큰 설정
+echo "HF_TOKEN=hf_your_token_here" > .env
+
+# 2. 빌드 & 컨테이너 시작
+docker compose up -d --build
+
+# 3. 컨테이너 진입
+docker compose exec workspace bash
+```
+
+모델 가중치는 `hf-cache` Docker 볼륨에 캐시되어 컨테이너 재생성 시에도 재다운로드 불필요.
+
+### SGLang 서버 실행
+
+컨테이너 안에서 실행:
+
+```bash
+# Vanilla (speculative decoding 없음)
+python3 -m sglang.launch_server \
+    --model-path zai-org/GLM-4.7-Flash \
+    --tp-size 4 \
+    --mem-fraction-static 0.8 \
+    --disable-cuda-graph \
+    --host 0.0.0.0 --port 30000
+
+# MTP (모델 내장 Multi-Token Prediction)
+python3 -m sglang.launch_server \
+    --model-path zai-org/GLM-4.7-Flash \
+    --tp-size 4 \
+    --speculative-algorithm EAGLE \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 4 \
+    --speculative-num-draft-tokens 16 \
+    --mem-fraction-static 0.8 \
+    --disable-cuda-graph \
+    --host 0.0.0.0 --port 30000
+
+# EAGLE3 (외부 드래프트 모델)
+python3 -m sglang.launch_server \
+    --model-path zai-org/GLM-4.7-Flash \
+    --tp-size 4 \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path thoughtworks/GLM-4.7-Flash-Eagle3 \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 4 \
+    --speculative-num-draft-tokens 16 \
+    --mem-fraction-static 0.8 \
+    --disable-cuda-graph \
+    --host 0.0.0.0 --port 30000
+```
+
+### API 요청 테스트
+
+```bash
+curl http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "zai-org/GLM-4.7-Flash",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "max_tokens": 128,
+    "temperature": 0
+  }'
+```
+
+### MoE 커널 튜닝 (선택)
+
+RTX 4090에 최적화된 MoE 커널 설정 생성:
+
+```bash
+git clone https://github.com/sgl-project/sglang.git /tmp/sglang-repo
+cd /tmp/sglang-repo/benchmark/kernels/fused_moe_triton
+python tuning_fused_moe_triton.py \
+    --model zai-org/GLM-4.7-Flash \
+    --tp-size 4 \
+    --tune
+cp *.json /opt/venv/lib/python3.11/site-packages/sglang/srt/layers/moe/fused_moe_triton/configs/triton_3_5_1/
+```
+
+### 로컬 환경 (Docker 없이)
+
+```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Create venv and install all dependencies (including SGLang)
 uv venv && uv pip install -e ".[dev]"
-
-# Activate
 source .venv/bin/activate
 ```
 
@@ -268,8 +352,26 @@ output.draft_latency_s      # wall-clock drafting time
 ## Settings
 
 - Batch size 1, greedy decoding (temperature=0)
-- Model: `meta-llama/Llama-3.1-8B-Instruct`
-- EAGLE-3 checkpoint: `yuhuili/EAGLE3-LLaMA3.1-Instruct-8B`
+- Target model: `zai-org/GLM-4.7-Flash` (31B MoE, 30B-A3B)
+- EAGLE-3 draft: `thoughtworks/GLM-4.7-Flash-Eagle3` (277MB)
 - Max tree budget: 64 tokens (shared across all proposers/baselines)
-- GPU: A100 80G+ recommended
+- GPU: RTX 4090 x4 (tp-size 4), CUDA 12.2
 - Lossless: tree verification uses standard rejection sampling, output distribution is identical to the target model
+
+## Docker Architecture
+
+```
+docker-compose.yml
+├── workspace (container: sglang-bench)
+│   ├── /workspace        ← 호스트 소스코드 마운트 (실시간 반영)
+│   ├── /opt/venv         ← Python venv (이미지 내, 마운트 영향 없음)
+│   └── /root/.cache/hf   ← 모델 캐시 (Docker volume, 영속)
+└── volumes
+    └── hf-cache          ← HuggingFace 모델 가중치 캐시
+```
+
+### 알려진 이슈
+
+- **CUDA Graph OOM**: RTX 4090에서 `--disable-cuda-graph` 필요. `--cuda-graph-max-bs 8`로 대체 가능
+- **SGLang + GLM4MoeLite**: `enable_a2a_moe` AttributeError 발생 — Dockerfile에서 자동 패치됨
+- **EAGLE3 context_length 불일치**: `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1` 환경변수 필요 — docker-compose.yml에 포함됨
