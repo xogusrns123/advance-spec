@@ -1,0 +1,31 @@
+[project]
+name = "hybrid-spec-decoding"
+version = "0.1.0"
+description = "Hybrid Speculative Decoding: EAGLE-3 + SuffixDecoding Tree Fusion"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "requests",
+    "pyyaml",
+    "matplotlib",
+    "datasets",
+    "sglang[all]",
+    "arctic-inference",
+]
+
+[project.scripts]
+spec-benchmark = "hybrid_spec_decoding.benchmarks.run_benchmark:main"
+spec-hybrid = "hybrid_spec_decoding.benchmarks.run_hybrid:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100

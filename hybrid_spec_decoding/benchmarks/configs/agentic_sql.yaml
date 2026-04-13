@@ -1,0 +1,20 @@
+dataset: agentic_sql
+max_samples: 50
+max_tokens: 512
+temperature: 0.0
+
+eagle3:
+  num_steps: 5
+  eagle_topk: 8
+  num_draft_tokens: 64
+
+# Higher suffix match for repetitive SQL patterns
+suffix:
+  match_len: 24
+  max_candidates: 15
+  adaptive_length: true
+
+fusion:
+  pruning_topk: 10
+  extension_depths: [1, 2, 3]
+  min_confidence: 0.2  # lower threshold for SQL patterns

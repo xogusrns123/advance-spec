@@ -1,0 +1,22 @@
+dataset: humaneval
+max_samples: 164  # full HumanEval
+max_tokens: 512
+temperature: 0.0
+
+# EAGLE-3 settings
+eagle3:
+  num_steps: 5
+  eagle_topk: 8
+  num_draft_tokens: 64
+
+# Suffix settings
+suffix:
+  match_len: 16
+  max_candidates: 10
+  adaptive_length: true
+
+# Fusion settings
+fusion:
+  pruning_topk: 10
+  extension_depths: [1, 2, 3]
+  min_confidence: 0.3
