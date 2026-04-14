@@ -40,17 +40,25 @@ RUN . /opt/venv/bin/activate && \
 COPY pyproject.toml uv.lock ./
 RUN . /opt/venv/bin/activate && \
     uv pip install numpy requests pyyaml matplotlib datasets pytest ruff \
-        arctic-inference ray
+        arctic-inference ray openai bfcl-eval tqdm
 
-# Layer 5: SGLang 패치 (Glm4MoeLiteModel enable_a2a_moe 버그)
+# Layer 5: SGLang 패치
+# 5a. Glm4MoeLiteModel enable_a2a_moe 버그
 RUN sed -i 's/if self.enable_a2a_moe and i > self.first_k_dense_replace:/if getattr(self, "enable_a2a_moe", False) and i > self.first_k_dense_replace:/' \
     /opt/venv/lib/python3.11/site-packages/sglang/srt/models/deepseek_v2.py
+# 5b. Oracle vanilla hook (SGLANG_ORACLE_VANILLA=1일 때만 활성화)
+RUN EAGLE_PY=/opt/venv/lib/python3.11/site-packages/sglang/srt/speculative/eagle_worker.py && \
+    SENTINEL="self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)" && \
+    if ! grep -q "oracle_patch" "$EAGLE_PY"; then \
+        sed -i "s|$SENTINEL|$SENTINEL\n\n        # Oracle vanilla patch: log draft tokens per step\n        import os as _os\n        if _os.environ.get('SGLANG_ORACLE_VANILLA', '0') == '1':\n            from hybrid_spec_decoding.sglang_integration.oracle_patch import patch_eagle_worker_full\n            patch_eagle_worker_full(self)|" "$EAGLE_PY"; \
+    fi
 
 # Layer 6: 소스코드
 COPY . .
 RUN . /opt/venv/bin/activate && \
     uv pip install --no-deps -e ".[dev]"
 
-ENV PATH="/opt/venv/bin:$PATH"
+ENV PATH="/opt/venv/bin:$PATH" \
+    SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 
 CMD ["bash"]

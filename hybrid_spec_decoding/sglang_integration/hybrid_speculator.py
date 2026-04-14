@@ -1,20 +1,19 @@
 """
-Hybrid Speculator: orchestrates EAGLE-3 + SuffixDecoding on SGLang.
+Hybrid Speculator: manages SuffixDecoding lifecycle.
 
 Provides:
-1. Patching SGLang's MultiLayerEagleWorkerV2 with suffix fusion
-2. Managing SuffixSpeculator lifecycle (start/stop/update per request)
-3. Hooking into SGLang's request lifecycle for suffix tree updates
+1. Suffix tree warming from corpus data
+2. Request lifecycle management (start/stop/update)
+3. SGLang launch command generation
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Sequence
 
 from ..suffix_decoding.speculator import SuffixSpeculator
-from .patched_eagle_worker import patch_eagle_worker
 
 __all__ = ["ExperimentConfig", "HybridConfig", "HybridSpeculator"]
 
@@ -31,20 +30,11 @@ class ExperimentConfig:
 
     # Tree budget
     max_tree_tokens: int = 64
-    num_draft_tokens: int = 64
-
-    # EAGLE-3 specific
-    num_steps: int = 5
-    eagle_topk: int = 8
+    num_draft_tokens: int = 16
 
     # Suffix specific
     suffix_match_len: int = 16
     max_candidates: int = 10
-
-    # Fusion
-    fusion_mode: str = "parallel"
-    pruning_topk: int = 10
-    suffix_budget_ratio: float = 0.3
 
     # Reproducibility
     seed: int = 42
@@ -52,7 +42,7 @@ class ExperimentConfig:
 
 @dataclass
 class HybridConfig:
-    """Configuration for hybrid speculative decoding."""
+    """Configuration for suffix speculative decoding."""
 
     # Suffix tree params
     max_tree_depth: int = 64
@@ -63,23 +53,16 @@ class HybridConfig:
     min_token_prob: float = 0.1
     use_tree_spec: bool = True
 
-    # Fusion params
-    fusion_mode: str = "parallel"        # parallel, sequential, combined
-    suffix_budget_ratio: float = 0.3     # fraction of draft budget for suffix
-    extension_depths: list[int] = field(default_factory=lambda: [1, 2, 3])
-    min_extension_confidence: float = 0.3
-
 
 class HybridSpeculator:
     """
-    Manages the lifecycle of hybrid EAGLE-3 + SuffixDecoding.
+    Manages the lifecycle of SuffixDecoding.
 
     Usage:
-        config = HybridConfig(fusion_mode="parallel")
+        config = HybridConfig()
         hybrid = HybridSpeculator(config)
-        hybrid.patch(sglang_spec_worker)
 
-        # Per-request lifecycle (called from scheduler hooks):
+        # Per-request lifecycle:
         hybrid.on_request_start(req_id, prompt_tokens)
         hybrid.on_tokens_generated(req_id, new_tokens)
         hybrid.on_request_end(req_id)
@@ -96,27 +79,6 @@ class HybridSpeculator:
             min_token_prob=config.min_token_prob,
             use_tree_spec=config.use_tree_spec,
         )
-        self._patched = False
-
-    def patch(self, spec_worker: Any) -> None:
-        """
-        Patch SGLang's MultiLayerEagleWorkerV2 with suffix fusion.
-
-        Args:
-            spec_worker: The SGLang speculative worker
-                (MultiLayerEagleWorkerV2 instance).
-        """
-        draft_worker = spec_worker.draft_worker
-        patch_eagle_worker(
-            draft_worker,
-            self.speculator,
-            fusion_mode=self.config.fusion_mode,
-            suffix_budget_ratio=self.config.suffix_budget_ratio,
-            extension_depths=self.config.extension_depths,
-            min_extension_confidence=self.config.min_extension_confidence,
-        )
-        self._patched = True
-        logger.info("HybridSpeculator: patched SGLang spec worker")
 
     # ---- Request lifecycle hooks ----
 
@@ -132,23 +94,47 @@ class HybridSpeculator:
         """Call when request completes. Cleans up local tree."""
         self.speculator.stop_request(req_id)
 
+    # ---- Warming ----
+
+    def warm_from_corpus(self, token_sequences: Sequence[Sequence[int]]) -> None:
+        """
+        Pre-populate the global suffix tree with tokenized sequences.
+
+        Call before serving to give the suffix tree initial data.
+        Each sequence is treated as a completed request: a minimal prompt
+        is registered, the rest is added as response, then the request
+        is stopped (promoting data to the global tree).
+
+        Args:
+            token_sequences: List of tokenized text sequences.
+        """
+        for i, seq in enumerate(token_sequences):
+            if len(seq) < 2:
+                continue
+            req_id = f"__warmup_{i}"
+            self.speculator.start_request(req_id, seq[:1])
+            self.speculator.add_active_response(req_id, seq[1:])
+            self.speculator.stop_request(req_id)
+        logger.info(f"Warmed suffix tree with {len(token_sequences)} sequences")
+
     # ---- Convenience ----
 
     @staticmethod
     def get_sglang_launch_cmd(
-        target_model: str = "meta-llama/Llama-3.1-8B-Instruct",
-        draft_model: str = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
-        num_steps: int = 5,
-        eagle_topk: int = 8,
-        num_draft_tokens: int = 64,
+        target_model: str = "zai-org/GLM-4.7-Flash",
+        tp_size: int = 4,
+        num_draft_tokens: int = 16,
+        mem_fraction_static: float = 0.8,
+        port: int = 30000,
     ) -> str:
-        """Generate the SGLang server launch command."""
+        """Generate the SGLang server launch command for suffix decoding."""
         return (
-            f"python3 -m sglang.launch_server "
-            f"--model {target_model} "
-            f"--speculative-algorithm EAGLE3 "
-            f"--speculative-draft-model-path {draft_model} "
-            f"--speculative-num-steps {num_steps} "
-            f"--speculative-eagle-topk {eagle_topk} "
-            f"--speculative-num-draft-tokens {num_draft_tokens}"
+            f"python3 -m hybrid_spec_decoding.sglang_integration.install_hook -- "
+            f"--model-path {target_model} "
+            f"--tp-size {tp_size} "
+            f"--speculative-algorithm SUFFIX "
+            f"--speculative-num-draft-tokens {num_draft_tokens} "
+            f"--mem-fraction-static {mem_fraction_static} "
+            f"--disable-cuda-graph "
+            f"--host 0.0.0.0 --port {port}"
         )
