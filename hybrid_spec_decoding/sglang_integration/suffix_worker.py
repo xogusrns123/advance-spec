@@ -80,6 +80,14 @@ class SuffixWorker:
             f"SuffixWorker initialized (draft_token_num={self.draft_token_num})"
         )
 
+        # Oracle verify patch: replace speculation with pre-built union tries
+        from hybrid_spec_decoding.sglang_integration.oracle_verify_patch import (
+            is_verify_tries_enabled,
+            patch_suffix_worker_for_verify,
+        )
+        if is_verify_tries_enabled():
+            patch_suffix_worker_for_verify(self)
+
     def clear_cache_pool(self):
         self.suffix_cache = SuffixDecodingCache(
             max_tree_depth=64,

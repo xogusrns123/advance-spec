@@ -72,66 +72,149 @@ python3 -m hybrid_spec_decoding.analysis.bfcl_agent \
     --num-requests "$NUM_REQUESTS" \
     --max-iterations "$MAX_ITERATIONS"
 
-echo "Stopping server..."
+echo "Stopping EAGLE3 server..."
 kill $SERVER_PID 2>/dev/null || true
 wait $SERVER_PID 2>/dev/null || true
 
-# ── Offline: Union trie + Simulation ───────────────────────────────
+# ── Offline: Build union tries ─────────────────────────────────────
 
 echo ""
-echo "[Offline] Full pipeline"
+echo "[Offline] Building union tries..."
 python3 -c "
-import json, time, os
-from collections import Counter
-
-OUTPUT_DIR = '$OUTPUT_DIR'
-
-# Load data
-with open(f'{OUTPUT_DIR}/agent_results_eagle3.json') as f:
-    data = json.load(f)
-
+import json
 from hybrid_spec_decoding.analysis.run_oracle_sim import extract_requests
 from hybrid_spec_decoding.analysis.collect_union_trie import collect_union_tries
 from arctic_inference.suffix_decoding import SuffixDecodingCache
+
+with open('$OUTPUT_DIR/agent_results_eagle3.json') as f:
+    data = json.load(f)
+requests = extract_requests(data, set())
+cache = SuffixDecodingCache(max_tree_depth=64, max_cached_requests=100000)
+records = collect_union_tries(requests, cache)
+with open('$OUTPUT_DIR/union_trie_data.jsonl', 'w') as f:
+    for rec in records:
+        f.write(json.dumps(rec) + '\n')
+print(f'Union tries: {len(records)} steps')
+"
+
+# ── Round 2: Verify union tries via SUFFIX server ──────────────────
+
+echo ""
+echo "[Round 2] Verifying union tries (SUFFIX server)"
+
+# Extract trajectory for replay
+python3 -m hybrid_spec_decoding.analysis.extract_trajectory \
+    --agent-results "$OUTPUT_DIR/agent_results_eagle3.json" \
+    --output "$OUTPUT_DIR/trajectory.json"
+
+export SGLANG_ORACLE_REPLAY="$OUTPUT_DIR/trajectory.json"
+export SGLANG_ORACLE_VERIFY_TRIES="$OUTPUT_DIR/union_trie_data.jsonl"
+> /tmp/sglang_oracle_verify_p_t.jsonl
+
+echo "Starting SUFFIX server (verify mode)..."
+python3 -m sglang.launch_server \
+    --model-path "$MODEL" --tp-size 1 \
+    --speculative-algorithm SUFFIX \
+    --speculative-num-draft-tokens 16 \
+    --mem-fraction-static 0.85 \
+    --disable-cuda-graph \
+    --host 0.0.0.0 --port $PORT &
+SERVER_PID=$!
+
+echo "Waiting for server..."
+for i in $(seq 1 120); do
+    if curl -s http://localhost:$PORT/health > /dev/null 2>&1; then
+        echo "Server ready!"
+        break
+    fi
+    if ! kill -0 $SERVER_PID 2>/dev/null; then
+        echo "Server died!" && exit 1
+    fi
+    sleep 3
+done
+
+echo "Running BFCL agent (replay + verify)..."
+python3 -m hybrid_spec_decoding.analysis.bfcl_agent \
+    --url "http://localhost:$PORT/v1" \
+    --model "$MODEL" \
+    --input-file data/bfcl_multi_turn/dataset.jsonl \
+    --output-file "$OUTPUT_DIR/agent_results_verify.json" \
+    --num-requests "$NUM_REQUESTS" \
+    --max-iterations "$MAX_ITERATIONS" \
+    --replay "$OUTPUT_DIR/agent_results_eagle3.json"
+
+echo "Stopping SUFFIX server..."
+kill $SERVER_PID 2>/dev/null || true
+wait $SERVER_PID 2>/dev/null || true
+unset SGLANG_ORACLE_REPLAY SGLANG_ORACLE_VERIFY_TRIES
+
+# ── Offline: Merge p_t + Simulation ────────────────────────────────
+
+echo ""
+echo "[Offline] Merge p_t + Simulation"
+python3 -c "
+import json, os
+
+OUTPUT_DIR = '$OUTPUT_DIR'
+
+# Load union trie records
+records = []
+with open(f'{OUTPUT_DIR}/union_trie_data.jsonl') as f:
+    for line in f:
+        if line.strip():
+            records.append(json.loads(line))
+print(f'Union trie records: {len(records)}')
+
+# Load verification p_t
+p_t_map = {}
+verify_path = '/tmp/sglang_oracle_verify_p_t.jsonl'
+if os.path.exists(verify_path):
+    with open(verify_path) as f:
+        for line in f:
+            if line.strip():
+                entry = json.loads(line)
+                key = (entry['request_id'], entry['call_idx'], entry['step_idx'])
+                p_t_map[key] = entry['p_t']
+print(f'Verification p_t entries: {len(p_t_map)}')
+
+# Merge p_t into records
+n_merged = 0
+for rec in records:
+    key = (rec['request_id'], rec.get('call_idx', 0), rec.get('step_idx', 0))
+    pt = p_t_map.get(key)
+    if pt is not None:
+        rec['p_t'] = pt
+        n_merged += 1
+print(f'Merged p_t: {n_merged}/{len(records)}')
+
+# Add oracle p_t
 from hybrid_spec_decoding.analysis.collect_target_probs import enrich_with_ground_truth_p_t
+enrich_with_ground_truth_p_t(records)
+
+# Simulation
 from hybrid_spec_decoding.analysis.run_tree_oracle_sim import (
     evaluate_choose_one, evaluate_expected_utility,
     evaluate_choose_one_at_budget, print_summary,
 )
 
-# Extract
-requests = extract_requests(data, set())
-q = data['questions'][0]
-entries = sum(len(s.get('spec_decode',{}).get('oracle_vanilla_entries',[])) for s in q['agent_metrics']['steps'])
-n_tree = sum(1 for s in q['agent_metrics']['steps']
-             for e in s.get('spec_decode',{}).get('oracle_vanilla_entries',[])
-             if e.get('eagle3_tree'))
-n_branch = sum(1 for s in q['agent_metrics']['steps']
-               for e in s.get('spec_decode',{}).get('oracle_vanilla_entries',[])
-               if e.get('eagle3_tree') and any(c > 1 for c in Counter(e['eagle3_tree']['parents']).values()))
-print(f'Entries: {entries}, with tree: {n_tree}, with branching: {n_branch}')
-
-# Union trie
-cache = SuffixDecodingCache(max_tree_depth=64, max_cached_requests=100000)
-records = collect_union_tries(requests, cache)
-total_nodes = sum(len(r['union_trie']['token_ids']) for r in records)
-proposer_counts = {}
-for r in records:
-    for name in r['per_proposer']:
-        proposer_counts[name] = proposer_counts.get(name, 0) + 1
-print(f'Steps: {len(records)}, union nodes: {total_nodes} (avg {total_nodes/len(records):.1f})')
-print(f'Proposers: {proposer_counts}')
-
-# Oracle simulation
-enrich_with_ground_truth_p_t(records)
 choose_one = evaluate_choose_one(records)
 budgets = [1, 2, 3, 4, 5, 8, 10, 15]
-eu_oracle = evaluate_expected_utility(records, budgets, 'p_t_oracle')
 c1b = evaluate_choose_one_at_budget(records, budgets)
+
+# Real p_t (from verification)
+has_real_pt = any('p_t' in r for r in records)
+if has_real_pt:
+    eu_real = evaluate_expected_utility(records, budgets, 'p_t')
+    print('\n=== Real p_t (verification logits) ===')
+    print_summary(choose_one, eu_real, c1b, budgets, 'p_t')
+
+# Oracle p_t
+eu_oracle = evaluate_expected_utility(records, budgets, 'p_t_oracle')
+print('\n=== Oracle p_t ===')
 print_summary(choose_one, eu_oracle, c1b, budgets, 'p_t_oracle')
 
-# Save
-with open(f'{OUTPUT_DIR}/union_trie_data.jsonl', 'w') as f:
+# Save enriched data
+with open(f'{OUTPUT_DIR}/union_trie_data_with_pt.jsonl', 'w') as f:
     for rec in records:
         f.write(json.dumps(rec) + '\n')
 
@@ -140,9 +223,7 @@ output = {
         'model': '$MODEL',
         'draft_model': '$DRAFT_MODEL',
         'n_steps': len(records),
-        'n_entries': entries,
-        'n_branching': n_branch,
-        'proposer_counts': proposer_counts,
+        'n_merged_p_t': n_merged,
     },
     'choose_one': {'aggregate': choose_one['aggregate']},
     'expected_utility_oracle': {

@@ -369,6 +369,49 @@ def collect_p_t_for_records(
 
 
 # ---------------------------------------------------------------------------
+# Server-based p_t collection
+# ---------------------------------------------------------------------------
+
+def collect_p_t_via_server(
+    records: List[dict],
+    server_url: str,
+) -> None:
+    """Collect p_t by sending requests to verify_server.py."""
+    import requests as http_requests
+
+    n = len(records)
+    t0 = time.time()
+    url = f"{server_url.rstrip('/')}/verify_tree"
+
+    for i, rec in enumerate(records):
+        context_ids = rec.get("context_token_ids", [])
+        trie_tids = rec["union_trie"]["token_ids"]
+        trie_parents = rec["union_trie"]["parents"]
+
+        if not context_ids or not trie_tids:
+            rec["p_t"] = [0.0] * len(trie_tids)
+            continue
+
+        payload = {
+            "context_token_ids": context_ids,
+            "tree_token_ids": trie_tids,
+            "tree_parents": trie_parents,
+            "request_id": rec.get("request_id"),
+            "call_idx": rec.get("call_idx"),
+        }
+        resp = http_requests.post(url, json=payload, timeout=30)
+        resp.raise_for_status()
+        rec["p_t"] = resp.json()["p_t"]
+
+        if (i + 1) % 100 == 0 or i == n - 1:
+            elapsed = time.time() - t0
+            rate = (i + 1) / elapsed
+            eta = (n - i - 1) / rate if rate > 0 else 0
+            print(f"  [{i+1}/{n}] {rate:.1f} steps/s, ETA {eta:.0f}s",
+                  file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # Oracle p_t (ground truth baseline)
 # ---------------------------------------------------------------------------
 
@@ -417,7 +460,9 @@ def main():
     parser.add_argument("--oracle-only", action="store_true",
                         help="Only add ground-truth oracle p_t (no model needed)")
     parser.add_argument("--model", default=None,
-                        help="HuggingFace model name or path")
+                        help="HuggingFace model name or path (local mode)")
+    parser.add_argument("--verify-server-url", default=None,
+                        help="URL of verify_server.py (e.g. http://localhost:8100)")
     parser.add_argument("--device", default="cuda",
                         help="Device for model (default: cuda)")
     parser.add_argument("--limit", type=int, default=None,
@@ -441,23 +486,8 @@ def main():
     print(f"Added oracle p_t (ground truth)", file=sys.stderr)
 
     if not args.oracle_only:
-        if not args.model:
-            parser.error("--model required unless --oracle-only")
-        if not HAS_TORCH:
-            parser.error("PyTorch required for model-based p_t collection")
-
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
-        print(f"Loading model: {args.model}", file=sys.stderr)
-        tokenizer = AutoTokenizer.from_pretrained(args.model,
-                                                   trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model,
-            dtype=torch.float16,
-            trust_remote_code=True,
-            device_map="auto",
-        )
-        print(f"Model loaded on {args.device}", file=sys.stderr)
+        if not args.model and not args.verify_server_url:
+            parser.error("--model or --verify-server-url required unless --oracle-only")
 
         # Check context_token_ids availability
         has_context = any("context_token_ids" in r for r in records)
@@ -468,7 +498,25 @@ def main():
             )
 
         t0 = time.time()
-        collect_p_t_for_records(records, model, tokenizer, device=args.device)
+
+        if args.verify_server_url:
+            # Server mode: send requests to verify_server.py
+            collect_p_t_via_server(records, args.verify_server_url)
+        else:
+            # Local mode: load model directly
+            if not HAS_TORCH:
+                parser.error("PyTorch required for local model-based p_t collection")
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            print(f"Loading model: {args.model}", file=sys.stderr)
+            tokenizer = AutoTokenizer.from_pretrained(args.model,
+                                                       trust_remote_code=True)
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model, dtype=torch.float16,
+                trust_remote_code=True, device_map="auto",
+            )
+            print(f"Model loaded on {args.device}", file=sys.stderr)
+            collect_p_t_for_records(records, model, tokenizer, device=args.device)
+
         print(f"p_t collection: {time.time() - t0:.1f}s", file=sys.stderr)
 
         # Sanity check: compare with oracle
