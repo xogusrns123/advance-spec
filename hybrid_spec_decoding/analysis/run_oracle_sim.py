@@ -359,9 +359,10 @@ def load_exclude_ids(path):
 
 
 def _extract_entries(entries):
-    """Extract tokens and eagle3 drafts from oracle_vanilla_entries."""
+    """Extract tokens, eagle3 drafts, and eagle3 trees from oracle_vanilla_entries."""
     call_tokens = []
     call_eagle3s = []
+    call_eagle3_trees = []
     for e in entries:
         toks = (e["tokens"][0]
                 if e.get("tokens") and e["tokens"] else [])
@@ -369,7 +370,8 @@ def _extract_entries(entries):
         call_eagle3s.append(
             e["eagle3"][0]
             if e.get("eagle3") and e["eagle3"] else [])
-    return call_tokens, call_eagle3s
+        call_eagle3_trees.append(e.get("eagle3_tree"))
+    return call_tokens, call_eagle3s, call_eagle3_trees
 
 
 def _langchain_to_openai_messages(messages):
@@ -524,15 +526,17 @@ def _extract_bfcl(questions, exclude_ids, dm_by_id=None,
 
         per_call_tokens = []
         per_call_eagle3s = []
+        per_call_eagle3_trees = []
 
         for s in q["agent_metrics"]["steps"]:
             entries = s.get("spec_decode", {}).get(
                 "oracle_vanilla_entries", [])
             if not entries:
                 continue
-            ct, ce = _extract_entries(entries)
+            ct, ce, c_trees = _extract_entries(entries)
             per_call_tokens.append(ct)
             per_call_eagle3s.append(ce)
+            per_call_eagle3_trees.append(c_trees)
 
         # Reconstruct prompt token IDs for suffix cache local tree
         per_call_prompt_ids = None
@@ -551,7 +555,12 @@ def _extract_bfcl(questions, exclude_ids, dm_by_id=None,
                     per_call_prompt_ids = _reconstruct_bfcl_prompts(
                         bfcl_dataset[bfcl_id], resp, tokenizer)
 
-        requests.append({
+        # Check if any eagle3_tree data is present
+        has_trees = any(
+            t is not None for trees in per_call_eagle3_trees for t in trees
+        )
+
+        req_data = {
             "bfcl_id": bfcl_id,
             "category": q.get("category", ""),
             "per_call_tokens": per_call_tokens,
@@ -559,7 +568,10 @@ def _extract_bfcl(questions, exclude_ids, dm_by_id=None,
             "per_call_prompt_ids": per_call_prompt_ids,
             "n_tokens": sum(len(ct) for ct in per_call_tokens),
             "draft_model_drafts": dm_by_id.get(bfcl_id) if dm_by_id else None,
-        })
+        }
+        if has_trees:
+            req_data["per_call_eagle3_trees"] = per_call_eagle3_trees
+        requests.append(req_data)
     return requests
 
 
@@ -586,6 +598,7 @@ def _extract_online(data, exclude_ids, dm_by_id=None,
 
             per_call_tokens = []
             per_call_eagle3s = []
+            per_call_eagle3_trees = []
 
             for turn in q["turns"]:
                 if isinstance(turn, dict):
@@ -593,9 +606,10 @@ def _extract_online(data, exclude_ids, dm_by_id=None,
                         "oracle_vanilla_entries", [])
                     if not entries:
                         continue
-                    ct, ce = _extract_entries(entries)
+                    ct, ce, c_trees = _extract_entries(entries)
                     per_call_tokens.append(ct)
                     per_call_eagle3s.append(ce)
+                    per_call_eagle3_trees.append(c_trees)
 
             if not per_call_tokens:
                 continue
@@ -608,7 +622,10 @@ def _extract_online(data, exclude_ids, dm_by_id=None,
                     per_call_prompt_ids = _reconstruct_specbench_prompts(
                         ds_entry, q, tokenizer)
 
-            requests.append({
+            has_trees = any(
+                t is not None for trees in per_call_eagle3_trees for t in trees
+            )
+            req_data = {
                 "bfcl_id": qid,
                 "category": q.get("category", ""),
                 "per_call_tokens": per_call_tokens,
@@ -616,7 +633,10 @@ def _extract_online(data, exclude_ids, dm_by_id=None,
                 "per_call_prompt_ids": per_call_prompt_ids,
                 "n_tokens": sum(len(ct) for ct in per_call_tokens),
                 "draft_model_drafts": dm_by_id.get(qid) if dm_by_id else None,
-            })
+            }
+            if has_trees:
+                req_data["per_call_eagle3_trees"] = per_call_eagle3_trees
+            requests.append(req_data)
     else:
         # Fallback: per_request[] (flat, one entry per LLM call)
         for ri, r in enumerate(per_request):
@@ -625,11 +645,12 @@ def _extract_online(data, exclude_ids, dm_by_id=None,
             if not entries:
                 continue
 
-            ct, ce = _extract_entries(entries)
+            ct, ce, c_trees = _extract_entries(entries)
             qid = str(ri)
             category = q_map.get(qid, "") if ri < len(questions) else ""
 
-            requests.append({
+            has_trees = any(t is not None for t in c_trees)
+            req_data = {
                 "bfcl_id": qid,
                 "category": category,
                 "per_call_tokens": [ct],
@@ -637,7 +658,10 @@ def _extract_online(data, exclude_ids, dm_by_id=None,
                 "per_call_prompt_ids": None,
                 "n_tokens": len(ct),
                 "draft_model_drafts": dm_by_id.get(qid) if dm_by_id else None,
-            })
+            }
+            if has_trees:
+                req_data["per_call_eagle3_trees"] = [c_trees]
+            requests.append(req_data)
 
     return requests
 

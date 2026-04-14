@@ -3,13 +3,17 @@ Oracle Vanilla Patch for SGLang EAGLE3/MTP Worker.
 
 Patches verify_tree_greedy_func to force accept_length=0, ensuring
 1-token/step advance with correct batch state updates.
+Works for both EAGLEWorker (EAGLE3) and MultiLayerEagleWorker (MTP)
+since they share the same EagleVerifyInput format.
 
 Two modes:
 - Vanilla (SGLANG_ORACLE_VANILLA=1): generate trajectory + log drafts
 - Replay (SGLANG_ORACLE_REPLAY=path): follow pre-recorded trajectory + log drafts
 
 Output format (per line):
-    {"eagle3": [[flat_draft_ids...]], "tokens": [[next_token]], "req_id": "..."}
+    {"eagle3": [[flat_draft_ids...]], "tokens": [[next_token]],
+     "req_id": "...", "proposer": "eagle3"|"mtp",
+     "eagle3_tree": {"token_ids": [...], "parents": [...]}}
 """
 
 from __future__ import annotations
@@ -90,11 +94,105 @@ class TrajectoryState:
 
 
 # ---------------------------------------------------------------------------
+# Tree structure extraction
+# ---------------------------------------------------------------------------
+
+def _extract_eagle3_tree(
+    draft_cpu: list,
+    retrive_next_token: "torch.Tensor",
+    retrive_next_sibling: "torch.Tensor",
+    req_idx: int,
+    num_draft: int,
+) -> dict | None:
+    """Extract (token_ids, parents) from EAGLE3 draft tree.
+
+    Uses retrive_next_token (first child) and retrive_next_sibling
+    (next sibling) to walk the tree structure via BFS.
+
+    Position 0 in each request's candidates is the verified root token.
+    Positions 1..num_draft-1 are draft nodes.
+
+    Returns {"token_ids": [...], "parents": [...]} where parents use
+    -1 for children of root, and indices are 0-based into the returned
+    token_ids (which excludes the root).
+    """
+    try:
+        req_start = req_idx * num_draft
+        req_end = req_start + num_draft
+
+        if req_end > len(draft_cpu):
+            return None
+
+        candidates = draft_cpu[req_start:req_end]
+        rnt = retrive_next_token[req_idx].tolist()   # first child
+        rns = retrive_next_sibling[req_idx].tolist()  # next sibling
+
+        # Global offset for this request in the batch
+        req_offset = req_idx * num_draft
+
+        # BFS from root (position 0) to collect tree structure
+        # pos_to_idx: maps candidates position → output index
+        token_ids = []
+        parents = []
+        pos_to_idx = {}
+
+        # Queue: (candidates_position, parent_output_index)
+        # Start with root's children
+        queue = []
+        first_child = rnt[0]
+        if first_child >= 0:
+            # Convert global index to request-local
+            local_first = first_child - req_offset
+            queue.append((local_first, -1))
+
+        while queue:
+            pos, parent_idx = queue.pop(0)
+
+            if pos < 0 or pos >= num_draft:
+                continue
+            tid = candidates[pos]
+            if tid == 0:
+                continue
+
+            idx = len(token_ids)
+            pos_to_idx[pos] = idx
+            token_ids.append(tid)
+            parents.append(parent_idx)
+
+            # First child of this node
+            child = rnt[pos]
+            if child >= 0:
+                local_child = child - req_offset
+                queue.append((local_child, idx))
+
+            # Next sibling (shares same parent)
+            sib = rns[pos]
+            if sib >= 0:
+                local_sib = sib - req_offset
+                queue.append((local_sib, parent_idx))
+
+        if not token_ids:
+            return None
+
+        return {"token_ids": token_ids, "parents": parents}
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Main patch
 # ---------------------------------------------------------------------------
 
+def _detect_proposer_type(eagle_worker) -> str:
+    """Detect whether the worker is EAGLE3 or MTP."""
+    cls_name = type(eagle_worker).__name__
+    if "MultiLayer" in cls_name:
+        return "mtp"
+    return "eagle3"
+
+
 def patch_eagle_worker_full(eagle_worker: "EAGLEWorker") -> None:
-    """Apply oracle patch.
+    """Apply oracle patch.  Works for both EAGLEWorker and MultiLayerEagleWorker.
 
     Strategy: Patch verify_tree_greedy_func (the core acceptance function)
     to always return accept_length=0. This way verify() naturally processes
@@ -103,6 +201,7 @@ def patch_eagle_worker_full(eagle_worker: "EAGLEWorker") -> None:
 
     No rollback needed — the acceptance decision is intercepted at the source.
     """
+    eagle_worker._oracle_proposer_type = _detect_proposer_type(eagle_worker)
     replay_state = None
     if ORACLE_REPLAY_PATH:
         trajectory = _load_trajectory(ORACLE_REPLAY_PATH)
@@ -159,7 +258,7 @@ def _patch_verify_greedy_func() -> None:
 
 
 def _patch_draft_stash(eagle_worker: "EAGLEWorker") -> None:
-    """Patch draft() to stash full draft tree."""
+    """Patch draft() to stash full draft tree (token_ids + tree structure)."""
     original_draft = eagle_worker.draft
 
     def patched_draft(batch: "ScheduleBatch") -> "EagleVerifyInput":
@@ -171,10 +270,25 @@ def _patch_draft_stash(eagle_worker: "EAGLEWorker") -> None:
                 eagle_worker._oracle_stashed_draft = dt.cpu().clone()
                 eagle_worker._oracle_stashed_num_draft = spec_info.draft_token_num
                 eagle_worker._oracle_stashed_topk = spec_info.topk
+                # Stash tree navigation indices for full tree extraction
+                eagle_worker._oracle_stashed_retrive_next_token = (
+                    spec_info.retrive_next_token.cpu().clone()
+                    if getattr(spec_info, "retrive_next_token", None) is not None
+                    else None
+                )
+                eagle_worker._oracle_stashed_retrive_next_sibling = (
+                    spec_info.retrive_next_sibling.cpu().clone()
+                    if getattr(spec_info, "retrive_next_sibling", None) is not None
+                    else None
+                )
             else:
                 eagle_worker._oracle_stashed_draft = None
+                eagle_worker._oracle_stashed_retrive_next_token = None
+                eagle_worker._oracle_stashed_retrive_next_sibling = None
         except Exception:
             eagle_worker._oracle_stashed_draft = None
+            eagle_worker._oracle_stashed_retrive_next_token = None
+            eagle_worker._oracle_stashed_retrive_next_sibling = None
 
         return spec_info
 
@@ -246,17 +360,28 @@ def _patch_forward_log(
 
                 # draft_token layout: [root_verified, draft_0, draft_1, ...]
                 # root_verified is the previous step's token, skip it
-                # TODO: store full tree structure for accurate simulation
                 d_start = i * num_draft + 1  # +1 to skip root
                 d_end = (i + 1) * num_draft
                 req_draft = draft_cpu[d_start:d_end] if d_end <= len(draft_cpu) else []
 
-                # TODO: add "eagle3_tree": {"token_ids": [...], "parents": [...]}
-                _log_entry({
+                # Extract full tree structure
+                eagle3_tree = None
+                rnt = getattr(eagle_worker, "_oracle_stashed_retrive_next_token", None)
+                rns = getattr(eagle_worker, "_oracle_stashed_retrive_next_sibling", None)
+                if rnt is not None and rns is not None:
+                    eagle3_tree = _extract_eagle3_tree(
+                        draft_cpu, rnt, rns, i, num_draft)
+
+                proposer = getattr(eagle_worker, "_oracle_proposer_type", "eagle3")
+                entry = {
                     "eagle3": [req_draft],
                     "tokens": [[vanilla_token]],
                     "req_id": req_id,
-                })
+                    "proposer": proposer,
+                }
+                if eagle3_tree is not None:
+                    entry["eagle3_tree"] = eagle3_tree
+                _log_entry(entry)
 
             eagle_worker._oracle_stashed_draft = None
 

@@ -156,42 +156,82 @@ def _patch_scheduler(path: Path) -> None:
 
 def install_oracle_patch() -> None:
     """
-    Install oracle vanilla patch that hooks EAGLEWorker.__init_subclass__
-    to auto-patch instances for draft token logging.
+    Install oracle vanilla patch that hooks EAGLEWorker and MultiLayerEagleWorker
+    __init__ to auto-patch instances for draft token logging.
 
     Activated by SGLANG_ORACLE_VANILLA=1 env var.
-    Patches EAGLEWorker class so that after __init__, the instance
-    gets oracle logging applied via monkey-patch.
+    Both workers use the same EagleVerifyInput format, so the same
+    patch_eagle_worker_full() works for both.
     """
     import os
     if os.environ.get("SGLANG_ORACLE_VANILLA", "0") != "1":
         return
 
     root = _get_sglang_root()
-    eagle_path = root / "srt" / "speculative" / "eagle_worker.py"
-    text = eagle_path.read_text()
+
+    # Patch EAGLEWorker (EAGLE3)
+    _inject_oracle_into_worker(
+        root / "srt" / "speculative" / "eagle_worker.py",
+        "EAGLEWorker",
+    )
+
+    # Patch MultiLayerEagleWorker (MTP) — same verify interface
+    _inject_oracle_into_worker(
+        root / "srt" / "speculative" / "multi_layer_eagle_worker.py",
+        "MultiLayerEagleWorker",
+    )
+
+
+def _inject_oracle_into_worker(worker_path: Path, worker_name: str) -> None:
+    """Inject oracle patch call at the end of a worker's __init__."""
+    if not worker_path.exists():
+        logger.warning(f"{worker_path} not found, skipping oracle patch for {worker_name}")
+        return
+
+    text = worker_path.read_text()
 
     if "oracle_patch" in text:
         return  # already patched
 
-    # Inject oracle patch call at the end of EAGLEWorker.__init__
-    # Find the last line of __init__ (self.extend_lens = ...)
+    # Ensure `from __future__ import annotations` so runtime type hints
+    # (e.g. -> ModelRunner in TYPE_CHECKING block) don't raise NameError.
+    if "from __future__ import annotations" not in text:
+        # Insert after the license header comment block
+        lines = text.split("\n")
+        insert_idx = 0
+        for i, line in enumerate(lines):
+            if not line.startswith("#") and line.strip():
+                insert_idx = i
+                break
+        lines.insert(insert_idx, "from __future__ import annotations")
+        text = "\n".join(lines)
+
+    # Find the sentinel: last assignment in __init__
+    # EAGLEWorker: self.extend_lens = torch.empty(...)
+    # MultiLayerEagleWorker: may differ, try common patterns
     sentinel = "self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)"
     if sentinel not in text:
-        logger.warning("Could not find EAGLEWorker.__init__ sentinel for oracle patch")
-        return
+        # Fallback: try to find end of __init__ by looking for the pattern
+        # "self.extend_lens = ..." which both workers have
+        import re
+        match = re.search(r'(self\.extend_lens\s*=\s*[^\n]+)', text)
+        if match:
+            sentinel = match.group(1)
+        else:
+            logger.warning(f"Could not find __init__ sentinel in {worker_path} for oracle patch")
+            return
 
     patch_code = (
         sentinel + "\n\n"
-        "        # Oracle vanilla patch: log draft tokens per step\n"
+        f"        # Oracle vanilla patch: log draft tokens per step ({worker_name})\n"
         "        import os as _os\n"
         "        if _os.environ.get('SGLANG_ORACLE_VANILLA', '0') == '1':\n"
         "            from hybrid_spec_decoding.sglang_integration.oracle_patch import patch_eagle_worker_full\n"
         "            patch_eagle_worker_full(self)\n"
     )
     text = text.replace(sentinel, patch_code)
-    eagle_path.write_text(text)
-    logger.info(f"Installed oracle vanilla patch into {eagle_path}")
+    worker_path.write_text(text)
+    logger.info(f"Installed oracle vanilla patch into {worker_path} ({worker_name})")
 
 
 def _start_process_watchdog(max_children: int = 50, check_interval: int = 5):
