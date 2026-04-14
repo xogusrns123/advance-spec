@@ -134,6 +134,7 @@ def _extract_eagle3_tree(
         # pos_to_idx: maps candidates position → output index
         token_ids = []
         parents = []
+        candidates_positions = []  # candidates pos for each output node
         pos_to_idx = {}
 
         # Queue: (candidates_position, parent_output_index)
@@ -158,6 +159,7 @@ def _extract_eagle3_tree(
             pos_to_idx[pos] = idx
             token_ids.append(tid)
             parents.append(parent_idx)
+            candidates_positions.append(pos)
 
             # First child of this node
             child = rnt[pos]
@@ -174,7 +176,64 @@ def _extract_eagle3_tree(
         if not token_ids:
             return None
 
-        return {"token_ids": token_ids, "parents": parents}
+        return {
+            "token_ids": token_ids,
+            "parents": parents,
+            "candidates_positions": candidates_positions,
+        }
+    except Exception:
+        return None
+
+
+def _extract_tree_p_t(
+    verify_logits: "torch.Tensor",
+    draft_cpu: list,
+    eagle3_tree: dict,
+    req_idx: int,
+    num_draft: int,
+) -> list | None:
+    """Extract per-node p_t from verification logits.
+
+    verify_logits shape: [bs * num_draft, vocab_size]
+    Each position's logits predict the NEXT token after that position.
+    So p_t(node) = softmax(logits[parent_candidates_pos])[node_token_id].
+
+    eagle3_tree contains candidates_positions mapping each tree node
+    to its candidates position (0-based within this request).
+    """
+    import torch
+    import torch.nn.functional as F
+
+    try:
+        token_ids = eagle3_tree["token_ids"]
+        parents = eagle3_tree["parents"]
+        cand_pos = eagle3_tree.get("candidates_positions")
+        n = len(token_ids)
+
+        if n == 0 or cand_pos is None:
+            return None
+
+        req_offset = req_idx * num_draft
+        p_t = []
+
+        for i in range(n):
+            tid = token_ids[i]
+
+            if parents[i] == -1:
+                # Root child: parent is candidates position 0
+                parent_global = req_offset + 0
+            else:
+                # Parent is tree node parents[i], whose candidates pos is cand_pos[parents[i]]
+                parent_global = req_offset + cand_pos[parents[i]]
+
+            if parent_global >= len(verify_logits):
+                p_t.append(0.0)
+                continue
+
+            probs = F.softmax(verify_logits[parent_global].float(), dim=-1)
+            p_t.append(probs[tid].item())
+
+        return p_t
     except Exception:
         return None
 
@@ -210,6 +269,7 @@ def patch_eagle_worker_full(eagle_worker: "EAGLEWorker") -> None:
 
     _patch_verify_greedy_func()
     _patch_draft_stash(eagle_worker)
+    _patch_verify_logits(eagle_worker)
     _patch_forward_log(eagle_worker, replay_state)
 
     mode = "REPLAY" if replay_state else "VANILLA"
@@ -295,6 +355,40 @@ def _patch_draft_stash(eagle_worker: "EAGLEWorker") -> None:
     eagle_worker.draft = patched_draft
 
 
+def _patch_verify_logits(eagle_worker: "EAGLEWorker") -> None:
+    """Patch verify() to stash full target-model logits before acceptance filtering."""
+    original_verify = eagle_worker.verify
+
+    def patched_verify(batch, spec_info):
+        result = original_verify(batch, spec_info)
+        # result is (logits_output, verify_output, model_worker_batch, can_run_cuda_graph)
+        # At this point logits_output.next_token_logits is already filtered to accepted_indices.
+        # But we need the FULL logits before filtering.
+        # Unfortunately verify() modifies logits_output in-place.
+        # So we need to capture them inside verify() before the filtering.
+        # Alternative: we stash from the target_worker forward result directly.
+        return result
+
+    # Instead of patching verify(), patch target_worker.forward_batch_generation
+    # to capture logits before verify filters them.
+    original_target_forward = eagle_worker.target_worker.forward_batch_generation
+
+    def patched_target_forward(model_worker_batch, is_verify=False):
+        result = original_target_forward(model_worker_batch, is_verify=is_verify)
+        if is_verify and result.logits_output is not None:
+            try:
+                logits = result.logits_output.next_token_logits
+                if logits is not None and logits.numel() > 0:
+                    eagle_worker._oracle_stashed_verify_logits = logits.cpu().clone()
+                else:
+                    eagle_worker._oracle_stashed_verify_logits = None
+            except Exception:
+                eagle_worker._oracle_stashed_verify_logits = None
+        return result
+
+    eagle_worker.target_worker.forward_batch_generation = patched_target_forward
+
+
 def _patch_forward_log(
     eagle_worker: "EAGLEWorker",
     replay_state: TrajectoryState | None,
@@ -372,6 +466,13 @@ def _patch_forward_log(
                     eagle3_tree = _extract_eagle3_tree(
                         draft_cpu, rnt, rns, i, num_draft)
 
+                # Extract per-node p_t from verification logits
+                tree_p_t = None
+                verify_logits = getattr(eagle_worker, "_oracle_stashed_verify_logits", None)
+                if verify_logits is not None and eagle3_tree is not None:
+                    tree_p_t = _extract_tree_p_t(
+                        verify_logits, draft_cpu, eagle3_tree, i, num_draft)
+
                 proposer = getattr(eagle_worker, "_oracle_proposer_type", "eagle3")
                 entry = {
                     "eagle3": [req_draft],
@@ -380,10 +481,17 @@ def _patch_forward_log(
                     "proposer": proposer,
                 }
                 if eagle3_tree is not None:
-                    entry["eagle3_tree"] = eagle3_tree
+                    # Don't store internal candidates_positions in log
+                    entry["eagle3_tree"] = {
+                        "token_ids": eagle3_tree["token_ids"],
+                        "parents": eagle3_tree["parents"],
+                    }
+                if tree_p_t is not None:
+                    entry["eagle3_tree_p_t"] = tree_p_t
                 _log_entry(entry)
 
             eagle_worker._oracle_stashed_draft = None
+            eagle_worker._oracle_stashed_verify_logits = None
 
         except Exception as e:
             logger.warning(f"Oracle logging failed: {e}")

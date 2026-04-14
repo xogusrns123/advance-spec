@@ -205,12 +205,19 @@ def collect_union_tries(
                 proposer_trees: Dict[str, Tuple[List[int], List[int]]] = {}
 
                 # EAGLE3: use full tree if available, else flat chain
+                eagle3_p_t = None  # p_t from verification logits
                 e3_trees = req.get("per_call_eagle3_trees")
+                e3_p_ts = req.get("per_call_eagle3_tree_p_ts")
                 if e3_trees and call_idx < len(e3_trees):
                     call_trees = e3_trees[call_idx]
                     if pos < len(call_trees) and call_trees[pos] is not None:
                         et = call_trees[pos]
                         proposer_trees["eagle3"] = (et["token_ids"], et["parents"])
+                        # Get p_t if available
+                        if e3_p_ts and call_idx < len(e3_p_ts):
+                            call_p_ts = e3_p_ts[call_idx]
+                            if pos < len(call_p_ts) and call_p_ts[pos] is not None:
+                                eagle3_p_t = call_p_ts[pos]
                     else:
                         e_draft = eagle3s[pos] if pos < len(eagle3s) else []
                         if e_draft:
@@ -274,11 +281,15 @@ def collect_union_tries(
 
                 per_proposer = {}
                 for name, (tids, pids) in proposer_trees.items():
-                    per_proposer[name] = {
+                    entry = {
                         "token_ids": tids,
                         "parents": pids,
                         "size": len(tids),
                     }
+                    # Include p_t from verification logits if available
+                    if name == "eagle3" and eagle3_p_t is not None:
+                        entry["p_t"] = eagle3_p_t
+                    per_proposer[name] = entry
 
                 records.append({
                     "request_id": bfcl_id,
