@@ -267,6 +267,439 @@ def print_summary(
     print("=" * 68, file=sys.stderr)
 
 
+# ---------------------------------------------------------------------------
+# Step-by-step simulation (correct skip-ahead behavior)
+# ---------------------------------------------------------------------------
+
+def simulate_decoding(
+    records: List[dict],
+    budget: int,
+    method: str,
+    p_t_key: str = "p_t_oracle",
+    verify_latency_ms: float = 10.0,
+    vanilla_latency_ms: float = 10.0,
+) -> dict:
+    """Simulate actual speculative decoding with skip-ahead.
+
+    Walks through the token sequence position by position.
+    At each step:
+    1. Select tree (EU Oracle or Choose-One) at current position
+    2. Verify against ground truth → accepted tokens
+    3. Advance by (accepted + 1) positions (bonus token)
+    4. Accumulate latency
+
+    Parameters
+    ----------
+    records : list[dict]
+        Union trie records indexed by (request_id, call_idx, step_idx).
+    budget : int
+        Number of nodes in the verification tree.
+    method : str
+        "eu" for Expected-Utility Oracle, "choose_one" for Choose-One.
+    p_t_key : str
+        Key for p_t values (only used for method="eu").
+    verify_latency_ms : float
+        Time for one tree verification step.
+    vanilla_latency_ms : float
+        Time for one vanilla decode step (baseline).
+
+    Returns
+    -------
+    dict with total_tokens, total_steps, total_time_ms, speedup, per_step, etc.
+    """
+    # Index records by (request_id, call_idx, step_idx)
+    record_index: Dict[Tuple, dict] = {}
+    # Group by (request_id, call_idx) to find sequence boundaries
+    sequences: Dict[Tuple, List[int]] = {}
+
+    for rec in records:
+        key = (rec["request_id"], rec.get("call_idx", 0), rec.get("step_idx", 0))
+        record_index[key] = rec
+        seq_key = (rec["request_id"], rec.get("call_idx", 0))
+        sequences.setdefault(seq_key, []).append(rec.get("step_idx", 0))
+
+    # Sort step indices within each sequence
+    for sk in sequences:
+        sequences[sk].sort()
+
+    total_generated = 0   # accepted + bonus (actual tokens produced)
+    total_accepted = 0    # accepted only (no bonus)
+    total_steps = 0
+    total_time_ms = 0.0
+    per_step_log = []
+
+    for seq_key, step_indices in sorted(sequences.items()):
+        req_id, call_idx = seq_key
+        if not step_indices:
+            continue
+
+        max_pos = max(step_indices)
+        first_rec = record_index.get((req_id, call_idx, step_indices[0]))
+        if not first_rec:
+            continue
+        # Detect data format to compute total sequence length:
+        # NEW format (gt = tokens[pos:]): seq_len = pos + len(gt)
+        # OLD format (gt = tokens[pos+1:]): seq_len = pos + 1 + len(gt)
+        # Detection: OLD format has gt_len=1 at last step, NEW has gt_len>=2
+        last_rec = record_index.get((req_id, call_idx, step_indices[-1]))
+        last_gt_len = len(last_rec.get("ground_truth_future", [])) if last_rec else 1
+        first_gt_len = len(first_rec.get("ground_truth_future", []))
+        if last_gt_len <= 1:
+            seq_len = step_indices[0] + 1 + first_gt_len
+        else:
+            seq_len = step_indices[0] + first_gt_len
+
+        pos = step_indices[0]  # start from first available position
+        step_set = set(step_indices)
+
+        while pos <= max_pos and pos in step_set:
+            rec = record_index.get((req_id, call_idx, pos))
+            if rec is None:
+                # No record at this position, advance by 1 (vanilla)
+                total_generated += 1
+                total_steps += 1
+                total_time_ms += vanilla_latency_ms
+                pos += 1
+                continue
+
+            # Select tree and compute acceptance
+            if method == "eu":
+                accepted = _eu_step(rec, budget, p_t_key)
+            elif method.startswith("single:"):
+                proposer_name = method.split(":", 1)[1]
+                accepted = _single_proposer_step(rec, budget, proposer_name)
+            elif method.startswith("subset:"):
+                names = method.split(":", 1)[1].split(",")
+                accepted = _subset_step(rec, budget, names)
+            else:  # choose_one
+                accepted = _choose_one_step(rec, budget)
+
+            advance = accepted + 1  # accepted + bonus token
+            total_generated += advance
+            total_accepted += accepted
+            total_steps += 1
+            total_time_ms += verify_latency_ms
+
+            per_step_log.append({
+                "pos": pos,
+                "accepted": accepted,
+                "advance": advance,
+            })
+
+            pos += advance
+
+        # Remaining tokens after last speculative step (vanilla decode)
+        remaining = seq_len - pos
+        if remaining > 0:
+            total_generated += remaining
+            total_steps += remaining
+            total_time_ms += remaining * vanilla_latency_ms
+
+    vanilla_time_ms = total_generated * vanilla_latency_ms
+    speedup = vanilla_time_ms / total_time_ms if total_time_ms > 0 else 1.0
+    mat = total_accepted / total_steps if total_steps > 0 else 0.0
+
+    return {
+        "total_generated": total_generated,  # accepted + bonus
+        "total_accepted": total_accepted,    # accepted only
+        "total_steps": total_steps,
+        "total_time_ms": total_time_ms,
+        "vanilla_time_ms": vanilla_time_ms,
+        "speedup": speedup,
+        "mat": mat,  # Mean Accepted Tokens (bonus excluded)
+    }
+
+
+def _eu_step(rec: dict, budget: int, p_t_key: str) -> int:
+    """EU Oracle: select optimal subtree via DP, return accepted tokens."""
+    tids = rec["union_trie"]["token_ids"]
+    pids = rec["union_trie"]["parents"]
+    p_t = rec.get(p_t_key, [])
+    gt = rec.get("ground_truth_future", [])
+
+    if not tids or not p_t or not gt:
+        return 0
+
+    _, selected = tree_knapsack_dp(tids, pids, p_t, budget=budget)
+    if not selected:
+        return 0
+
+    sel_set = set(selected)
+    sel_tids = [tids[j] for j in range(len(tids)) if j in sel_set]
+    sel_pids_raw = [pids[j] for j in range(len(tids)) if j in sel_set]
+    old_to_new = {old: new for new, old in enumerate(
+        j for j in range(len(tids)) if j in sel_set)}
+    sel_pids = [old_to_new[p] if p in old_to_new else -1 for p in sel_pids_raw]
+    return greedy_tree_walk(sel_tids, sel_pids, gt)
+
+
+def _choose_one_step(rec: dict, budget: int) -> int:
+    """Choose-One Oracle: pick best proposer's tree, return accepted tokens."""
+    gt = rec.get("ground_truth_future", [])
+    if not gt:
+        return 0
+
+    best_acc = 0
+    for name, tree_data in rec.get("per_proposer", {}).items():
+        tids = tree_data["token_ids"][:budget]
+        pids = tree_data["parents"][:budget]
+        acc = greedy_tree_walk(tids, pids, gt)
+        best_acc = max(best_acc, acc)
+    return best_acc
+
+
+def _single_proposer_step(rec: dict, budget: int, proposer_name: str) -> int:
+    """Single proposer: use only one proposer's tree, return accepted tokens."""
+    gt = rec.get("ground_truth_future", [])
+    if not gt:
+        return 0
+
+    tree_data = rec.get("per_proposer", {}).get(proposer_name)
+    if not tree_data:
+        return 0
+
+    tids = tree_data["token_ids"][:budget]
+    pids = tree_data["parents"][:budget]
+    return greedy_tree_walk(tids, pids, gt)
+
+
+def _subset_step(rec: dict, budget: int, proposer_names: List[str]) -> int:
+    """Choose-One over a subset of proposers."""
+    gt = rec.get("ground_truth_future", [])
+    if not gt:
+        return 0
+
+    best_acc = 0
+    for name in proposer_names:
+        tree_data = rec.get("per_proposer", {}).get(name)
+        if not tree_data:
+            continue
+        tids = tree_data["token_ids"][:budget]
+        pids = tree_data["parents"][:budget]
+        acc = greedy_tree_walk(tids, pids, gt)
+        best_acc = max(best_acc, acc)
+    return best_acc
+
+
+def _discover_proposers(records: List[dict]) -> List[str]:
+    """Find all proposer names present in the records."""
+    names: set = set()
+    for rec in records:
+        names.update(rec.get("per_proposer", {}).keys())
+    return sorted(names)
+
+
+def compute_latency_speedup(
+    records: List[dict],
+    budgets: List[int],
+    latency_config: dict,
+    p_t_key: str = "p_t",
+    draft_latencies_ms: Optional[Dict[str, float]] = None,
+) -> dict:
+    """Run step-by-step simulation for each budget with measured latencies.
+
+    Returns per-budget simulation results including speedup.
+    Includes oracle methods (EU, Choose-One) and single-proposer baselines.
+
+    Parameters
+    ----------
+    draft_latencies_ms : dict, optional
+        Per-proposer draft generation latency in ms.
+        E.g. {"eagle3": 3.3, "mtp": 2.0, "suffix": 0.3}
+        Multi-proposer methods use max() (parallel draft assumption).
+        If None, draft cost is assumed zero (verify-only).
+    """
+    vanilla_ms = latency_config["vanilla_step_ms"]
+    verify_ms = latency_config["verify_latencies_ms"]
+    proposers = _discover_proposers(records)
+    draft_ms = draft_latencies_ms or {}
+
+    def _draft_cost(names: List[str]) -> float:
+        """Draft cost for a set of proposers (parallel = max)."""
+        costs = [draft_ms.get(n, 0.0) for n in names]
+        return max(costs) if costs else 0.0
+
+    # Generate pairwise combinations
+    pairs: List[Tuple[str, str]] = []
+    for i in range(len(proposers)):
+        for j in range(i + 1, len(proposers)):
+            pairs.append((proposers[i], proposers[j]))
+
+    results = {}
+    for B in budgets:
+        v_ms = verify_ms.get(str(B), verify_ms.get(B, vanilla_ms))
+
+        # Oracle methods need all proposers' drafts
+        oracle_draft = _draft_cost(proposers)
+        eu_sim = simulate_decoding(
+            records, budget=B, method="eu", p_t_key=p_t_key,
+            verify_latency_ms=v_ms + oracle_draft,
+            vanilla_latency_ms=vanilla_ms)
+        c1_sim = simulate_decoding(
+            records, budget=B, method="choose_one",
+            verify_latency_ms=v_ms + oracle_draft,
+            vanilla_latency_ms=vanilla_ms)
+
+        entry = {
+            "verify_ms": v_ms,
+            "draft_cost_ms": {p: draft_ms.get(p, 0.0) for p in proposers},
+            "eu_mat": eu_sim["mat"],
+            "c1_mat": c1_sim["mat"],
+            "eu_speedup": eu_sim["speedup"],
+            "c1_speedup": c1_sim["speedup"],
+            "eu_steps": eu_sim["total_steps"],
+            "c1_steps": c1_sim["total_steps"],
+            "eu_tokens": eu_sim["total_generated"],
+            "c1_tokens": c1_sim["total_generated"],
+        }
+
+        # Single-proposer baselines
+        for pname in proposers:
+            step_ms = v_ms + _draft_cost([pname])
+            sim = simulate_decoding(
+                records, budget=B, method=f"single:{pname}",
+                verify_latency_ms=step_ms,
+                vanilla_latency_ms=vanilla_ms)
+            entry[f"{pname}_mat"] = sim["mat"]
+            entry[f"{pname}_speedup"] = sim["speedup"]
+            entry[f"{pname}_steps"] = sim["total_steps"]
+
+        # Pairwise combinations
+        for a, b in pairs:
+            pair_key = f"{a}+{b}"
+            step_ms = v_ms + _draft_cost([a, b])
+            sim = simulate_decoding(
+                records, budget=B, method=f"subset:{a},{b}",
+                verify_latency_ms=step_ms,
+                vanilla_latency_ms=vanilla_ms)
+            entry[f"{pair_key}_mat"] = sim["mat"]
+            entry[f"{pair_key}_speedup"] = sim["speedup"]
+            entry[f"{pair_key}_steps"] = sim["total_steps"]
+
+        results[B] = entry
+
+    return results
+
+
+def print_latency_summary(
+    latency_results: dict,
+    budgets: List[int],
+    vanilla_ms: float,
+):
+    """Print latency-aware speedup summary."""
+    # Discover proposer names from first budget entry
+    first = latency_results[budgets[0]]
+    proposers = sorted(k.replace("_speedup", "") for k in first
+                       if k.endswith("_speedup") and k not in
+                       ("eu_speedup", "c1_speedup") and "+" not in k)
+    pair_keys = sorted(k.replace("_speedup", "") for k in first
+                       if k.endswith("_speedup") and "+" in k)
+
+    # --- Single-proposer baselines ---
+    if proposers:
+        print("\n" + "=" * 85, file=sys.stderr)
+        print("SINGLE-PROPOSER BASELINES", file=sys.stderr)
+        print("=" * 85, file=sys.stderr)
+        print(f"Vanilla: {vanilla_ms:.2f} ms/tok", file=sys.stderr)
+        draft_cost = first.get("draft_cost_ms", {})
+        if any(v > 0 for v in draft_cost.values()):
+            print(f"Draft cost: {draft_cost}", file=sys.stderr)
+            print("Step cost = verify(B) + draft(proposer); "
+                  "multi-proposer = max(drafts)", file=sys.stderr)
+        print(file=sys.stderr)
+
+        # Header
+        hdr = f"{'Budget':>6} | {'Verify':>8}"
+        for p in proposers:
+            hdr += f" | {p:>10}"
+        print(hdr, file=sys.stderr)
+        print("-" * len(hdr), file=sys.stderr)
+
+        best_per_proposer: Dict[str, tuple] = {p: (0, 0.0) for p in proposers}
+
+        for B in budgets:
+            r = latency_results[B]
+            row = f"{B:>6} | {r['verify_ms']:>7.2f}ms"
+            for p in proposers:
+                spd = r.get(f"{p}_speedup", 0)
+                mat = r.get(f"{p}_mat", 0)
+                row += f" | {spd:>6.2f}x/{mat:.2f}"
+                if spd > best_per_proposer[p][1]:
+                    best_per_proposer[p] = (B, spd)
+            print(row, file=sys.stderr)
+
+        print(file=sys.stderr)
+        for p in proposers:
+            b, s = best_per_proposer[p]
+            print(f"  Best {p}: budget={b}, speedup={s:.2f}x", file=sys.stderr)
+        print("=" * len(hdr), file=sys.stderr)
+
+    # --- Pairwise combinations ---
+    if pair_keys:
+        print("\n" + "=" * 85, file=sys.stderr)
+        print("PAIRWISE COMBINATIONS (choose-one over 2 proposers)", file=sys.stderr)
+        print("=" * 85, file=sys.stderr)
+        print(file=sys.stderr)
+
+        hdr = f"{'Budget':>6} | {'Verify':>8}"
+        for pk in pair_keys:
+            hdr += f" | {pk:>14}"
+        print(hdr, file=sys.stderr)
+        print("-" * len(hdr), file=sys.stderr)
+
+        best_per_pair: Dict[str, tuple] = {pk: (0, 0.0) for pk in pair_keys}
+
+        for B in budgets:
+            r = latency_results[B]
+            row = f"{B:>6} | {r['verify_ms']:>7.2f}ms"
+            for pk in pair_keys:
+                spd = r.get(f"{pk}_speedup", 0)
+                mat = r.get(f"{pk}_mat", 0)
+                row += f" | {spd:>7.2f}x/{mat:.2f}"
+                if spd > best_per_pair[pk][1]:
+                    best_per_pair[pk] = (B, spd)
+            print(row, file=sys.stderr)
+
+        print(file=sys.stderr)
+        for pk in pair_keys:
+            b, s = best_per_pair[pk]
+            print(f"  Best {pk}: budget={b}, speedup={s:.2f}x", file=sys.stderr)
+        print("=" * len(hdr), file=sys.stderr)
+
+    # --- Oracle methods ---
+    print("\n" + "=" * 85, file=sys.stderr)
+    print("ORACLE METHODS (measured verify cost)", file=sys.stderr)
+    print("=" * 85, file=sys.stderr)
+    print(f"Vanilla: {vanilla_ms:.2f} ms/tok", file=sys.stderr)
+    print(file=sys.stderr)
+    print(f"{'Budget':>6} | {'Verify':>8} | {'EU MAT':>7} | {'C1 MAT':>7} | "
+          f"{'EU speed':>9} | {'C1 speed':>9} | {'EU steps':>9} | {'C1 steps':>9}",
+          file=sys.stderr)
+    print("-" * 85, file=sys.stderr)
+
+    best_eu = (0, 0.0)
+    best_c1 = (0, 0.0)
+
+    for B in budgets:
+        r = latency_results[B]
+        print(f"{B:>6} | {r['verify_ms']:>7.2f}ms | {r['eu_mat']:>7.2f} | {r['c1_mat']:>7.2f} | "
+              f"{r['eu_speedup']:>8.2f}x | {r['c1_speedup']:>8.2f}x | "
+              f"{r['eu_steps']:>8} | {r['c1_steps']:>8}",
+              file=sys.stderr)
+        if r['eu_speedup'] > best_eu[1]:
+            best_eu = (B, r['eu_speedup'])
+        if r['c1_speedup'] > best_c1[1]:
+            best_c1 = (B, r['c1_speedup'])
+
+    print(file=sys.stderr)
+    print(f"Best EU Oracle:  budget={best_eu[0]}, speedup={best_eu[1]:.2f}x", file=sys.stderr)
+    print(f"Best Choose-One: budget={best_c1[0]}, speedup={best_c1[1]:.2f}x", file=sys.stderr)
+    if best_c1[1] > 0:
+        advantage = (best_eu[1] / best_c1[1] - 1) * 100
+        print(f"EU advantage: {advantage:+.1f}%", file=sys.stderr)
+    print("=" * 85, file=sys.stderr)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -279,6 +712,12 @@ def main():
                         help="Comma-separated budget values for sweep")
     parser.add_argument("--p-t-key", default="p_t_oracle",
                         help="Key for p_t values in records (default: p_t_oracle)")
+    parser.add_argument("--latency-config", default=None,
+                        help="Path to latency_config.json (from measure_verify_latency.py)")
+    parser.add_argument("--draft-latencies", default=None,
+                        help="Per-proposer draft cost in ms, e.g. "
+                             "'eagle3=3.3,mtp=2.0,suffix=0.3'. "
+                             "Multi-proposer methods use max() (parallel).")
     parser.add_argument("--print-summary", action="store_true")
     args = parser.parse_args()
 
@@ -320,9 +759,31 @@ def main():
     choose_one_budget = evaluate_choose_one_at_budget(records, budgets)
     print(f"Choose-One at budget: {time.time() - t0:.2f}s", file=sys.stderr)
 
+    # Parse draft latencies
+    draft_latencies_ms = None
+    if args.draft_latencies:
+        draft_latencies_ms = {}
+        for part in args.draft_latencies.split(","):
+            name, val = part.split("=")
+            draft_latencies_ms[name.strip()] = float(val)
+        print(f"Draft latencies (ms): {draft_latencies_ms}", file=sys.stderr)
+
+    # Latency-aware simulation
+    latency_config = None
+    latency_results = None
+    if args.latency_config:
+        with open(args.latency_config) as f:
+            latency_config = json.load(f)
+        latency_results = compute_latency_speedup(
+            records, budgets, latency_config, p_t_key=args.p_t_key,
+            draft_latencies_ms=draft_latencies_ms)
+
     if args.print_summary:
         print_summary(choose_one, eu_results, choose_one_budget,
                       budgets, args.p_t_key)
+        if latency_results and latency_config:
+            print_latency_summary(latency_results, budgets,
+                                  latency_config["vanilla_step_ms"])
 
     if args.output:
         output = {
@@ -350,6 +811,35 @@ def main():
                 ],
             },
         }
+
+        if latency_results:
+            proposers = _discover_proposers(records)
+            pairs = [f"{proposers[i]}+{proposers[j]}"
+                     for i in range(len(proposers))
+                     for j in range(i + 1, len(proposers))]
+            all_methods = proposers + pairs
+            output["latency"] = {
+                "vanilla_step_ms": latency_config["vanilla_step_ms"],
+                "proposers": proposers,
+                "pairs": pairs,
+                "budget_sweep": [
+                    {
+                        "budget": B,
+                        "verify_ms": latency_results[B]["verify_ms"],
+                        "eu_speedup": latency_results[B]["eu_speedup"],
+                        "c1_speedup": latency_results[B]["c1_speedup"],
+                        **{
+                            f"{m}_speedup": latency_results[B].get(f"{m}_speedup", 0)
+                            for m in all_methods
+                        },
+                        **{
+                            f"{m}_mat": latency_results[B].get(f"{m}_mat", 0)
+                            for m in all_methods
+                        },
+                    }
+                    for B in budgets if B in latency_results
+                ],
+            }
 
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)

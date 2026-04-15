@@ -138,6 +138,10 @@ def build_union_trie(
                     next_queue.append((child, idx))
         queue = next_queue
 
+    # BFS guarantees: parent[i] < i for all i (enables safe truncation)
+    assert all(p == -1 or p < i for i, p in enumerate(flat_parents)), \
+        "BFS order violated: parent must precede child"
+
     return flat_tokens, flat_parents, source_map
 
 
@@ -196,8 +200,9 @@ def collect_union_tries(
             decoded = []
 
             for pos in range(N):
-                future = tokens[pos + 1:]
-                if not future:
+                # All proposers now predict tokens[pos:] (aligned)
+                future = tokens[pos:]
+                if len(future) <= 1:  # only current token, nothing to verify
                     decoded.append(tokens[pos])
                     suffix_cache.add_active_response(req_id, [tokens[pos]])
                     continue
@@ -229,18 +234,29 @@ def collect_union_tries(
                         e_parents, e_tokens = _flat_to_tree(e_draft)
                         proposer_trees["eagle3"] = (e_tokens, e_parents)
 
-                # Suffix (already tree-structured)
-                response_so_far = decoded + [tokens[pos]]
+                # Suffix: speculate from context BEFORE tokens[pos]
+                # so that suffix predicts tokens[pos:] (same as EAGLE3)
+                response_so_far = list(decoded)
                 if len(prompt) > 0:
-                    context = np.concatenate(
-                        [prompt, np.array(response_so_far, dtype=np.int32)])
+                    suffix_context = np.concatenate(
+                        [prompt, np.array(response_so_far, dtype=np.int32)]) if response_so_far else prompt.copy()
                 else:
-                    context = np.array(response_so_far, dtype=np.int32)
+                    suffix_context = np.array(response_so_far, dtype=np.int32)
                 suffix_draft = suffix_cache.speculate(
-                    req_id, context,
+                    req_id, suffix_context,
                     max_spec_tokens=max_spec_tokens,
                     max_spec_factor=max_spec_factor,
                     min_token_prob=min_token_prob)
+
+                # Context for p_t collection: ends at tokens[pos-1]
+                # so that logits at context[-1] predict tokens[pos],
+                # matching what tree depth-1 nodes predict.
+                context_for_pt = list(decoded)  # = tokens[0:pos]
+                if len(prompt) > 0:
+                    context = np.concatenate(
+                        [prompt, np.array(context_for_pt, dtype=np.int32)]) if context_for_pt else prompt.copy()
+                else:
+                    context = np.array(context_for_pt, dtype=np.int32)
                 if suffix_draft.token_ids:
                     proposer_trees["suffix"] = (
                         list(suffix_draft.token_ids),
@@ -301,6 +317,7 @@ def collect_union_tries(
                     },
                     "source_map": source_map,
                     "per_proposer": per_proposer,
+                    # ground_truth_future: tokens[pos:] — all proposers predict from here
                     "ground_truth_future": list(future),
                     "context_token_ids": context.tolist(),
                 })

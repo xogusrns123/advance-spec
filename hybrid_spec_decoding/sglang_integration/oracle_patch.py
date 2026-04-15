@@ -176,6 +176,11 @@ def _extract_eagle3_tree(
         if not token_ids:
             return None
 
+        # BFS guarantees parent[i] < i (enables safe truncation)
+        for i, p in enumerate(parents):
+            if p != -1 and p >= i:
+                return None  # safety: skip malformed tree
+
         return {
             "token_ids": token_ids,
             "parents": parents,

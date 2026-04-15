@@ -216,6 +216,79 @@ def verify_batch(req: VerifyBatchRequest):
     return VerifyBatchResponse(results=results)
 
 
+class BenchmarkRequest(BaseModel):
+    context_token_ids: List[int]
+    tree_token_ids: List[int]
+    tree_parents: List[int]
+    budgets: List[int] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    n_trials: int = 30
+
+
+class BenchmarkResponse(BaseModel):
+    vanilla_step_ms: float
+    verify_latencies: Dict[str, float]  # budget → ms
+
+
+@app.post("/benchmark_verify", response_model=BenchmarkResponse)
+def benchmark_verify(req: BenchmarkRequest):
+    """Measure verify latency at different budget sizes.
+
+    Uses full forward (context + trie) for each budget size.
+    Vanilla = context + 1 token (B=0).
+    Verify(B) = context + B trie nodes with tree attention.
+    """
+    import statistics
+
+    model = _state["model"]
+    model_dtype = _state["model_dtype"]
+    ctx = req.context_token_ids
+    full_tids = req.tree_token_ids
+    full_pids = req.tree_parents
+    context_len = len(ctx)
+
+    def _measure(input_ids, mask, pos_ids, n_warmup=3, n_trials=None):
+        if n_trials is None:
+            n_trials = req.n_trials
+        inp = torch.tensor([input_ids], dtype=torch.long)
+        pos = torch.tensor([pos_ids], dtype=torch.long)
+        for _ in range(n_warmup):
+            with torch.no_grad():
+                model(input_ids=inp, attention_mask=mask,
+                      position_ids=pos, use_cache=False)
+        times = []
+        for _ in range(n_trials):
+            t0 = time.perf_counter()
+            with torch.no_grad():
+                model(input_ids=inp, attention_mask=mask,
+                      position_ids=pos, use_cache=False)
+            torch.cuda.synchronize()
+            times.append((time.perf_counter() - t0) * 1000)
+        return statistics.median(times)
+
+    # Vanilla: context + 1 token (causal)
+    vanilla_ids = ctx + [full_tids[0] if full_tids else 0]
+    vanilla_len = len(vanilla_ids)
+    vanilla_mask = _build_mask_tensor(context_len, [vanilla_ids[-1]], [-1], model_dtype)
+    vanilla_pos = list(range(context_len)) + [context_len]
+    vanilla_ms = _measure(vanilla_ids, vanilla_mask, vanilla_pos)
+
+    # Verify at each budget
+    results = {}
+    for B in req.budgets:
+        tids = full_tids[:B]
+        pids = full_pids[:B]
+        pids = [p if p < B else -1 for p in pids]
+
+        mask = _build_mask_tensor(context_len, tids, pids, model_dtype)
+        pos = build_position_ids(context_len, pids)
+        input_ids = ctx + tids
+
+        ms = _measure(input_ids, mask, pos)
+        results[str(B)] = ms
+
+    return BenchmarkResponse(vanilla_step_ms=vanilla_ms, verify_latencies=results)
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "model_loaded": _state["model"] is not None}
