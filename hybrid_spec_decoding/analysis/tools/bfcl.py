@@ -1,17 +1,16 @@
 """BFCL multi-turn tool utilities.
 
-Provides DuckDuckGo search monkey-patching for WebSearchAPI instances
-created by execute_multi_turn_func_call(), replacing the paid SerpAPI.
-
-Note: execute_multi_turn_func_call() stores class instances in the
-multi_turn_utils module's globals(), so we operate on that module's
-namespace rather than this module's.
+Provides DuckDuckGo search monkey-patching for WebSearchAPI,
+replacing the paid SerpAPI. Patches the CLASS before any instances
+are created, so execute_multi_turn_func_call() uses DuckDuckGo
+from the first call.
 """
 
 import re
-import types
 
 from bfcl_eval.eval_checker.multi_turn_eval import multi_turn_utils as _mt_utils
+
+_CLASS_PATCHED = False
 
 
 def _ddg_search_engine_query(
@@ -20,16 +19,7 @@ def _ddg_search_engine_query(
     max_results: int = 10,
     region: str = "wt-wt",
 ) -> list | dict:
-    """Replace SerpAPI with free duckduckgo-search (no API key required).
-
-    Args:
-        keywords: Search query string
-        max_results: Number of results to return
-        region: DuckDuckGo region code (e.g., "wt-wt", "us-en")
-
-    Returns:
-        List of dicts with "title", "href", "body" keys, or error dict.
-    """
+    """Replace SerpAPI with free duckduckgo-search (no API key required)."""
     try:
         try:
             from ddgs import DDGS
@@ -38,7 +28,6 @@ def _ddg_search_engine_query(
 
         results = list(DDGS().text(keywords, region=region, max_results=max_results))
 
-        # Filter to only include "title", "href", "body" keys to match expected format
         filtered_results = [
             {
                 "title": r.get("title", ""),
@@ -48,7 +37,6 @@ def _ddg_search_engine_query(
             for r in results
         ]
 
-        # If show_snippet is False, omit the "body" key
         if hasattr(self, "show_snippet") and not self.show_snippet:
             filtered_results = [
                 {"title": r["title"], "href": r["href"]} for r in filtered_results
@@ -59,16 +47,25 @@ def _ddg_search_engine_query(
         return {"error": str(e)}
 
 
-def patch_websearch_in_globals(entry_id: str):
-    """Monkey-patch WebSearchAPI instances in multi_turn_utils globals().
+def patch_websearch_class():
+    """Patch WebSearchAPI class to use DuckDuckGo BEFORE any instances are created.
 
-    After execute_multi_turn_func_call() creates class instances in the
-    multi_turn_utils module's globals(), find any WebSearchAPI instances
-    matching the entry_id and replace their search_engine_query method.
-
-    Args:
-        entry_id: The BFCL entry ID used to identify the correct instances.
+    Must be called once at startup, before execute_multi_turn_func_call().
     """
+    global _CLASS_PATCHED
+    if _CLASS_PATCHED:
+        return
+
+    from bfcl_eval.eval_checker.multi_turn_eval.func_source_code.web_search import (
+        WebSearchAPI,
+    )
+    WebSearchAPI.search_engine_query = _ddg_search_engine_query
+    _CLASS_PATCHED = True
+
+
+def patch_websearch_in_globals(entry_id: str):
+    """Patch any already-created WebSearchAPI instances (backward compat)."""
+    import types
     sanitized_id = re.sub(r"[-./:]", "_", entry_id)
     mt_globals = vars(_mt_utils)
     for key, val in list(mt_globals.items()):
@@ -77,11 +74,7 @@ def patch_websearch_in_globals(entry_id: str):
 
 
 def cleanup_globals(entry_id: str):
-    """Remove class instances from multi_turn_utils globals().
-
-    Args:
-        entry_id: The BFCL entry ID used to identify instances to clean up.
-    """
+    """Remove class instances from multi_turn_utils globals()."""
     sanitized_id = re.sub(r"[-./:]", "_", entry_id)
     mt_globals = vars(_mt_utils)
     keys_to_remove = [

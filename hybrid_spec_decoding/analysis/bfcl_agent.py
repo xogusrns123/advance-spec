@@ -48,7 +48,10 @@ from ..sglang_integration.oracle_patch import (
     read_oracle_log,
     is_oracle_enabled,
 )
-from .tools.bfcl import patch_websearch_in_globals, cleanup_globals
+from .tools.bfcl import patch_websearch_class, patch_websearch_in_globals, cleanup_globals
+
+# Patch WebSearchAPI class BEFORE any instances are created
+patch_websearch_class()
 
 
 def load_bfcl_dataset(path: str, num_requests: int | None = None) -> list[dict]:

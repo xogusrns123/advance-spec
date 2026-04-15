@@ -48,10 +48,10 @@ case $BENCHMARK in
     MAX_ITER_FLAG="--max-iterations 20"
     ;;
   bfcl_v4)
-    AGENT_MODULE="hybrid_spec_decoding.analysis.bfcl_agent"
+    AGENT_MODULE="hybrid_spec_decoding.analysis.bfcl_v4_agent"
     INPUT_FILE="data/bfcl_agent/dataset.jsonl"
     DATASET_FLAG="--model $MODEL"
-    MAX_ITER_FLAG="--max-iterations 5"
+    MAX_ITER_FLAG="--max-iterations 10"
     ;;
   specbench)
     AGENT_MODULE="hybrid_spec_decoding.analysis.specbench_agent"

@@ -41,7 +41,7 @@ COPY pyproject.toml uv.lock ./
 RUN . /opt/venv/bin/activate && \
     uv pip install numpy requests pyyaml matplotlib datasets pytest ruff \
         arctic-inference ray openai bfcl-eval tqdm \
-        langchain langchain-openai psutil
+        langchain langchain-openai psutil duckduckgo-search
 
 # Layer 5: SGLang 패치
 # 5a. Glm4MoeLiteModel enable_a2a_moe 버그

@@ -133,23 +133,76 @@ def prepare_bfcl_v3(output_dir: Path) -> None:
 
 
 def prepare_bfcl_v4(output_dir: Path) -> None:
-    """BFCLv4: Agent tasks (web_search, memory)."""
+    """BFCLv4: Agent tasks (web_search, memory).
+
+    Uses official load_dataset_entry() to get correct involved_classes
+    (e.g., MemoryAPI_kv instead of MemoryAPI) and function docs.
+    """
     print("Preparing BFCLv4 (agent) dataset...")
 
     try:
-        import bfcl_eval
-        data_dir = Path(bfcl_eval.__file__).parent / "data"
+        from bfcl_eval.constants.category_mapping import AGENTIC_CATEGORY
+        from bfcl_eval.utils import (
+            load_dataset_entry,
+            load_ground_truth_entry,
+            extract_test_category_from_id,
+        )
+        try:
+            from bfcl_eval.utils import is_memory_prereq
+        except ImportError:
+            is_memory_prereq = lambda x: "prereq" in str(x)
     except ImportError:
         print("  ERROR: bfcl-eval not installed. Run: pip install bfcl-eval")
         return
 
-    categories = [
-        ("web_search", "BFCL_v4_web_search.json"),
-        ("memory", "BFCL_v4_memory.json"),
-    ]
+    records = []
+    ground_truths = []
+    gt_map = {}
+    idx = 0
 
-    records, ground_truths = _load_bfcl_categories(
-        data_dir, categories, prefix="bfcl_v4")
+    for cat in AGENTIC_CATEGORY:
+        entries = load_dataset_entry(cat, include_prereq=True)
+        print(f"  {cat}: {len(entries)} entries")
+
+        gts = load_ground_truth_entry(cat)
+        for gt in gts:
+            gt_map[gt["id"]] = gt.get("ground_truth")
+
+        for row in entries:
+            bfcl_id = row["id"]
+            record = {
+                "question_id": idx,
+                "category": f"bfcl_v4/{cat}",
+                "bfcl_id": bfcl_id,
+                "id": bfcl_id,
+                "question": row["question"],
+                "function": row.get("function", []),
+                "involved_classes": row.get("involved_classes", []),
+                "initial_config": row.get("initial_config", {}),
+            }
+            if "scenario" in row:
+                record["scenario"] = row["scenario"]
+            if "depends_on" in row:
+                record["depends_on"] = row["depends_on"]
+
+            records.append(record)
+
+            if bfcl_id in gt_map:
+                ground_truths.append({
+                    "question_id": idx,
+                    "bfcl_id": bfcl_id,
+                    "ground_truth": gt_map[bfcl_id],
+                })
+            idx += 1
+
+    # Deduplicate by id
+    seen = set()
+    deduped = []
+    for r in records:
+        if r["id"] not in seen:
+            seen.add(r["id"])
+            deduped.append(r)
+    records = deduped
 
     out_dir = output_dir / "bfcl_agent"
     save_jsonl(records, out_dir / "dataset.jsonl")
