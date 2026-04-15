@@ -13,6 +13,9 @@ from bfcl_eval.eval_checker.multi_turn_eval import multi_turn_utils as _mt_utils
 _CLASS_PATCHED = False
 
 
+_EN_HEADERS = {"Accept-Language": "en-US,en;q=0.9"}
+
+
 def _ddg_search_engine_query(
     self,
     keywords: str,
@@ -26,7 +29,11 @@ def _ddg_search_engine_query(
         except ImportError:
             from duckduckgo_search import DDGS
 
-        results = list(DDGS().text(keywords, region=region, max_results=max_results))
+        results = list(
+            DDGS(headers=_EN_HEADERS).text(
+                keywords, region=region, max_results=max_results,
+            )
+        )
 
         filtered_results = [
             {
