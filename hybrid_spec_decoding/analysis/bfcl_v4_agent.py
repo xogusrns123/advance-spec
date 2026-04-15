@@ -238,6 +238,7 @@ def process_request(
             "prompt_tokens": response.usage.prompt_tokens,
             "completion_tokens": response.usage.completion_tokens,
             "content": content,
+            "messages": copy.deepcopy(messages),
         }
 
         # Collect oracle entries

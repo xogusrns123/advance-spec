@@ -151,10 +151,15 @@ wait_for_server() {
   return 1
 }
 
+SERVER_PID=""
 kill_server() {
-  echo "Stopping server..."
-  pkill -f "sglang.launch_server" 2>/dev/null || true
-  sleep 5
+  if [ -n "$SERVER_PID" ]; then
+    echo "Stopping server (PID=$SERVER_PID)..."
+    kill $SERVER_PID 2>/dev/null || true
+    wait $SERVER_PID 2>/dev/null || true
+    SERVER_PID=""
+  fi
+  sleep 3
 }
 
 # ============================================================
@@ -184,6 +189,7 @@ python3 -m sglang.launch_server \
   --disable-cuda-graph \
   --host 0.0.0.0 --port $PORT \
   > /tmp/sglang_pipeline.log 2>&1 &
+SERVER_PID=$!
 
 wait_for_server || exit 1
 
@@ -207,55 +213,71 @@ python3 -m hybrid_spec_decoding.analysis.extract_trajectory \
   --output "$OUTPUT_DIR/trajectory.json"
 
 # ============================================================
-# Stage 3: MTP Oracle Replay (Round 2)
+# Stage 3: MTP Oracle Replay (skip if model has no MTP heads)
 # ============================================================
-echo ""
-echo "=== Stage 3: MTP Oracle Replay ==="
+MTP_FLAG=""
+if [ "$BENCHMARK" != "specbench" ]; then
+  # Check if model supports MTP by trying to build trajectory for replay
+  python3 scripts/replay_oracle.py \
+    --agent-results "$OUTPUT_DIR/agent_results_eagle3.json" \
+    --output /dev/null \
+    --trajectory-output "$OUTPUT_DIR/replay_trajectory.json" 2>/dev/null
 
-export SGLANG_ORACLE_REPLAY="$OUTPUT_DIR/trajectory.json"
+  # Only run MTP if model supports NEXTN/EAGLE algorithm
+  # (Qwen3-8B has no MTP heads, GLM-4.7-Flash does)
+  if [ "$MODEL_PRESET" = "glm4_flash" ]; then
+    echo ""
+    echo "=== Stage 3: MTP Oracle Replay ==="
 
-# Re-install oracle patch for MTP worker
-python3 -m hybrid_spec_decoding.sglang_integration.install_hook
+    export SGLANG_ORACLE_REPLAY="$OUTPUT_DIR/replay_trajectory.json"
+    python3 -m hybrid_spec_decoding.sglang_integration.install_hook
 
-python3 -m sglang.launch_server \
-  --model-path "$MODEL" \
-  --tp-size $TP_SIZE \
-  --speculative-algorithm NEXTN \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 4 \
-  --speculative-num-draft-tokens 16 \
-  --mem-fraction-static $MEM_FRAC \
-  --disable-cuda-graph \
-  --host 0.0.0.0 --port $PORT \
-  > /tmp/sglang_pipeline.log 2>&1 &
+    python3 -m sglang.launch_server \
+      --model-path "$MODEL" \
+      --tp-size $TP_SIZE \
+      --speculative-algorithm NEXTN \
+      --speculative-num-steps 3 \
+      --speculative-eagle-topk 4 \
+      --speculative-num-draft-tokens 16 \
+      --mem-fraction-static $MEM_FRAC \
+      --disable-cuda-graph \
+      --watchdog-timeout 600 \
+      --host 0.0.0.0 --port $PORT \
+      > /tmp/sglang_pipeline.log 2>&1 &
+    SERVER_PID=$!
 
-wait_for_server || exit 1
+    wait_for_server || exit 1
 
-python3 -m $AGENT_MODULE \
-  --url http://localhost:$PORT/v1 \
-  --model "$MODEL" \
-  --input-file "$INPUT_FILE" \
-  --output-file "$OUTPUT_DIR/agent_results_mtp.json" \
-  --replay "$OUTPUT_DIR/agent_results_eagle3.json" \
-  --num-workers $NUM_WORKERS $TEMP_FLAG $NUM_REQ_FLAG
+    python3 scripts/replay_oracle.py \
+      --agent-results "$OUTPUT_DIR/agent_results_eagle3.json" \
+      --output "$OUTPUT_DIR/agent_results_mtp.json" \
+      --server-url "http://localhost:$PORT" \
+      --model "$MODEL" \
+      --num-workers 1
 
-kill_server
-unset SGLANG_ORACLE_REPLAY
+    kill_server
+    unset SGLANG_ORACLE_REPLAY
+    MTP_FLAG="--mtp-agent-results $OUTPUT_DIR/agent_results_mtp.json"
+  else
+    echo ""
+    echo "=== Stage 3: SKIPPED (model has no MTP heads) ==="
+  fi
+fi
 
 # ============================================================
-# Stage 4: Collect Union Trie (EAGLE3 + Suffix + MTP)
+# Stage 4: Collect Union Trie (EAGLE3 + Suffix [+ MTP])
 # ============================================================
 echo ""
 echo "=== Stage 4: Collect Union Trie ==="
 
 python3 -m hybrid_spec_decoding.analysis.collect_union_trie \
   --agent-results "$OUTPUT_DIR/agent_results_eagle3.json" \
-  --mtp-agent-results "$OUTPUT_DIR/agent_results_mtp.json" \
+  $MTP_FLAG \
   --output "$OUTPUT_DIR/union_trie_data.jsonl" \
   $DATASET_FLAG
 
 # ============================================================
-# Stage 5: Collect Target Model p_t
+# Stage 5: Collect Target Model p_t (HuggingFace direct forward)
 # ============================================================
 echo ""
 echo "=== Stage 5: Collect p_t ==="

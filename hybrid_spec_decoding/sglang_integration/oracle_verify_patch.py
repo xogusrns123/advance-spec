@@ -38,46 +38,33 @@ def is_verify_tries_enabled() -> bool:
 
 
 class UnionTrieFeeder:
-    """Feeds pre-built union tries to suffix_worker's speculation step.
+    """Feeds pre-built union tries sequentially.
 
-    Indexes union tries by (request_id, step_idx) from the JSONL file.
-    Tracks each request's decode position to serve the correct trie.
+    Simply pops records in JSONL order. Works correctly when requests
+    are processed sequentially (num_workers=1), since decode step order
+    matches the record order in the file. All TP ranks pop in lockstep
+    because they process the same batches simultaneously.
     """
 
-    def __init__(self, jsonl_path: str):
-        self.tries: Dict[str, List[dict]] = {}  # req_id → list of records
-        self._positions: Dict[str, int] = {}     # req_id → current step
+    def __init__(self, jsonl_path: str, rid_map_path: str | None = None):
+        self._records: List[dict] = []
+        self._pos: int = 0
 
         with open(jsonl_path) as f:
             for line in f:
                 line = line.strip()
-                if not line:
-                    continue
-                rec = json.loads(line)
-                rid = rec.get("request_id", "")
-                self.tries.setdefault(rid, []).append(rec)
+                if line:
+                    self._records.append(json.loads(line))
 
-        # Sort each request's records by step_idx
-        for rid in self.tries:
-            self.tries[rid].sort(key=lambda r: (r.get("call_idx", 0), r.get("step_idx", 0)))
+        logger.info(f"UnionTrieFeeder: loaded {len(self._records)} records (sequential mode)")
 
-        total = sum(len(v) for v in self.tries.values())
-        logger.info(f"UnionTrieFeeder: loaded {total} tries for {len(self.tries)} requests")
-
-    def get_next_trie(self, req_id: str) -> Optional[dict]:
-        """Get the next union trie for this request."""
-        records = self.tries.get(req_id)
-        if not records:
+    def get_next_trie(self) -> Optional[dict]:
+        """Pop the next union trie record in order."""
+        if self._pos >= len(self._records):
             return None
-        pos = self._positions.get(req_id, 0)
-        if pos >= len(records):
-            return None
-        rec = records[pos]
-        self._positions[req_id] = pos + 1
+        rec = self._records[self._pos]
+        self._pos += 1
         return rec
-
-    def reset_request(self, req_id: str):
-        self._positions.pop(req_id, None)
 
 
 def patch_suffix_worker_for_verify(suffix_worker: "SuffixWorker") -> None:

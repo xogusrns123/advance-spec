@@ -360,6 +360,14 @@ def load_exclude_ids(path):
 
 def _extract_entries(entries):
     """Extract tokens, eagle3 drafts, eagle3 trees, p_t, and mtp trees from oracle_vanilla_entries."""
+    # Filter interleaved entries from concurrent requests (workers>1):
+    # keep only entries matching the most common req_id.
+    if entries and len(set(e.get("req_id", "") for e in entries)) > 1:
+        from collections import Counter
+        rid_counts = Counter(e.get("req_id", "") for e in entries)
+        primary_rid = rid_counts.most_common(1)[0][0]
+        entries = [e for e in entries if e.get("req_id") == primary_rid]
+
     call_tokens = []
     call_eagle3s = []
     call_eagle3_trees = []
