@@ -80,7 +80,19 @@ from .tools.bfcl import patch_websearch_in_globals, cleanup_globals
 
 
 def _strip_thinking(text: str) -> str:
-    return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+    """Strip thinking content.
+
+    Handles:
+    - <think>...</think> (standard)
+    - Bare text...</think> (GLM-4.7-Flash: no opening tag)
+    - Multiple </think> closings
+    """
+    # First: standard <think>...</think>
+    text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+    # Then: if </think> still remains (no opening <think>), take text after last </think>
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[-1].strip()
+    return text
 
 
 def load_bfcl_v4_dataset(
