@@ -158,6 +158,7 @@ def _build_mask_tensor(
     trie_tids: List[int],
     trie_parents: List[int],
     dtype: "torch.dtype",
+    device: str = "cpu",
 ) -> "torch.Tensor":
     """Build 4D attention mask tensor efficiently using torch ops."""
     n_trie = len(trie_tids)
@@ -165,7 +166,7 @@ def _build_mask_tensor(
     min_val = torch.finfo(dtype).min
 
     # Start with all masked
-    mask = torch.full((1, 1, total, total), min_val, dtype=dtype)
+    mask = torch.full((1, 1, total, total), min_val, dtype=dtype, device=device)
 
     # Context: causal mask (lower triangular)
     if context_len > 0:
@@ -282,7 +283,7 @@ def collect_p_t_for_records(
             # Attention mask: (total_new) attends to (cached + total_new)
             full_len = cached_ctx_len + total_new
             mask = torch.full((1, 1, total_new, full_len), torch.finfo(model_dtype).min,
-                              dtype=model_dtype)
+                              dtype=model_dtype, device=device)
             # New context tokens: causal over cached + new context
             for j in range(new_ctx_len):
                 mask[0, 0, j, :cached_ctx_len + j + 1] = 0.0
@@ -296,8 +297,8 @@ def collect_p_t_for_records(
                     mask[0, 0, row, new_ctx_len + parent] = 0.0
                     parent = trie_parents[parent]
 
-            input_tensor = torch.tensor([input_ids], dtype=torch.long)
-            pos_tensor = torch.tensor([pos_ids], dtype=torch.long)
+            input_tensor = torch.tensor([input_ids], dtype=torch.long, device=device)
+            pos_tensor = torch.tensor([pos_ids], dtype=torch.long, device=device)
 
             with torch.no_grad():
                 outputs = model(
@@ -335,11 +336,11 @@ def collect_p_t_for_records(
             input_ids = context_ids + trie_tids
             total_len = len(input_ids)
 
-            mask = _build_mask_tensor(context_len, trie_tids, trie_parents, model_dtype)
+            mask = _build_mask_tensor(context_len, trie_tids, trie_parents, model_dtype, device)
             pos_ids = build_position_ids(context_len, trie_parents)
 
-            input_tensor = torch.tensor([input_ids], dtype=torch.long)
-            pos_tensor = torch.tensor([pos_ids], dtype=torch.long)
+            input_tensor = torch.tensor([input_ids], dtype=torch.long, device=device)
+            pos_tensor = torch.tensor([pos_ids], dtype=torch.long, device=device)
 
             with torch.no_grad():
                 outputs = model(
@@ -467,6 +468,11 @@ def main():
                         help="Device for model (default: cuda)")
     parser.add_argument("--limit", type=int, default=None,
                         help="Process only first N records (for testing)")
+    parser.add_argument("--shard", default=None,
+                        help="Process shard M/N, e.g. '0/4' for first of 4 shards")
+    parser.add_argument("--checkpoint-every", type=int, default=0,
+                        help="Save checkpoint every N requests (0=off). "
+                             "Frees processed records from memory.")
     args = parser.parse_args()
 
     # Load records
@@ -479,19 +485,33 @@ def main():
                 records.append(json.loads(line))
     if args.limit:
         records = records[:args.limit]
+
+    # Shard: select subset of records by request_id
+    if args.shard:
+        shard_id, num_shards = map(int, args.shard.split("/"))
+        all_req_ids = sorted(set(r.get("request_id", "") for r in records))
+        my_req_ids = set(all_req_ids[i] for i in range(len(all_req_ids))
+                         if i % num_shards == shard_id)
+        records = [r for r in records if r.get("request_id", "") in my_req_ids]
+        print(f"Shard {shard_id}/{num_shards}: {len(records)} records "
+              f"({len(my_req_ids)} requests)", file=sys.stderr)
+
     print(f"Loaded {len(records)} step records", file=sys.stderr)
 
     # Add oracle p_t (always)
     enrich_with_ground_truth_p_t(records)
     print(f"Added oracle p_t (ground truth)", file=sys.stderr)
 
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
     if not args.oracle_only:
         if not args.model and not args.verify_server_url:
             parser.error("--model or --verify-server-url required unless --oracle-only")
 
-        # Check context_token_ids availability
-        has_context = any("context_token_ids" in r for r in records)
-        if not has_context:
+        if not records:
+            print("No records to process", file=sys.stderr)
+        elif not any("context_token_ids" in r for r in records):
             parser.error(
                 "Records missing context_token_ids. "
                 "Re-run collect_union_trie.py to generate updated data."
@@ -500,26 +520,31 @@ def main():
         t0 = time.time()
 
         if args.verify_server_url:
-            # Server mode: send requests to verify_server.py
             collect_p_t_via_server(records, args.verify_server_url)
         else:
-            # Local mode: load model directly
             if not HAS_TORCH:
                 parser.error("PyTorch required for local model-based p_t collection")
             from transformers import AutoModelForCausalLM, AutoTokenizer
-            print(f"Loading model: {args.model}", file=sys.stderr)
+            print(f"Loading model: {args.model} on {args.device}", file=sys.stderr)
             tokenizer = AutoTokenizer.from_pretrained(args.model,
                                                        trust_remote_code=True)
             model = AutoModelForCausalLM.from_pretrained(
                 args.model, dtype=torch.float16,
-                trust_remote_code=True, device_map="auto",
-            )
-            print(f"Model loaded on {args.device}", file=sys.stderr)
-            collect_p_t_for_records(records, model, tokenizer, device=args.device)
+                trust_remote_code=True,
+            ).to(args.device)
+            print(f"Model loaded", file=sys.stderr)
+
+            if args.checkpoint_every > 0:
+                # Process per-request with checkpointing
+                _collect_with_checkpoint(
+                    records, model, tokenizer, args.device,
+                    output_path, args.checkpoint_every)
+            else:
+                collect_p_t_for_records(records, model, tokenizer, device=args.device)
 
         print(f"p_t collection: {time.time() - t0:.1f}s", file=sys.stderr)
 
-        # Sanity check: compare with oracle
+        # Sanity check
         n_checked = 0
         n_agree = 0
         for rec in records:
@@ -531,20 +556,63 @@ def main():
                 if pt_oracle == 1.0 and pt_real > 0.01:
                     n_agree += 1
                 elif pt_oracle == 0.0:
-                    n_agree += 1  # don't penalise wrong-path nodes
+                    n_agree += 1
         if n_checked > 0:
             print(f"Sanity: {n_agree}/{n_checked} nodes agree "
                   f"({100*n_agree/n_checked:.1f}%)", file=sys.stderr)
 
-    # Write output
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w") as f:
-        for rec in records:
-            f.write(json.dumps(rec) + "\n")
+    # Write output (skip if checkpoint mode already wrote)
+    if args.checkpoint_every <= 0:
+        with open(output_path, "w") as f:
+            for rec in records:
+                f.write(json.dumps(rec) + "\n")
 
     print(f"Output: {args.output}", file=sys.stderr)
     print(f"Records: {len(records)}", file=sys.stderr)
+
+
+def _collect_with_checkpoint(records, model, tokenizer, device, output_path, every_n):
+    """Process records per-request, checkpoint and free memory periodically."""
+    import gc
+
+    # Group by request_id
+    from collections import OrderedDict
+    by_req = OrderedDict()
+    for rec in records:
+        rid = rec.get("request_id", "")
+        by_req.setdefault(rid, []).append(rec)
+
+    req_ids = list(by_req.keys())
+    n_reqs = len(req_ids)
+    t0 = time.time()
+    processed = 0
+
+    with open(output_path, "w") as f:
+        for ri, rid in enumerate(req_ids):
+            req_records = by_req[rid]
+            collect_p_t_for_records(req_records, model, tokenizer, device=device)
+
+            # Write and free
+            for rec in req_records:
+                f.write(json.dumps(rec) + "\n")
+            f.flush()
+            processed += len(req_records)
+
+            if (ri + 1) % every_n == 0 or ri == n_reqs - 1:
+                elapsed = time.time() - t0
+                rate = processed / elapsed if elapsed > 0 else 0
+                remaining = sum(len(by_req[r]) for r in req_ids[ri+1:])
+                eta = remaining / rate if rate > 0 else 0
+                print(f"  [{ri+1}/{n_reqs}] {processed} steps, "
+                      f"{rate:.1f} steps/s, ETA {eta:.0f}s",
+                      file=sys.stderr)
+
+                # Free memory
+                for rec in req_records:
+                    rec.clear()
+                gc.collect()
+                if HAS_TORCH:
+                    torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

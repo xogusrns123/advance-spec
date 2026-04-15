@@ -193,40 +193,31 @@ def evaluate_choose_one_at_budget(
     records: List[dict],
     budgets: List[int],
 ) -> Dict[int, dict]:
-    """Choose-One Oracle constrained to budget B.
+    """Choose-One Oracle: pick the best proposer's full tree per step.
 
-    For each step and budget, pick the single proposer whose tree
-    (truncated to B nodes) gives the highest accepted tokens.
+    No budget truncation — each proposer's entire tree is evaluated.
+    Result is the same for all budgets (budget-independent).
     """
-    budget_results: Dict[int, dict] = {}
+    # Compute once (budget doesn't matter)
+    n_steps = len(records)
+    total_acc = 0
 
-    for B in budgets:
-        total_acc = 0
-        n_steps = len(records)
+    for rec in records:
+        gt = rec["ground_truth_future"]
+        per_proposer = rec.get("per_proposer", {})
+        best_acc = 0
 
-        for rec in records:
-            gt = rec["ground_truth_future"]
-            per_proposer = rec.get("per_proposer", {})
-            best_acc = 0
+        for name, tree_data in per_proposer.items():
+            tids = tree_data["token_ids"]
+            pids = tree_data["parents"]
+            acc = greedy_tree_walk(tids, pids, gt)
+            best_acc = max(best_acc, acc)
 
-            for name, tree_data in per_proposer.items():
-                tids = tree_data["token_ids"]
-                pids = tree_data["parents"]
-                # Truncate to budget B (keep first B nodes)
-                tids_b = tids[:B]
-                pids_b = pids[:B]
-                acc = greedy_tree_walk(tids_b, pids_b, gt)
-                best_acc = max(best_acc, acc)
+        total_acc += best_acc
 
-            total_acc += best_acc
-
-        budget_results[B] = {
-            "budget": B,
-            "total_acc": total_acc,
-            "avg_acc": total_acc / max(n_steps, 1),
-        }
-
-    return budget_results
+    avg = total_acc / max(n_steps, 1)
+    return {B: {"budget": B, "total_acc": total_acc, "avg_acc": avg}
+            for B in budgets}
 
 
 def print_summary(
@@ -366,6 +357,9 @@ def simulate_decoding(
             # Select tree and compute acceptance
             if method == "eu":
                 accepted = _eu_step(rec, budget, p_t_key)
+            elif method.startswith("hybrid:"):
+                threshold = float(method.split(":", 1)[1])
+                accepted = _hybrid_step(rec, budget, threshold)
             elif method.startswith("single:"):
                 proposer_name = method.split(":", 1)[1]
                 accepted = _single_proposer_step(rec, budget, proposer_name)
@@ -435,18 +429,53 @@ def _eu_step(rec: dict, budget: int, p_t_key: str) -> int:
 
 
 def _choose_one_step(rec: dict, budget: int) -> int:
-    """Choose-One Oracle: pick best proposer's tree, return accepted tokens."""
+    """Choose-One Oracle: pick best proposer's full tree, return accepted tokens.
+
+    No budget truncation — uses each proposer's entire tree and picks the
+    best result. The budget parameter is ignored (kept for API compat).
+    """
     gt = rec.get("ground_truth_future", [])
     if not gt:
         return 0
 
     best_acc = 0
     for name, tree_data in rec.get("per_proposer", {}).items():
-        tids = tree_data["token_ids"][:budget]
-        pids = tree_data["parents"][:budget]
+        tids = tree_data["token_ids"]
+        pids = tree_data["parents"]
         acc = greedy_tree_walk(tids, pids, gt)
         best_acc = max(best_acc, acc)
     return best_acc
+
+
+def _hybrid_step(rec: dict, budget: int, threshold: float) -> int:
+    """Hybrid (suffix decoding paper): use suffix if score >= threshold, else EAGLE3.
+
+    If suffix score is high enough, use suffix tree. Otherwise fall back
+    to EAGLE3 tree. Both use full tree (no budget truncation).
+    """
+    gt = rec.get("ground_truth_future", [])
+    if not gt:
+        return 0
+
+    per_proposer = rec.get("per_proposer", {})
+    suffix_data = per_proposer.get("suffix")
+    eagle3_data = per_proposer.get("eagle3")
+
+    # Check suffix score
+    use_suffix = (suffix_data is not None
+                  and suffix_data.get("score", 0.0) >= threshold
+                  and suffix_data.get("token_ids"))
+
+    if use_suffix:
+        tids = suffix_data["token_ids"]
+        pids = suffix_data["parents"]
+    elif eagle3_data:
+        tids = eagle3_data["token_ids"]
+        pids = eagle3_data["parents"]
+    else:
+        return 0
+
+    return greedy_tree_walk(tids, pids, gt)
 
 
 def _single_proposer_step(rec: dict, budget: int, proposer_name: str) -> int:
@@ -576,6 +605,19 @@ def compute_latency_speedup(
             entry[f"{pair_key}_mat"] = sim["mat"]
             entry[f"{pair_key}_speedup"] = sim["speedup"]
             entry[f"{pair_key}_steps"] = sim["total_steps"]
+
+        # Hybrid (suffix score threshold): suffix if score >= t, else eagle3
+        # Both proposers run, so step cost = verify + max(eagle3_draft, suffix_draft)
+        if "suffix" in proposers and "eagle3" in proposers:
+            hybrid_cost = v_ms + _draft_cost(["eagle3", "suffix"])
+            for t in [0.0, 0.1, 0.3, 0.5, 0.7, 0.9]:
+                key = f"hybrid_t{t:.1f}"
+                sim = simulate_decoding(
+                    records, budget=B, method=f"hybrid:{t}",
+                    verify_latency_ms=hybrid_cost,
+                    vanilla_latency_ms=vanilla_ms)
+                entry[f"{key}_mat"] = sim["mat"]
+                entry[f"{key}_speedup"] = sim["speedup"]
 
         results[B] = entry
 

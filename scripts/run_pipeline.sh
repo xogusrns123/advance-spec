@@ -277,15 +277,16 @@ python3 -m hybrid_spec_decoding.analysis.collect_union_trie \
   $DATASET_FLAG
 
 # ============================================================
-# Stage 5: Collect Target Model p_t (HuggingFace direct forward)
+# Stage 5: Collect Target Model p_t (HuggingFace, multi-GPU parallel)
 # ============================================================
 echo ""
 echo "=== Stage 5: Collect p_t ==="
 
-python3 -m hybrid_spec_decoding.analysis.collect_target_probs \
-  --union-trie-data "$OUTPUT_DIR/union_trie_data.jsonl" \
-  --output "$OUTPUT_DIR/union_trie_data_with_pt.jsonl" \
-  --model "$MODEL"
+bash scripts/run_parallel_p_t.sh \
+  "$OUTPUT_DIR/union_trie_data.jsonl" \
+  "$OUTPUT_DIR/union_trie_data_with_pt.jsonl" \
+  "$MODEL" \
+  "$TP_SIZE"
 
 # ============================================================
 # Stage 6: Oracle Simulation (skip in shard mode — run after merge)

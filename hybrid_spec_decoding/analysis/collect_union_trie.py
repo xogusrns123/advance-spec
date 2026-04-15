@@ -257,6 +257,7 @@ def collect_union_tries(
                         [prompt, np.array(context_for_pt, dtype=np.int32)]) if context_for_pt else prompt.copy()
                 else:
                     context = np.array(context_for_pt, dtype=np.int32)
+                suffix_score = getattr(suffix_draft, "score", 0.0)
                 if suffix_draft.token_ids:
                     proposer_trees["suffix"] = (
                         list(suffix_draft.token_ids),
@@ -305,6 +306,8 @@ def collect_union_tries(
                     # Include p_t from verification logits if available
                     if name == "eagle3" and eagle3_p_t is not None:
                         entry["p_t"] = eagle3_p_t
+                    if name == "suffix":
+                        entry["score"] = float(suffix_score)
                     per_proposer[name] = entry
 
                 records.append({
