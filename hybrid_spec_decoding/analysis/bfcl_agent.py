@@ -48,6 +48,7 @@ from ..sglang_integration.oracle_patch import (
     read_oracle_log,
     is_oracle_enabled,
 )
+from .tools.bfcl import patch_websearch_in_globals, cleanup_globals
 
 
 def load_bfcl_dataset(path: str, num_requests: int | None = None) -> list[dict]:
@@ -262,6 +263,8 @@ def run_single_request(
                     long_context=long_context,
                     is_evaL_run=False,
                 )
+                # Patch WebSearchAPI with DuckDuckGo (free, no SerpAPI key)
+                patch_websearch_in_globals(bfcl_id)
             except Exception as e:
                 step_data["exec_error"] = str(e)
                 all_steps.append(step_data)
@@ -282,6 +285,9 @@ def run_single_request(
                     "role": "tool",
                     "content": str(exec_result),
                 })
+
+    # Clean up globals to prevent memory leak
+    cleanup_globals(bfcl_id)
 
     return {
         "bfcl_id": bfcl_id,
