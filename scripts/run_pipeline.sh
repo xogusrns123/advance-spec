@@ -7,17 +7,23 @@
 # Benchmarks: bfcl_v3, bfcl_v4, specbench, swebench
 # Model presets: glm4_flash, qwen3_8b
 #
+# Request range (for parallel execution across machines):
+#   REQ_START=0  REQ_END=50  bash scripts/run_pipeline.sh bfcl_v4 glm4_flash  # Machine A
+#   REQ_START=50 REQ_END=100 bash scripts/run_pipeline.sh bfcl_v4 glm4_flash  # Machine B
+#   # Then merge: scripts/merge_shards.sh results/glm4_flash/bfcl_v4
+#
 # Examples:
-#   bash scripts/run_pipeline.sh bfcl_v3 glm4_flash 10   # multi-turn function calling
-#   bash scripts/run_pipeline.sh bfcl_v4 glm4_flash 5    # agent (web_search, memory)
-#   bash scripts/run_pipeline.sh specbench qwen3_8b 5
-#   bash scripts/run_pipeline.sh swebench qwen3_8b
+#   bash scripts/run_pipeline.sh bfcl_v3 glm4_flash 10   # first 10 requests
+#   bash scripts/run_pipeline.sh bfcl_v4 glm4_flash 5    # first 5 requests
+#   REQ_START=5 REQ_END=10 bash scripts/run_pipeline.sh bfcl_v4 glm4_flash  # requests 5-9
 set -euo pipefail
 
 BENCHMARK=${1:?Usage: $0 <benchmark> <model_preset> [num_requests]}
 MODEL_PRESET=${2:?Usage: $0 <benchmark> <model_preset> [num_requests]}
 NUM_REQUESTS=${3:-}
 PORT=${PORT:-30000}
+REQ_START=${REQ_START:-}
+REQ_END=${REQ_END:-}
 
 # --- Model preset ---
 case $MODEL_PRESET in
@@ -73,22 +79,14 @@ esac
 
 MODEL_SHORT=$(echo $MODEL_PRESET | tr '[:upper:]' '[:lower:]')
 OUTPUT_DIR="results/${MODEL_SHORT}/${BENCHMARK}"
-mkdir -p "$OUTPUT_DIR"
 
-echo "======================================"
-echo "Oracle Pipeline: $BENCHMARK + $MODEL_PRESET"
-echo "======================================"
-echo "Model: $MODEL"
-echo "Draft: $DRAFT_MODEL"
-echo "TP: $TP_SIZE"
-echo "Input: $INPUT_FILE"
-echo "Output: $OUTPUT_DIR"
-echo ""
-
-NUM_REQ_FLAG=""
-if [ -n "$NUM_REQUESTS" ]; then
-  NUM_REQ_FLAG="--num-requests $NUM_REQUESTS"
+# --- Request range: slice input dataset for parallel execution ---
+IS_PARTIAL=""
+if [ -n "$REQ_START" ] && [ -n "$REQ_END" ]; then
+  IS_PARTIAL=1
+  OUTPUT_DIR="${OUTPUT_DIR}_req${REQ_START}-${REQ_END}"
 fi
+mkdir -p "$OUTPUT_DIR"
 
 # Verify input file exists
 if [ ! -f "$INPUT_FILE" ]; then
@@ -99,6 +97,40 @@ if [ ! -f "$INPUT_FILE" ]; then
   echo "  specbench: python3 scripts/prepare_specbench_data.py"
   echo "  swebench:  Collect trajectories to data/swebench/trajectories.jsonl"
   exit 1
+fi
+
+# Slice the input dataset if range specified
+ORIGINAL_INPUT_FILE="$INPUT_FILE"
+if [ -n "$IS_PARTIAL" ]; then
+  SLICED_INPUT="$OUTPUT_DIR/input_slice.jsonl"
+  python3 -c "
+import sys
+lines = open('$INPUT_FILE').readlines()
+start, end = $REQ_START, $REQ_END
+sliced = lines[start:end]
+with open('$SLICED_INPUT', 'w') as f:
+    f.writelines(sliced)
+print(f'Requests [{start}:{end}]: {len(sliced)}/{len(lines)} selected', file=sys.stderr)
+"
+  INPUT_FILE="$SLICED_INPUT"
+fi
+
+echo "======================================"
+echo "Oracle Pipeline: $BENCHMARK + $MODEL_PRESET"
+echo "======================================"
+echo "Model: $MODEL"
+echo "Draft: $DRAFT_MODEL"
+echo "TP: $TP_SIZE"
+echo "Input: $INPUT_FILE"
+if [ -n "$IS_PARTIAL" ]; then
+  echo "Range: requests [$REQ_START:$REQ_END)"
+fi
+echo "Output: $OUTPUT_DIR"
+echo ""
+
+NUM_REQ_FLAG=""
+if [ -n "$NUM_REQUESTS" ]; then
+  NUM_REQ_FLAG="--num-requests $NUM_REQUESTS"
 fi
 
 wait_for_server() {
@@ -224,12 +256,24 @@ python3 -m hybrid_spec_decoding.analysis.collect_target_probs \
   --model "$MODEL"
 
 # ============================================================
-# Stage 6: Oracle Simulation
+# Stage 6: Oracle Simulation (skip in shard mode — run after merge)
 # ============================================================
+if [ -n "$IS_PARTIAL" ]; then
+  echo ""
+  echo "=== Stage 6: SKIPPED (partial run) ==="
+  echo "Merge partial results and run Stage 6:"
+  echo "  bash scripts/merge_shards.sh results/${MODEL_SHORT}/${BENCHMARK}"
+  echo ""
+  echo "======================================"
+  echo "Partial run [${REQ_START}:${REQ_END}) complete: $BENCHMARK + $MODEL_PRESET"
+  echo "Results: $OUTPUT_DIR/"
+  echo "======================================"
+  exit 0
+fi
+
 echo ""
 echo "=== Stage 6: Oracle Simulation ==="
 
-# Use existing latency config if available, otherwise oracle-only
 LATENCY_FLAG=""
 if [ -f "$OUTPUT_DIR/latency_config.json" ]; then
   LATENCY_FLAG="--latency-config $OUTPUT_DIR/latency_config.json"
