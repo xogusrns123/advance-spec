@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 ORACLE_LOG_PATH = Path("/tmp/sglang_oracle_vanilla.jsonl")
 ORACLE_REPLAY_PATH = os.environ.get("SGLANG_ORACLE_REPLAY", "")
+ORACLE_DRAFT_BUDGET = os.environ.get("SGLANG_DRAFT_BUDGET", "")  # override draft token count
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +272,14 @@ def patch_eagle_worker_full(eagle_worker: "EAGLEWorker") -> None:
         trajectory = _load_trajectory(ORACLE_REPLAY_PATH)
         replay_state = TrajectoryState(trajectory)
         logger.info(f"Oracle REPLAY: {len(trajectory)} trajectories")
+
+    # Override draft budget if requested (for latency measurement)
+    if ORACLE_DRAFT_BUDGET:
+        budget = int(ORACLE_DRAFT_BUDGET)
+        original = eagle_worker.speculative_num_draft_tokens
+        eagle_worker.speculative_num_draft_tokens = budget
+        eagle_worker.server_args.speculative_num_draft_tokens = budget
+        logger.info(f"Oracle DRAFT BUDGET override: {original} → {budget}")
 
     _patch_verify_greedy_func()
     _patch_draft_stash(eagle_worker)
