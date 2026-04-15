@@ -277,10 +277,8 @@ def run_benchmark(
         "questions": questions,
     }
 
-    out_path = Path(output_file)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w") as f:
-        json.dump(output, f, indent=2, ensure_ascii=False)
+    from .save_results import save_agent_results
+    save_agent_results(output, output_file)
 
     print(f"\nResults saved to {output_file}")
     print(f"  Requests: {len(questions)}")

@@ -509,8 +509,8 @@ def run_benchmark(
         "questions": results,
     }
 
-    with open(output_path, "w") as f:
-        json.dump(output, f, indent=2)
+    from .save_results import save_agent_results
+    save_agent_results(output, output_path)
 
     print(f"\nResults saved to {output_file}")
     print(f"  Requests: {len(results)}")
