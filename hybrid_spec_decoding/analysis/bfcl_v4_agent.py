@@ -192,6 +192,12 @@ def process_request(
     all_turn_messages[0] = system_prompt_pre_processing_chat_model(
         all_turn_messages[0], functions, entry_id
     )
+    # Append efficiency instruction to system prompt
+    all_turn_messages[0][0]["content"] += (
+        "\n\nIMPORTANT: Be efficient. Use the minimum number of function calls needed. "
+        "Once you have enough information to answer, respond with the final answer immediately "
+        "instead of making additional searches. Do NOT over-verify or repeat similar queries."
+    )
     messages = []
     for turn_msgs in all_turn_messages:
         messages.extend(turn_msgs)
