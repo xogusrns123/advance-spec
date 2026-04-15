@@ -557,19 +557,28 @@ def _extract_bfcl(questions, exclude_ids, dm_by_id=None,
         # Reconstruct prompt token IDs for suffix cache local tree
         per_call_prompt_ids = None
         if tokenizer:
-            turns = q.get("turns", [])
-            has_messages = (turns and isinstance(turns[0], dict)
-                           and "messages" in turns[0])
-            if has_messages:
-                # SWE-bench: messages embedded in agent_results.json
-                per_call_prompt_ids = _reconstruct_swebench_prompts(
-                    q, tokenizer)
-            elif bfcl_dataset and resp_by_id and bfcl_id in bfcl_dataset:
-                # BFCL: needs external dataset + responses file
-                resp = resp_by_id.get(bfcl_id)
-                if resp:
-                    per_call_prompt_ids = _reconstruct_bfcl_prompts(
-                        bfcl_dataset[bfcl_id], resp, tokenizer)
+            # Preferred: use stored messages (from bfcl_v4_agent with messages)
+            steps = q.get("agent_metrics", {}).get("steps", [])
+            steps_with_msgs = [s for s in steps if s.get("messages")]
+            if steps_with_msgs:
+                per_call_prompt_ids = []
+                for s in steps_with_msgs:
+                    prompt_ids = tokenizer.apply_chat_template(
+                        s["messages"], add_generation_prompt=True)
+                    per_call_prompt_ids.append(prompt_ids)
+            else:
+                # Fallback: SWE-bench or BFCL v3 reconstruction
+                turns = q.get("turns", [])
+                has_messages = (turns and isinstance(turns[0], dict)
+                               and "messages" in turns[0])
+                if has_messages:
+                    per_call_prompt_ids = _reconstruct_swebench_prompts(
+                        q, tokenizer)
+                elif bfcl_dataset and resp_by_id and bfcl_id in bfcl_dataset:
+                    resp = resp_by_id.get(bfcl_id)
+                    if resp:
+                        per_call_prompt_ids = _reconstruct_bfcl_prompts(
+                            bfcl_dataset[bfcl_id], resp, tokenizer)
 
         # Check if any eagle3_tree data is present
         has_trees = any(

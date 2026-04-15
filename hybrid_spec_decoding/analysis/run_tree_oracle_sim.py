@@ -357,9 +357,12 @@ def simulate_decoding(
             # Select tree and compute acceptance
             if method == "eu":
                 accepted = _eu_step(rec, budget, p_t_key)
-            elif method.startswith("hybrid:"):
+            elif method.startswith("hybrid_e3:"):
                 threshold = float(method.split(":", 1)[1])
-                accepted = _hybrid_step(rec, budget, threshold)
+                accepted = _hybrid_step(rec, budget, threshold, fallback="eagle3")
+            elif method.startswith("hybrid_dm:"):
+                threshold = float(method.split(":", 1)[1])
+                accepted = _hybrid_step(rec, budget, threshold, fallback="draft_model")
             elif method.startswith("single:"):
                 proposer_name = method.split(":", 1)[1]
                 accepted = _single_proposer_step(rec, budget, proposer_name)
@@ -447,11 +450,12 @@ def _choose_one_step(rec: dict, budget: int) -> int:
     return best_acc
 
 
-def _hybrid_step(rec: dict, budget: int, threshold: float) -> int:
-    """Hybrid (suffix decoding paper): use suffix if score >= threshold, else EAGLE3.
+def _hybrid_step(rec: dict, budget: int, threshold: float,
+                 fallback: str = "eagle3") -> int:
+    """Hybrid: use suffix if score >= threshold, else fallback proposer.
 
-    If suffix score is high enough, use suffix tree. Otherwise fall back
-    to EAGLE3 tree. Both use full tree (no budget truncation).
+    fallback="eagle3" → suffix + EAGLE3  (hybrid_e3)
+    fallback="draft_model" → suffix + draft model  (hybrid_dm)
     """
     gt = rec.get("ground_truth_future", [])
     if not gt:
@@ -459,9 +463,8 @@ def _hybrid_step(rec: dict, budget: int, threshold: float) -> int:
 
     per_proposer = rec.get("per_proposer", {})
     suffix_data = per_proposer.get("suffix")
-    eagle3_data = per_proposer.get("eagle3")
+    fallback_data = per_proposer.get(fallback)
 
-    # Check suffix score
     use_suffix = (suffix_data is not None
                   and suffix_data.get("score", 0.0) >= threshold
                   and suffix_data.get("token_ids"))
@@ -469,9 +472,9 @@ def _hybrid_step(rec: dict, budget: int, threshold: float) -> int:
     if use_suffix:
         tids = suffix_data["token_ids"]
         pids = suffix_data["parents"]
-    elif eagle3_data:
-        tids = eagle3_data["token_ids"]
-        pids = eagle3_data["parents"]
+    elif fallback_data and fallback_data.get("token_ids"):
+        tids = fallback_data["token_ids"]
+        pids = fallback_data["parents"]
     else:
         return 0
 
@@ -479,7 +482,7 @@ def _hybrid_step(rec: dict, budget: int, threshold: float) -> int:
 
 
 def _single_proposer_step(rec: dict, budget: int, proposer_name: str) -> int:
-    """Single proposer: use only one proposer's tree, return accepted tokens."""
+    """Single proposer: use full tree, return accepted tokens."""
     gt = rec.get("ground_truth_future", [])
     if not gt:
         return 0
@@ -488,13 +491,13 @@ def _single_proposer_step(rec: dict, budget: int, proposer_name: str) -> int:
     if not tree_data:
         return 0
 
-    tids = tree_data["token_ids"][:budget]
-    pids = tree_data["parents"][:budget]
+    tids = tree_data["token_ids"]
+    pids = tree_data["parents"]
     return greedy_tree_walk(tids, pids, gt)
 
 
 def _subset_step(rec: dict, budget: int, proposer_names: List[str]) -> int:
-    """Choose-One over a subset of proposers."""
+    """Choose-One over a subset of proposers. Full trees, no truncation."""
     gt = rec.get("ground_truth_future", [])
     if not gt:
         return 0
@@ -504,8 +507,8 @@ def _subset_step(rec: dict, budget: int, proposer_names: List[str]) -> int:
         tree_data = rec.get("per_proposer", {}).get(name)
         if not tree_data:
             continue
-        tids = tree_data["token_ids"][:budget]
-        pids = tree_data["parents"][:budget]
+        tids = tree_data["token_ids"]
+        pids = tree_data["parents"]
         acc = greedy_tree_walk(tids, pids, gt)
         best_acc = max(best_acc, acc)
     return best_acc
@@ -585,7 +588,11 @@ def compute_latency_speedup(
 
         # Single-proposer baselines
         for pname in proposers:
-            step_ms = v_ms + _draft_cost([pname])
+            if pname == "suffix":
+                # Suffix draft is free (CPU) → step cost = target forward only
+                step_ms = vanilla_ms
+            else:
+                step_ms = v_ms + _draft_cost([pname])
             sim = simulate_decoding(
                 records, budget=B, method=f"single:{pname}",
                 verify_latency_ms=step_ms,
@@ -606,14 +613,28 @@ def compute_latency_speedup(
             entry[f"{pair_key}_speedup"] = sim["speedup"]
             entry[f"{pair_key}_steps"] = sim["total_steps"]
 
-        # Hybrid (suffix score threshold): suffix if score >= t, else eagle3
-        # Both proposers run, so step cost = verify + max(eagle3_draft, suffix_draft)
+        # Hybrid (suffix score threshold): suffix if score >= t, else fallback
+        thresholds = [1.0, 3.0, 5.0]
+
+        # hybrid_e3: suffix + EAGLE3
         if "suffix" in proposers and "eagle3" in proposers:
             hybrid_cost = v_ms + _draft_cost(["eagle3", "suffix"])
-            for t in [0.0, 0.1, 0.3, 0.5, 0.7, 0.9]:
-                key = f"hybrid_t{t:.1f}"
+            for t in thresholds:
+                key = f"hybrid_e3_t{t:.1f}"
                 sim = simulate_decoding(
-                    records, budget=B, method=f"hybrid:{t}",
+                    records, budget=B, method=f"hybrid_e3:{t}",
+                    verify_latency_ms=hybrid_cost,
+                    vanilla_latency_ms=vanilla_ms)
+                entry[f"{key}_mat"] = sim["mat"]
+                entry[f"{key}_speedup"] = sim["speedup"]
+
+        # hybrid_dm: suffix + draft model
+        if "suffix" in proposers and "draft_model" in proposers:
+            hybrid_cost = v_ms + _draft_cost(["draft_model", "suffix"])
+            for t in thresholds:
+                key = f"hybrid_dm_t{t:.1f}"
+                sim = simulate_decoding(
+                    records, budget=B, method=f"hybrid_dm:{t}",
                     verify_latency_ms=hybrid_cost,
                     vanilla_latency_ms=vanilla_ms)
                 entry[f"{key}_mat"] = sim["mat"]

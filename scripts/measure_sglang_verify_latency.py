@@ -171,6 +171,11 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=200)
     parser.add_argument("--output", required=True,
                         help="Output latency_config.json path")
+    parser.add_argument("--draft-lm", default=None,
+                        help="Small draft language model (e.g. Qwen/Qwen3-0.6B). "
+                             "Measured as vanilla autoregressive TPOT.")
+    parser.add_argument("--draft-lm-tp-size", type=int, default=1,
+                        help="TP size for draft LM (default: 1)")
     parser.add_argument("--extra-args", nargs="*", default=[],
                         help="Extra args passed to sglang.launch_server")
     args = parser.parse_args()
@@ -250,6 +255,42 @@ def main():
         kill_server(proc)
         time.sleep(5)
 
+    # --- Step 3 (optional): Measure draft LM vanilla TPOT ---
+    draft_lm_tpot = None
+    if args.draft_lm:
+        print("=" * 60, file=sys.stderr)
+        print(f"Measuring draft LM: {args.draft_lm}...", file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
+
+        env = os.environ.copy()
+        env["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
+        draft_lm_cmd = [
+            sys.executable, "-m", "sglang.launch_server",
+            "--model-path", args.draft_lm,
+            "--tp-size", str(args.draft_lm_tp_size),
+            "--mem-fraction-static", "0.8",
+            "--disable-cuda-graph",
+            "--host", "0.0.0.0",
+            "--port", str(args.port),
+        ]
+
+        proc = subprocess.Popen(
+            draft_lm_cmd, env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=os.setsid,
+        )
+
+        if not wait_for_server(url):
+            kill_server(proc)
+            print("ERROR: Draft LM server failed to start", file=sys.stderr)
+        else:
+            draft_lm_tpot = measure_tpot(url, args.draft_lm, args.n_warmup,
+                                         args.n_measure, args.max_tokens)
+            print(f"\n  Draft LM TPOT: {draft_lm_tpot:.2f} ms/tok\n", file=sys.stderr)
+            kill_server(proc)
+            time.sleep(5)
+
     # --- Output ---
     output = {
         "vanilla_step_ms": vanilla_tpot,
@@ -259,6 +300,9 @@ def main():
                 "(accept_length=0, 1 token/step). "
                 "TPOT = step_cost = draft(B) + verify(B) per step.",
     }
+    if draft_lm_tpot is not None:
+        output["draft_lm_tpot_ms"] = draft_lm_tpot
+        output["draft_lm"] = args.draft_lm
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     with open(args.output, "w") as f:
@@ -269,6 +313,9 @@ def main():
     print("RESULTS", file=sys.stderr)
     print("=" * 60, file=sys.stderr)
     print(f"Vanilla TPOT: {vanilla_tpot:.2f} ms/tok", file=sys.stderr)
+    if draft_lm_tpot is not None:
+        print(f"Draft LM TPOT: {draft_lm_tpot:.2f} ms/tok ({args.draft_lm})",
+              file=sys.stderr)
     print(file=sys.stderr)
     print(f"{'Budget':>6} | {'Step cost (ms)':>14} | {'Overhead':>10} | {'Draft cost':>10}",
           file=sys.stderr)

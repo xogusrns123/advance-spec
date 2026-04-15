@@ -31,12 +31,14 @@ case $MODEL_PRESET in
   glm4_flash)
     MODEL="zai-org/GLM-4.7-Flash"
     DRAFT_MODEL="thoughtworks/GLM-4.7-Flash-Eagle3"
+    DRAFT_LM=""
     TP_SIZE=4
     MEM_FRAC=0.8
     ;;
   qwen3_8b)
     MODEL="Qwen/Qwen3-8B"
     DRAFT_MODEL="Tengyunw/qwen3_8b_eagle3"
+    DRAFT_LM="Qwen/Qwen3-0.6B"
     TP_SIZE=1
     MEM_FRAC=0.85
     ;;
@@ -182,9 +184,9 @@ python3 -m sglang.launch_server \
   --tp-size $TP_SIZE \
   --speculative-algorithm EAGLE3 \
   --speculative-draft-model-path "$DRAFT_MODEL" \
-  --speculative-num-steps 3 \
+  --speculative-num-steps 5 \
   --speculative-eagle-topk 4 \
-  --speculative-num-draft-tokens 16 \
+  --speculative-num-draft-tokens 256 \
   --mem-fraction-static $MEM_FRAC \
   --disable-cuda-graph \
   --host 0.0.0.0 --port $PORT \
@@ -277,33 +279,39 @@ python3 -m hybrid_spec_decoding.analysis.collect_union_trie \
   $DATASET_FLAG
 
 # ============================================================
+# Stage 4b: Collect Draft Model proposals (if DRAFT_LM is set)
+# ============================================================
+DRAFT_LM=${DRAFT_LM:-}
+PT_INPUT="$OUTPUT_DIR/union_trie_data.jsonl"
+
+if [ -n "$DRAFT_LM" ]; then
+  echo ""
+  echo "=== Stage 4b: Draft Model ($DRAFT_LM) ==="
+  NUM_GPUS=${NUM_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}
+  bash scripts/run_parallel_draft_model.sh \
+    "$OUTPUT_DIR/union_trie_data.jsonl" \
+    "$OUTPUT_DIR/union_trie_data_with_dm.jsonl" \
+    "$DRAFT_LM" \
+    "$NUM_GPUS"
+  PT_INPUT="$OUTPUT_DIR/union_trie_data_with_dm.jsonl"
+fi
+
+# ============================================================
 # Stage 5: Collect Target Model p_t (HuggingFace, multi-GPU parallel)
 # ============================================================
 echo ""
 echo "=== Stage 5: Collect p_t ==="
 
+NUM_GPUS=${NUM_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}
 bash scripts/run_parallel_p_t.sh \
-  "$OUTPUT_DIR/union_trie_data.jsonl" \
+  "$PT_INPUT" \
   "$OUTPUT_DIR/union_trie_data_with_pt.jsonl" \
   "$MODEL" \
-  "$TP_SIZE"
+  "$NUM_GPUS"
 
 # ============================================================
-# Stage 6: Oracle Simulation (skip in shard mode — run after merge)
+# Stage 6: Oracle Simulation
 # ============================================================
-if [ -n "$IS_PARTIAL" ]; then
-  echo ""
-  echo "=== Stage 6: SKIPPED (partial run) ==="
-  echo "Merge partial results and run Stage 6:"
-  echo "  bash scripts/merge_shards.sh results/${MODEL_SHORT}/${BENCHMARK}"
-  echo ""
-  echo "======================================"
-  echo "Partial run [${REQ_START}:${REQ_END}) complete: $BENCHMARK + $MODEL_PRESET"
-  echo "Results: $OUTPUT_DIR/"
-  echo "======================================"
-  exit 0
-fi
-
 echo ""
 echo "=== Stage 6: Oracle Simulation ==="
 
@@ -314,7 +322,7 @@ fi
 
 python3 -m hybrid_spec_decoding.analysis.run_tree_oracle_sim \
   --union-trie-data "$OUTPUT_DIR/union_trie_data_with_pt.jsonl" \
-  --budgets 1,2,4,8,16 \
+  --budgets 1,2,4,8,16,32,64,128,256 \
   --p-t-key p_t \
   --output "$OUTPUT_DIR/tree_oracle_sim.json" \
   --print-summary \
