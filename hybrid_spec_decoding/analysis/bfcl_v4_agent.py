@@ -73,6 +73,7 @@ from bfcl_eval.constants.category_mapping import AGENTIC_CATEGORY
 
 from ..sglang_integration.oracle_patch import (
     clear_oracle_log,
+    get_oracle_log_position,
     read_oracle_log,
     is_oracle_enabled,
 )
@@ -209,7 +210,7 @@ def process_request(
 
     for step in range(max_iterations):
         if collect_oracle:
-            clear_oracle_log()
+            oracle_pos = get_oracle_log_position()
 
         # LLM call
         t_llm = time.perf_counter()
@@ -241,7 +242,7 @@ def process_request(
 
         # Collect oracle entries
         if collect_oracle:
-            oracle_entries = read_oracle_log()
+            oracle_entries = read_oracle_log(oracle_pos)
             if oracle_entries:
                 step_data["spec_decode"] = {
                     "oracle_vanilla_entries": oracle_entries,
@@ -311,6 +312,7 @@ def run_benchmark(
     output_file: str,
     num_requests: int | None = None,
     max_iterations: int = 10,
+    num_workers: int = 1,
 ) -> None:
     """Run BFCLv4 agentic benchmark."""
     collect_oracle = is_oracle_enabled()
@@ -332,16 +334,26 @@ def run_benchmark(
         dataset = populate_initial_settings_for_web_search_test_cases(dataset)
 
     dataset.sort(key=sort_key)
-    print(f"Running {len(dataset)} BFCLv4 requests against {url}")
+    print(f"Running {len(dataset)} BFCLv4 requests against {url}"
+          f" (workers={num_workers})")
 
     client = OpenAI(base_url=url, api_key="dummy")
     questions = []
     total_oracle = 0
     total_tokens = 0
 
-    for request in tqdm(dataset, desc="BFCLv4"):
-        result = process_request(
+    def _process(request):
+        return process_request(
             client, model, request, max_iterations, collect_oracle)
+
+    if num_workers <= 1:
+        results_iter = (_process(r) for r in dataset)
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        executor = ThreadPoolExecutor(max_workers=num_workers)
+        results_iter = executor.map(_process, dataset)
+
+    for result in tqdm(results_iter, total=len(dataset), desc="BFCLv4"):
         questions.append(result)
         for s in result.get("agent_metrics", {}).get("steps", []):
             total_tokens += s.get("completion_tokens", 0)
@@ -379,6 +391,9 @@ def main():
     parser.add_argument("--output-file", required=True)
     parser.add_argument("--num-requests", type=int, default=None)
     parser.add_argument("--max-iterations", type=int, default=10)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--num-workers", type=int, default=1,
+                        help="Concurrent requests to SGLang server")
     args = parser.parse_args()
 
     run_benchmark(
@@ -388,6 +403,7 @@ def main():
         output_file=args.output_file,
         num_requests=args.num_requests,
         max_iterations=args.max_iterations,
+        num_workers=args.num_workers,
     )
 
 
