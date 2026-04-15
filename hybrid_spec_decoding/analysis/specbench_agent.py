@@ -1,0 +1,320 @@
+"""
+SpecBench / MT-Bench agent for SGLang oracle trajectory collection.
+
+Multi-turn Q&A without tool calls. Sends each turn's user message,
+collects the assistant response, and logs oracle draft entries.
+
+Output format is compatible with _extract_online() in run_oracle_sim.py.
+
+Usage:
+    python3 -m hybrid_spec_decoding.analysis.specbench_agent \
+        --url http://localhost:30000/v1 \
+        --model Qwen/Qwen3-8B \
+        --input-file data/specbench/dataset.jsonl \
+        --output-file results/qwen3_8b/specbench/agent_results_eagle3.json \
+        --num-requests 80
+
+    # MTP replay (Round 2):
+    python3 -m hybrid_spec_decoding.analysis.specbench_agent \
+        --url http://localhost:30000/v1 \
+        --model Qwen/Qwen3-8B \
+        --input-file data/specbench/dataset.jsonl \
+        --output-file results/qwen3_8b/specbench/agent_results_mtp.json \
+        --replay results/qwen3_8b/specbench/agent_results_eagle3.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import time
+from pathlib import Path
+
+from openai import OpenAI
+from tqdm import tqdm
+
+from ..sglang_integration.oracle_patch import (
+    clear_oracle_log,
+    read_oracle_log,
+    is_oracle_enabled,
+)
+
+
+def load_specbench_dataset(
+    path: str,
+    num_requests: int | None = None,
+) -> list[dict]:
+    """Load SpecBench/MT-Bench JSONL dataset."""
+    records = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    if num_requests is not None:
+        records = records[:num_requests]
+    return records
+
+
+def run_single_request(
+    client: OpenAI,
+    model: str,
+    item: dict,
+    temperature: float = 0.0,
+    max_tokens: int = 2048,
+    collect_oracle: bool = True,
+) -> dict:
+    """Run multi-turn Q&A for one SpecBench question.
+
+    Each turn: send user message → collect assistant response → log oracle.
+    No tool calls, no agent loop.
+    """
+    question_id = item.get("question_id", "unknown")
+    turns = item.get("turns", [])
+    messages = []
+    turns_data = []
+
+    total_oracle = 0
+    total_tokens = 0
+
+    for turn_idx, user_msg in enumerate(turns):
+        if collect_oracle:
+            clear_oracle_log()
+
+        messages.append({"role": "user", "content": user_msg})
+
+        t_start = time.perf_counter()
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except Exception as e:
+            turns_data.append({
+                "response": "",
+                "error": str(e),
+            })
+            continue
+
+        latency = time.perf_counter() - t_start
+        choice = response.choices[0]
+        content = choice.message.content or ""
+        messages.append({"role": "assistant", "content": content})
+
+        completion_tokens = response.usage.completion_tokens
+        total_tokens += completion_tokens
+
+        turn_data = {
+            "response": content,
+            "latency_s": latency,
+            "prompt_tokens": response.usage.prompt_tokens,
+            "completion_tokens": completion_tokens,
+        }
+
+        if collect_oracle:
+            oracle_entries = read_oracle_log()
+            if oracle_entries:
+                turn_data["spec_decode"] = {
+                    "oracle_vanilla_entries": oracle_entries,
+                }
+                total_oracle += len(oracle_entries)
+
+        turns_data.append(turn_data)
+
+    return {
+        "question_id": question_id,
+        "category": item.get("category", ""),
+        "turns": turns_data,
+        "total_oracle_entries": total_oracle,
+        "total_tokens": total_tokens,
+    }
+
+
+def replay_single_request(
+    client: OpenAI,
+    model: str,
+    item: dict,
+    round1_question: dict,
+    temperature: float = 0.0,
+    max_tokens: int = 2048,
+) -> dict:
+    """Replay Round 1 message history to collect MTP drafts.
+
+    Reconstructs exact conversation from Round 1 and sends each turn's
+    prompt to the MTP server. The oracle_replay patch forces tokens.
+    """
+    question_id = item.get("question_id", "unknown")
+    turns = item.get("turns", [])
+    r1_turns = round1_question.get("turns", [])
+    messages = []
+    turns_data = []
+    total_oracle = 0
+
+    for turn_idx, user_msg in enumerate(turns):
+        clear_oracle_log()
+
+        messages.append({"role": "user", "content": user_msg})
+
+        t_start = time.perf_counter()
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except Exception as e:
+            turns_data.append({"response": "", "error": str(e)})
+            # Use Round 1 response to keep conversation history consistent
+            if turn_idx < len(r1_turns):
+                messages.append({"role": "assistant",
+                                 "content": r1_turns[turn_idx].get("response", "")})
+            continue
+
+        latency = time.perf_counter() - t_start
+        content = response.choices[0].message.content or ""
+
+        # Use Round 1 response for conversation history (MTP might differ)
+        if turn_idx < len(r1_turns):
+            messages.append({"role": "assistant",
+                             "content": r1_turns[turn_idx].get("response", "")})
+        else:
+            messages.append({"role": "assistant", "content": content})
+
+        turn_data = {
+            "response": content,
+            "latency_s": latency,
+            "completion_tokens": response.usage.completion_tokens,
+        }
+
+        oracle_entries = read_oracle_log()
+        if oracle_entries:
+            turn_data["spec_decode"] = {
+                "oracle_vanilla_entries": oracle_entries,
+            }
+            total_oracle += len(oracle_entries)
+
+        turns_data.append(turn_data)
+
+    return {
+        "question_id": question_id,
+        "category": item.get("category", ""),
+        "turns": turns_data,
+        "total_oracle_entries": total_oracle,
+        "mode": "replay",
+    }
+
+
+def run_benchmark(
+    url: str,
+    model: str,
+    input_file: str,
+    output_file: str,
+    num_requests: int | None = None,
+    max_iterations: int = 1,  # unused, kept for CLI compat
+    temperature: float = 0.0,
+    max_tokens: int = 2048,
+    replay_path: str | None = None,
+) -> None:
+    """Run SpecBench benchmark and save results."""
+    collect_oracle = is_oracle_enabled()
+
+    if collect_oracle:
+        print("Oracle collection enabled (SGLANG_ORACLE_VANILLA=1)")
+    else:
+        print("Oracle collection disabled (set SGLANG_ORACLE_VANILLA=1 to enable)")
+
+    dataset = load_specbench_dataset(input_file, num_requests)
+
+    # Load Round 1 results for replay mode
+    round1_map = {}
+    if replay_path:
+        print(f"REPLAY mode: following trajectory from {replay_path}")
+        with open(replay_path) as f:
+            r1_data = json.load(f)
+        for q in r1_data["questions"]:
+            qid = str(q.get("question_id", ""))
+            round1_map[qid] = q
+        print(f"  Round 1 questions: {len(round1_map)}")
+
+    client = OpenAI(base_url=url, api_key="dummy")
+    print(f"Running {len(dataset)} SpecBench requests against {url}")
+
+    questions = []
+    total_oracle = 0
+    total_tokens = 0
+
+    for item in tqdm(dataset, desc="SpecBench"):
+        qid = str(item.get("question_id", ""))
+
+        if replay_path:
+            r1_q = round1_map.get(qid)
+            if not r1_q:
+                continue
+            result = replay_single_request(
+                client, model, item, r1_q, temperature, max_tokens)
+        else:
+            result = run_single_request(
+                client, model, item, temperature, max_tokens, collect_oracle)
+
+        questions.append(result)
+        total_oracle += result.get("total_oracle_entries", 0)
+        total_tokens += result.get("total_tokens", 0)
+
+    # Save results
+    output = {
+        "metadata": {
+            "model": model,
+            "url": url,
+            "benchmark": "specbench",
+            "num_requests": len(questions),
+            "total_oracle_entries": total_oracle,
+            "total_tokens": total_tokens,
+            "oracle_enabled": collect_oracle,
+        },
+        "questions": questions,
+    }
+
+    out_path = Path(output_file)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump(output, f, indent=2, ensure_ascii=False)
+
+    print(f"\nResults saved to {output_file}")
+    print(f"  Requests: {len(questions)}")
+    print(f"  Oracle entries: {total_oracle}")
+    print(f"  Total tokens: {total_tokens}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="SpecBench agent for SGLang oracle collection")
+    parser.add_argument("--url", default="http://localhost:30000/v1")
+    parser.add_argument("--model", default="Qwen/Qwen3-8B")
+    parser.add_argument("--input-file", required=True)
+    parser.add_argument("--output-file", required=True)
+    parser.add_argument("--num-requests", type=int, default=None)
+    parser.add_argument("--max-iterations", type=int, default=1,
+                        help="Unused, kept for CLI compatibility")
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--max-tokens", type=int, default=2048)
+    parser.add_argument("--replay", default=None,
+                        help="Path to Round 1 results for MTP replay")
+    args = parser.parse_args()
+
+    run_benchmark(
+        url=args.url,
+        model=args.model,
+        input_file=args.input_file,
+        output_file=args.output_file,
+        num_requests=args.num_requests,
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+        replay_path=args.replay,
+    )
+
+
+if __name__ == "__main__":
+    main()

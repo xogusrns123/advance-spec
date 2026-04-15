@@ -30,11 +30,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import signal
 import statistics
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 from openai import OpenAI
 
@@ -97,6 +97,9 @@ def measure_tpot(
     return statistics.median(tpots) if tpots else 0.0
 
 
+_SERVER_LOG = Path("/tmp/sglang_latency_bench.log")
+
+
 def launch_server(
     model: str,
     draft_model: str | None,
@@ -110,10 +113,7 @@ def launch_server(
     env = os.environ.copy()
     env["SGLANG_ORACLE_VANILLA"] = "1"
     env["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
-    if draft_budget is not None:
-        env["SGLANG_DRAFT_BUDGET"] = str(draft_budget)
-    else:
-        env.pop("SGLANG_DRAFT_BUDGET", None)
+    env.pop("SGLANG_DRAFT_BUDGET", None)  # use CLI arg, not env override
 
     cmd = [
         sys.executable, "-m", "sglang.launch_server",
@@ -122,7 +122,9 @@ def launch_server(
         "--speculative-algorithm", algorithm,
         "--speculative-num-steps", "3",
         "--speculative-eagle-topk", "4",
-        "--speculative-num-draft-tokens", "16",
+        # Pass budget directly as num-draft-tokens so all
+        # initialization (buffers, masks) uses the correct size
+        "--speculative-num-draft-tokens", str(draft_budget or 16),
         "--mem-fraction-static", "0.8",
         "--disable-cuda-graph",
         "--host", "0.0.0.0",
@@ -132,22 +134,22 @@ def launch_server(
         cmd.extend(["--speculative-draft-model-path", draft_model])
     cmd.extend(extra_args)
 
-    proc = subprocess.Popen(
-        cmd, env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        preexec_fn=os.setsid,
-    )
+    log_fh = open(_SERVER_LOG, "w")
+    proc = subprocess.Popen(cmd, env=env, stdout=log_fh, stderr=log_fh)
     return proc
 
 
 def kill_server(proc: subprocess.Popen):
-    """Kill server process group."""
+    """Kill server and all children."""
+    import psutil
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except ProcessLookupError:
+        parent = psutil.Process(proc.pid)
+        for child in parent.children(recursive=True):
+            child.kill()
+        parent.kill()
+    except psutil.NoSuchProcess:
         pass
-    proc.wait(timeout=10)
+    proc.wait(timeout=30)
 
 
 def main():
