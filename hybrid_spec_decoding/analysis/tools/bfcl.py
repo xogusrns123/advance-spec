@@ -17,7 +17,7 @@ def _ddg_search_engine_query(
     self,
     keywords: str,
     max_results: int = 10,
-    region: str = "wt-wt",
+    region: str = "us-en",
 ) -> list | dict:
     """Replace SerpAPI with free duckduckgo-search (no API key required)."""
     try:

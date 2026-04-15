@@ -276,8 +276,9 @@ def simulate_decoding(
     budget: int,
     method: str,
     p_t_key: str = "p_t_oracle",
-    verify_latency_ms: float = 10.0,
-    vanilla_latency_ms: float = 10.0,
+    *,
+    verify_latency_ms: float,
+    vanilla_latency_ms: float,
 ) -> dict:
     """Simulate actual speculative decoding with skip-ahead.
 
@@ -299,9 +300,9 @@ def simulate_decoding(
     p_t_key : str
         Key for p_t values (only used for method="eu").
     verify_latency_ms : float
-        Time for one tree verification step.
+        Time for one tree verification step. Must be from measured latency config.
     vanilla_latency_ms : float
-        Time for one vanilla decode step (baseline).
+        Time for one vanilla decode step (baseline). Must be from measured latency config.
 
     Returns
     -------
@@ -712,8 +713,9 @@ def main():
                         help="Comma-separated budget values for sweep")
     parser.add_argument("--p-t-key", default="p_t_oracle",
                         help="Key for p_t values in records (default: p_t_oracle)")
-    parser.add_argument("--latency-config", default=None,
-                        help="Path to latency_config.json (from measure_verify_latency.py)")
+    parser.add_argument("--latency-config", required=True,
+                        help="Path to latency_config.json (from measure_verify_latency.py). "
+                             "Required: use measure_sglang_verify_latency.py to generate it.")
     parser.add_argument("--draft-latencies", default=None,
                         help="Per-proposer draft cost in ms, e.g. "
                              "'eagle3=3.3,mtp=2.0,suffix=0.3'. "
@@ -769,21 +771,17 @@ def main():
         print(f"Draft latencies (ms): {draft_latencies_ms}", file=sys.stderr)
 
     # Latency-aware simulation
-    latency_config = None
-    latency_results = None
-    if args.latency_config:
-        with open(args.latency_config) as f:
-            latency_config = json.load(f)
-        latency_results = compute_latency_speedup(
-            records, budgets, latency_config, p_t_key=args.p_t_key,
-            draft_latencies_ms=draft_latencies_ms)
+    with open(args.latency_config) as f:
+        latency_config = json.load(f)
+    latency_results = compute_latency_speedup(
+        records, budgets, latency_config, p_t_key=args.p_t_key,
+        draft_latencies_ms=draft_latencies_ms)
 
     if args.print_summary:
         print_summary(choose_one, eu_results, choose_one_budget,
                       budgets, args.p_t_key)
-        if latency_results and latency_config:
-            print_latency_summary(latency_results, budgets,
-                                  latency_config["vanilla_step_ms"])
+        print_latency_summary(latency_results, budgets,
+                              latency_config["vanilla_step_ms"])
 
     if args.output:
         output = {
@@ -812,34 +810,33 @@ def main():
             },
         }
 
-        if latency_results:
-            proposers = _discover_proposers(records)
-            pairs = [f"{proposers[i]}+{proposers[j]}"
-                     for i in range(len(proposers))
-                     for j in range(i + 1, len(proposers))]
-            all_methods = proposers + pairs
-            output["latency"] = {
-                "vanilla_step_ms": latency_config["vanilla_step_ms"],
-                "proposers": proposers,
-                "pairs": pairs,
-                "budget_sweep": [
-                    {
-                        "budget": B,
-                        "verify_ms": latency_results[B]["verify_ms"],
-                        "eu_speedup": latency_results[B]["eu_speedup"],
-                        "c1_speedup": latency_results[B]["c1_speedup"],
-                        **{
-                            f"{m}_speedup": latency_results[B].get(f"{m}_speedup", 0)
-                            for m in all_methods
-                        },
-                        **{
-                            f"{m}_mat": latency_results[B].get(f"{m}_mat", 0)
-                            for m in all_methods
-                        },
-                    }
-                    for B in budgets if B in latency_results
-                ],
-            }
+        proposers = _discover_proposers(records)
+        pairs = [f"{proposers[i]}+{proposers[j]}"
+                 for i in range(len(proposers))
+                 for j in range(i + 1, len(proposers))]
+        all_methods = proposers + pairs
+        output["latency"] = {
+            "vanilla_step_ms": latency_config["vanilla_step_ms"],
+            "proposers": proposers,
+            "pairs": pairs,
+            "budget_sweep": [
+                {
+                    "budget": B,
+                    "verify_ms": latency_results[B]["verify_ms"],
+                    "eu_speedup": latency_results[B]["eu_speedup"],
+                    "c1_speedup": latency_results[B]["c1_speedup"],
+                    **{
+                        f"{m}_speedup": latency_results[B].get(f"{m}_speedup", 0)
+                        for m in all_methods
+                    },
+                    **{
+                        f"{m}_mat": latency_results[B].get(f"{m}_mat", 0)
+                        for m in all_methods
+                    },
+                }
+                for B in budgets if B in latency_results
+            ],
+        }
 
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
