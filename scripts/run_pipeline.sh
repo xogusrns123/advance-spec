@@ -4,12 +4,13 @@
 # Usage:
 #   bash scripts/run_pipeline.sh <benchmark> <model_preset> [num_requests]
 #
-# Benchmarks: bfcl, specbench, swebench
+# Benchmarks: bfcl_v3, bfcl_v4, specbench, swebench
 # Model presets: glm4_flash, qwen3_8b
 #
 # Examples:
+#   bash scripts/run_pipeline.sh bfcl_v3 glm4_flash 10   # multi-turn function calling
+#   bash scripts/run_pipeline.sh bfcl_v4 glm4_flash 5    # agent (web_search, memory)
 #   bash scripts/run_pipeline.sh specbench qwen3_8b 5
-#   bash scripts/run_pipeline.sh bfcl glm4_flash 10
 #   bash scripts/run_pipeline.sh swebench qwen3_8b
 set -euo pipefail
 
@@ -40,11 +41,17 @@ esac
 
 # --- Benchmark config ---
 case $BENCHMARK in
-  bfcl)
+  bfcl_v3)
     AGENT_MODULE="hybrid_spec_decoding.analysis.bfcl_agent"
     INPUT_FILE="data/bfcl_multi_turn/dataset.jsonl"
     DATASET_FLAG="--model $MODEL"
     MAX_ITER_FLAG="--max-iterations 20"
+    ;;
+  bfcl_v4)
+    AGENT_MODULE="hybrid_spec_decoding.analysis.bfcl_agent"
+    INPUT_FILE="data/bfcl_agent/dataset.jsonl"
+    DATASET_FLAG="--model $MODEL"
+    MAX_ITER_FLAG="--max-iterations 5"
     ;;
   specbench)
     AGENT_MODULE="hybrid_spec_decoding.analysis.specbench_agent"
@@ -59,7 +66,7 @@ case $BENCHMARK in
     MAX_ITER_FLAG="--max-iterations 15 --repos-dir data/swebench/repos"
     ;;
   *)
-    echo "Unknown benchmark: $BENCHMARK (use bfcl, specbench, or swebench)"
+    echo "Unknown benchmark: $BENCHMARK (use bfcl_v3, bfcl_v4, specbench, or swebench)"
     exit 1
     ;;
 esac
@@ -87,7 +94,8 @@ fi
 if [ ! -f "$INPUT_FILE" ]; then
   echo "ERROR: Input file not found: $INPUT_FILE"
   echo "Run the appropriate prepare script first:"
-  echo "  bfcl:      python3 scripts/prepare_bfcl_data.py"
+  echo "  bfcl_v3:   python3 scripts/prepare_bfcl_data.py --benchmark v3"
+  echo "  bfcl_v4:   python3 scripts/prepare_bfcl_data.py --benchmark v4"
   echo "  specbench: python3 scripts/prepare_specbench_data.py"
   echo "  swebench:  Collect trajectories to data/swebench/trajectories.jsonl"
   exit 1
