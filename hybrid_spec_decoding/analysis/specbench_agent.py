@@ -35,6 +35,7 @@ from tqdm import tqdm
 
 from ..sglang_integration.oracle_patch import (
     clear_oracle_log,
+    get_oracle_log_position,
     read_oracle_log,
     is_oracle_enabled,
 )
@@ -79,7 +80,7 @@ def run_single_request(
 
     for turn_idx, user_msg in enumerate(turns):
         if collect_oracle:
-            clear_oracle_log()
+            oracle_pos = get_oracle_log_position()
 
         messages.append({"role": "user", "content": user_msg})
 
@@ -114,7 +115,7 @@ def run_single_request(
         }
 
         if collect_oracle:
-            oracle_entries = read_oracle_log()
+            oracle_entries = read_oracle_log(oracle_pos)
             if oracle_entries:
                 turn_data["spec_decode"] = {
                     "oracle_vanilla_entries": oracle_entries,
@@ -153,7 +154,7 @@ def replay_single_request(
     total_oracle = 0
 
     for turn_idx, user_msg in enumerate(turns):
-        clear_oracle_log()
+        oracle_pos = get_oracle_log_position()
 
         messages.append({"role": "user", "content": user_msg})
 
@@ -189,7 +190,7 @@ def replay_single_request(
             "completion_tokens": response.usage.completion_tokens,
         }
 
-        oracle_entries = read_oracle_log()
+        oracle_entries = read_oracle_log(oracle_pos)
         if oracle_entries:
             turn_data["spec_decode"] = {
                 "oracle_vanilla_entries": oracle_entries,
@@ -217,6 +218,7 @@ def run_benchmark(
     temperature: float = 0.0,
     max_tokens: int = 2048,
     replay_path: str | None = None,
+    num_workers: int = 1,
 ) -> None:
     """Run SpecBench benchmark and save results."""
     collect_oracle = is_oracle_enabled()
@@ -240,25 +242,36 @@ def run_benchmark(
         print(f"  Round 1 questions: {len(round1_map)}")
 
     client = OpenAI(base_url=url, api_key="dummy")
-    print(f"Running {len(dataset)} SpecBench requests against {url}")
+    print(f"Running {len(dataset)} SpecBench requests against {url}"
+          f" (workers={num_workers})")
 
     questions = []
     total_oracle = 0
     total_tokens = 0
 
-    for item in tqdm(dataset, desc="SpecBench"):
-        qid = str(item.get("question_id", ""))
-
-        if replay_path:
+    if replay_path:
+        def _process(item):
+            qid = str(item.get("question_id", ""))
             r1_q = round1_map.get(qid)
             if not r1_q:
-                continue
-            result = replay_single_request(
+                return None
+            return replay_single_request(
                 client, model, item, r1_q, temperature, max_tokens)
-        else:
-            result = run_single_request(
+    else:
+        def _process(item):
+            return run_single_request(
                 client, model, item, temperature, max_tokens, collect_oracle)
 
+    if num_workers <= 1:
+        results_iter = (_process(item) for item in dataset)
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        executor = ThreadPoolExecutor(max_workers=num_workers)
+        results_iter = executor.map(_process, dataset)
+
+    for result in tqdm(results_iter, total=len(dataset), desc="SpecBench"):
+        if result is None:
+            continue
         questions.append(result)
         total_oracle += result.get("total_oracle_entries", 0)
         total_tokens += result.get("total_tokens", 0)
@@ -300,6 +313,8 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--replay", default=None,
                         help="Path to Round 1 results for MTP replay")
+    parser.add_argument("--num-workers", type=int, default=1,
+                        help="Concurrent requests to SGLang server")
     args = parser.parse_args()
 
     run_benchmark(
@@ -311,6 +326,7 @@ def main():
         temperature=args.temperature,
         max_tokens=args.max_tokens,
         replay_path=args.replay,
+        num_workers=args.num_workers,
     )
 
 

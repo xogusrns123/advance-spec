@@ -53,11 +53,34 @@ def clear_oracle_log() -> None:
     except OSError:
         pass
 
-def read_oracle_log() -> list[dict]:
+def get_oracle_log_position() -> int:
+    """Return the current byte offset (end) of the oracle log file.
+
+    Call this before an LLM request to mark where new entries will start.
+    """
+    try:
+        return ORACLE_LOG_PATH.stat().st_size
+    except (OSError, FileNotFoundError):
+        return 0
+
+def read_oracle_log(start_position: int | None = None) -> list[dict]:
+    """Read oracle log entries appended after start_position.
+
+    When start_position is given (from get_oracle_log_position()), only
+    entries written after that byte offset are returned.  This enables
+    concurrent requests to share the same log file safely — each caller
+    reads only its own entries without clearing others'.
+
+    When start_position is None (legacy), all entries are returned.
+    """
     entries = []
     try:
-        with open(ORACLE_LOG_PATH) as f:
+        with open(ORACLE_LOG_PATH, "rb" if start_position is not None else "r") as f:
+            if start_position is not None:
+                f.seek(start_position)
             for line in f:
+                if isinstance(line, bytes):
+                    line = line.decode("utf-8")
                 line = line.strip()
                 if line:
                     entries.append(json.loads(line))

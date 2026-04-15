@@ -24,6 +24,7 @@ NUM_REQUESTS=${3:-}
 PORT=${PORT:-30000}
 REQ_START=${REQ_START:-}
 REQ_END=${REQ_END:-}
+NUM_WORKERS=${NUM_WORKERS:-1}
 
 # --- Model preset ---
 case $MODEL_PRESET in
@@ -51,25 +52,29 @@ case $BENCHMARK in
     AGENT_MODULE="hybrid_spec_decoding.analysis.bfcl_agent"
     INPUT_FILE="data/bfcl_multi_turn/dataset.jsonl"
     DATASET_FLAG="--model $MODEL"
-    MAX_ITER_FLAG="--max-iterations 20"
+    MAX_ITER_FLAG="--max-iterations 5"
+    TEMP_FLAG="--temperature 0.0"
     ;;
   bfcl_v4)
     AGENT_MODULE="hybrid_spec_decoding.analysis.bfcl_v4_agent"
     INPUT_FILE="data/bfcl_agent/dataset.jsonl"
     DATASET_FLAG="--model $MODEL"
-    MAX_ITER_FLAG="--max-iterations 10"
+    MAX_ITER_FLAG="--max-iterations 5"
+    TEMP_FLAG=""
     ;;
   specbench)
     AGENT_MODULE="hybrid_spec_decoding.analysis.specbench_agent"
     INPUT_FILE="data/specbench/dataset.jsonl"
     DATASET_FLAG="--dataset $INPUT_FILE --model $MODEL"
     MAX_ITER_FLAG=""
+    TEMP_FLAG="--temperature 0.0"
     ;;
   swebench)
     AGENT_MODULE="hybrid_spec_decoding.analysis.swebench_agent"
     INPUT_FILE="data/swebench/dataset.jsonl"
     DATASET_FLAG="--model $MODEL"
-    MAX_ITER_FLAG="--max-iterations 15 --repos-dir data/swebench/repos"
+    MAX_ITER_FLAG="--max-iterations 30 --repos-dir data/swebench/repos"
+    TEMP_FLAG="--temperature 0.0"
     ;;
   *)
     echo "Unknown benchmark: $BENCHMARK (use bfcl_v3, bfcl_v4, specbench, or swebench)"
@@ -162,6 +167,10 @@ kill_server
 
 export SGLANG_ORACLE_VANILLA=1
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+export TORCHINDUCTOR_COMPILE_THREADS=1
+
+# Install oracle patch + SUFFIX algorithm into SGLang
+python3 -m hybrid_spec_decoding.sglang_integration.install_hook
 
 python3 -m sglang.launch_server \
   --model-path "$MODEL" \
@@ -183,8 +192,7 @@ python3 -m $AGENT_MODULE \
   --model "$MODEL" \
   --input-file "$INPUT_FILE" \
   --output-file "$OUTPUT_DIR/agent_results_eagle3.json" \
-  --temperature 0.0 \
-  $NUM_REQ_FLAG $MAX_ITER_FLAG
+  --num-workers $NUM_WORKERS $TEMP_FLAG $NUM_REQ_FLAG $MAX_ITER_FLAG
 
 kill_server
 
@@ -206,6 +214,9 @@ echo "=== Stage 3: MTP Oracle Replay ==="
 
 export SGLANG_ORACLE_REPLAY="$OUTPUT_DIR/trajectory.json"
 
+# Re-install oracle patch for MTP worker
+python3 -m hybrid_spec_decoding.sglang_integration.install_hook
+
 python3 -m sglang.launch_server \
   --model-path "$MODEL" \
   --tp-size $TP_SIZE \
@@ -225,9 +236,8 @@ python3 -m $AGENT_MODULE \
   --model "$MODEL" \
   --input-file "$INPUT_FILE" \
   --output-file "$OUTPUT_DIR/agent_results_mtp.json" \
-  --temperature 0.0 \
   --replay "$OUTPUT_DIR/agent_results_eagle3.json" \
-  $NUM_REQ_FLAG
+  --num-workers $NUM_WORKERS $TEMP_FLAG $NUM_REQ_FLAG
 
 kill_server
 unset SGLANG_ORACLE_REPLAY

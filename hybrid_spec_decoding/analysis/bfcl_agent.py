@@ -45,6 +45,7 @@ MULTI_TURN_FUNC_DOC_PATH = (
 
 from ..sglang_integration.oracle_patch import (
     clear_oracle_log,
+    get_oracle_log_position,
     read_oracle_log,
     is_oracle_enabled,
 )
@@ -189,9 +190,8 @@ def run_single_request(
                 "step": step,
             }
 
-            # Clear oracle log before LLM call
             if collect_oracle:
-                clear_oracle_log()
+                oracle_pos = get_oracle_log_position()
 
             # Format prompt with BFCL system prompt
             formatted_messages = system_prompt_pre_processing_chat_model(
@@ -227,7 +227,7 @@ def run_single_request(
 
             # Collect oracle entries
             if collect_oracle:
-                oracle_entries = read_oracle_log()
+                oracle_entries = read_oracle_log(oracle_pos)
                 if oracle_entries:
                     step_data["spec_decode"] = {
                         "oracle_vanilla_entries": oracle_entries,
@@ -365,8 +365,7 @@ def replay_single_request(
                     elif isinstance(turn_msgs, dict):
                         messages.append(turn_msgs)
 
-        # Clear oracle log
-        clear_oracle_log()
+        oracle_pos = get_oracle_log_position()
 
         # Format and send to MTP server
         formatted_messages = system_prompt_pre_processing_chat_model(
@@ -397,7 +396,7 @@ def replay_single_request(
         step_data["content"] = content
 
         # Collect oracle entries (MTP drafts)
-        oracle_entries = read_oracle_log()
+        oracle_entries = read_oracle_log(oracle_pos)
         if oracle_entries:
             step_data["spec_decode"] = {
                 "oracle_vanilla_entries": oracle_entries,
@@ -426,6 +425,7 @@ def run_benchmark(
     max_iterations: int = 20,
     temperature: float = 0.0,
     replay: str | None = None,
+    num_workers: int = 1,
 ) -> dict:
     """Run full BFCL benchmark and save results.
 
@@ -452,36 +452,44 @@ def run_benchmark(
     else:
         print("Oracle collection disabled (set SGLANG_ORACLE_VANILLA=1 to enable)")
 
-    print(f"Running {len(dataset)} BFCL requests against {url}")
+    print(f"Running {len(dataset)} BFCL requests against {url}"
+          f" (workers={num_workers})")
 
     results = []
     total_oracle_entries = 0
     total_tokens = 0
     total_tool_calls = 0
 
-    for idx, item in enumerate(tqdm(dataset, desc="BFCL")):
-        if replay and round1_data:
-            # Replay mode: follow Round 1 trajectory
-            if idx >= len(round1_data["questions"]):
-                break
-            round1_q = round1_data["questions"][idx]
-            result = replay_single_request(
-                client=client,
-                model=model,
-                item=item,
-                round1_question=round1_q,
-                temperature=temperature,
-            )
+    if replay and round1_data:
+        pairs = list(zip(dataset, round1_data["questions"]))
+
+        def _process_replay(pair):
+            item, round1_q = pair
+            return replay_single_request(
+                client=client, model=model, item=item,
+                round1_question=round1_q, temperature=temperature)
+
+        if num_workers <= 1:
+            results_iter = (_process_replay(p) for p in pairs)
         else:
-            # Normal mode: run agent with tool execution
-            result = run_single_request(
-                client=client,
-                model=model,
-                item=item,
-                max_iterations=max_iterations,
-                temperature=temperature,
-                collect_oracle=collect_oracle,
-            )
+            from concurrent.futures import ThreadPoolExecutor
+            executor = ThreadPoolExecutor(max_workers=num_workers)
+            results_iter = executor.map(_process_replay, pairs)
+    else:
+        def _process_normal(item):
+            return run_single_request(
+                client=client, model=model, item=item,
+                max_iterations=max_iterations, temperature=temperature,
+                collect_oracle=collect_oracle)
+
+        if num_workers <= 1:
+            results_iter = (_process_normal(item) for item in dataset)
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            executor = ThreadPoolExecutor(max_workers=num_workers)
+            results_iter = executor.map(_process_normal, dataset)
+
+    for result in tqdm(results_iter, total=len(dataset), desc="BFCL"):
         results.append(result)
 
         for step in result["agent_metrics"]["steps"]:
@@ -534,6 +542,8 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--replay", default=None,
                         help="Path to Round 1 agent_results.json for replay mode")
+    parser.add_argument("--num-workers", type=int, default=1,
+                        help="Concurrent requests to SGLang server")
     args = parser.parse_args()
 
     run_benchmark(
@@ -545,6 +555,7 @@ def main():
         max_iterations=args.max_iterations,
         temperature=args.temperature,
         replay=args.replay,
+        num_workers=args.num_workers,
     )
 
 

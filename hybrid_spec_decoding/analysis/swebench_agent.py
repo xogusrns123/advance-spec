@@ -40,6 +40,7 @@ from tqdm import tqdm
 
 from ..sglang_integration.oracle_patch import (
     clear_oracle_log,
+    get_oracle_log_position,
     read_oracle_log,
     is_oracle_enabled,
 )
@@ -218,9 +219,8 @@ def process_request(
 
     try:
         for iteration in range(max_iterations):
-            # Clear oracle log before LLM call
             if collect_oracle:
-                clear_oracle_log()
+                oracle_pos = get_oracle_log_position()
 
             # LLM call
             t_llm = time.perf_counter()
@@ -239,7 +239,7 @@ def process_request(
 
             # Collect oracle entries
             if collect_oracle:
-                oracle_entries = read_oracle_log()
+                oracle_entries = read_oracle_log(oracle_pos)
                 if oracle_entries:
                     step_data["spec_decode"] = {
                         "oracle_vanilla_entries": oracle_entries,
@@ -318,6 +318,91 @@ def process_request(
     }
 
 
+def replay_request(
+    llm,
+    request: dict,
+    round1_question: dict,
+) -> dict:
+    """Replay Round 1 trajectory to collect MTP drafts.
+
+    Reconstructs the message history from Round 1 steps and sends
+    each step to the MTP server. Only oracle entries are collected.
+    """
+    instance_id = request.get("instance_id", "")
+    round1_steps = round1_question.get("agent_metrics", {}).get("steps", [])
+    round1_turns = round1_question.get("turns", [])
+
+    # Reconstruct messages from Round 1's serialized turns
+    # Each turn has "messages" which is the full message list at that point
+    messages = [
+        SystemMessage(content=SYSTEM_PROMPT),
+        HumanMessage(content=request["turns"][0]),
+    ]
+
+    all_steps = []
+
+    for i, r1_step in enumerate(round1_steps):
+        step_data = {
+            "type": "llm",
+            "turn": 0,
+            "step": r1_step.get("step", i),
+        }
+
+        # For steps after the first, append Round 1's AI response + tool results
+        if i > 0 and i - 1 < len(round1_turns):
+            prev_turn = round1_turns[i - 1]
+            prev_response = prev_turn.get("response", "")
+            prev_tool_calls = prev_turn.get("tool_calls", [])
+
+            ai_msg = AIMessage(
+                content=prev_response,
+                tool_calls=prev_tool_calls,
+            )
+            messages.append(ai_msg)
+
+            # Re-execute tools to get the same results for message history
+            # (tool results aren't serialized in turns, so we use content from steps)
+            prev_step = round1_steps[i - 1]
+            if prev_step.get("has_tool_calls") and prev_tool_calls:
+                for tc in prev_tool_calls:
+                    # Use a placeholder result — the oracle replay forces tokens anyway
+                    messages.append(
+                        ToolMessage(content="[replayed]", tool_call_id=tc.get("id", ""))
+                    )
+
+        oracle_pos = get_oracle_log_position()
+
+        t_start = time.perf_counter()
+        try:
+            ai_msg = llm.invoke(messages)
+        except Exception as e:
+            step_data["error"] = str(e)
+            all_steps.append(step_data)
+            continue
+
+        latency = time.perf_counter() - t_start
+        step_data["latency_s"] = latency
+        step_data["content"] = ai_msg.content or ""
+
+        oracle_entries = read_oracle_log(oracle_pos)
+        if oracle_entries:
+            step_data["spec_decode"] = {
+                "oracle_vanilla_entries": oracle_entries,
+            }
+
+        all_steps.append(step_data)
+
+    return {
+        "instance_id": instance_id,
+        "category": request.get("category", ""),
+        "agent_metrics": {
+            "steps": all_steps,
+            "total_steps": len(all_steps),
+            "mode": "replay",
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Benchmark runner
 # ---------------------------------------------------------------------------
@@ -345,6 +430,8 @@ def run_benchmark(
     max_iterations: int = 15,
     temperature: float = 0.0,
     tool_style: str = "full",
+    num_workers: int = 1,
+    replay: str | None = None,
 ) -> None:
     """Run SWE-Bench benchmark with oracle collection."""
     collect_oracle = is_oracle_enabled()
@@ -355,7 +442,20 @@ def run_benchmark(
         print("Oracle collection disabled (set SGLANG_ORACLE_VANILLA=1 to enable)")
 
     dataset = load_swebench_dataset(input_file, num_requests)
-    print(f"Running {len(dataset)} SWE-Bench instances against {url}")
+
+    # Load Round 1 results for replay mode
+    round1_by_id = {}
+    if replay:
+        with open(replay) as f:
+            round1_data = json.load(f)
+        for q in round1_data["questions"]:
+            iid = q.get("instance_id", "")
+            round1_by_id[iid] = q
+        print(f"REPLAY mode: following trajectory from {replay}")
+        print(f"  Round 1 questions: {len(round1_by_id)}")
+
+    mode_str = "replay" if replay else "normal"
+    print(f"Running {len(dataset)} SWE-Bench instances ({mode_str}) against {url}")
 
     llm = ChatOpenAI(
         base_url=url,
@@ -372,19 +472,38 @@ def run_benchmark(
         if r.get("instance_id") and r.get("base_commit")
     }
 
-    # Initialize repos
-    print("Initializing repositories...")
-    _cleanup_repos(repos_dir, base_commits)
+    # Initialize repos (skip in replay mode — no tool execution)
+    if not replay:
+        print("Initializing repositories...")
+        _cleanup_repos(repos_dir, base_commits)
 
     questions = []
     total_oracle = 0
     total_steps = 0
 
-    for request in tqdm(dataset, desc="SWE-Bench"):
-        result = process_request(
-            llm, request, repos_dir, max_iterations,
-            collect_oracle, tool_style,
-        )
+    if replay:
+        def _process(request):
+            iid = request.get("instance_id", "")
+            r1_q = round1_by_id.get(iid)
+            if not r1_q:
+                return None
+            return replay_request(llm, request, r1_q)
+    else:
+        def _process(request):
+            return process_request(
+                llm, request, repos_dir, max_iterations,
+                collect_oracle, tool_style)
+
+    if num_workers <= 1:
+        results_iter = (_process(r) for r in dataset)
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        executor = ThreadPoolExecutor(max_workers=num_workers)
+        results_iter = executor.map(_process, dataset)
+
+    for result in tqdm(results_iter, total=len(dataset), desc="SWE-Bench"):
+        if result is None:
+            continue
         questions.append(result)
         for s in result.get("agent_metrics", {}).get("steps", []):
             total_steps += 1
@@ -461,6 +580,10 @@ def main():
     parser.add_argument("--tool-style", default="full",
                         choices=["full", "sweagent"],
                         help="Tool style: full (6 tools) or sweagent (3 tools)")
+    parser.add_argument("--num-workers", type=int, default=1,
+                        help="Concurrent requests (caution: SWE-bench repos may conflict)")
+    parser.add_argument("--replay", default=None,
+                        help="Path to Round 1 agent_results.json for replay mode")
     args = parser.parse_args()
 
     run_benchmark(
@@ -473,6 +596,8 @@ def main():
         max_iterations=args.max_iterations,
         temperature=args.temperature,
         tool_style=args.tool_style,
+        num_workers=args.num_workers,
+        replay=args.replay,
     )
 
 

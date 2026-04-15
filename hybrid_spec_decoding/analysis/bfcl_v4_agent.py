@@ -305,6 +305,97 @@ def process_request(
     }
 
 
+def replay_request(
+    client: OpenAI,
+    model: str,
+    request: dict,
+    round1_question: dict,
+) -> dict:
+    """Replay Round 1 trajectory to collect MTP drafts.
+
+    Reconstructs the exact message history from Round 1 and sends
+    each step to the MTP server. SGLANG_ORACLE_REPLAY forces the
+    same token output; we just collect the MTP draft trees.
+    """
+    bfcl_id = request.get("bfcl_id", request.get("id", ""))
+    entry_id = request.get("id", bfcl_id)
+    category = request.get("category", "")
+    functions = request.get("function", [])
+
+    round1_steps = round1_question.get("agent_metrics", {}).get("steps", [])
+
+    # Build initial messages (same as process_request)
+    conversation_turns = request.get("question", [])
+    all_turn_messages = copy.deepcopy(conversation_turns)
+    all_turn_messages[0] = system_prompt_pre_processing_chat_model(
+        all_turn_messages[0], functions, entry_id
+    )
+    all_turn_messages[0][0]["content"] += (
+        "\n\nIMPORTANT: Be efficient. Use the minimum number of function calls needed. "
+        "Once you have enough information to answer, respond with the final answer immediately "
+        "instead of making additional searches. Do NOT over-verify or repeat similar queries."
+    )
+    messages = []
+    for turn_msgs in all_turn_messages:
+        messages.extend(turn_msgs)
+
+    all_steps = []
+
+    for i, r1_step in enumerate(round1_steps):
+        step_data = {
+            "type": "llm",
+            "step": r1_step.get("step", i),
+        }
+
+        # For steps after the first, append Round 1's assistant response + tool results
+        if i > 0:
+            prev_step = round1_steps[i - 1]
+            messages.append({"role": "assistant", "content": prev_step.get("content", "")})
+            for exec_result in prev_step.get("exec_results", []):
+                messages.append({"role": "tool", "content": str(exec_result)})
+
+        oracle_pos = get_oracle_log_position()
+
+        t_start = time.perf_counter()
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.0,
+                max_tokens=4096,
+            )
+        except Exception as e:
+            step_data["error"] = str(e)
+            all_steps.append(step_data)
+            continue
+
+        latency = time.perf_counter() - t_start
+        content = response.choices[0].message.content or ""
+
+        step_data["latency_s"] = latency
+        step_data["prompt_tokens"] = response.usage.prompt_tokens
+        step_data["completion_tokens"] = response.usage.completion_tokens
+        step_data["content"] = content
+
+        oracle_entries = read_oracle_log(oracle_pos)
+        if oracle_entries:
+            step_data["spec_decode"] = {
+                "oracle_vanilla_entries": oracle_entries,
+            }
+
+        all_steps.append(step_data)
+
+    return {
+        "bfcl_id": bfcl_id,
+        "category": category,
+        "agent_metrics": {
+            "steps": all_steps,
+            "total_steps": len(all_steps),
+            "mode": "replay",
+        },
+    }
+
+
 def run_benchmark(
     url: str,
     model: str,
@@ -313,6 +404,7 @@ def run_benchmark(
     num_requests: int | None = None,
     max_iterations: int = 10,
     num_workers: int = 1,
+    replay: str | None = None,
 ) -> None:
     """Run BFCLv4 agentic benchmark."""
     collect_oracle = is_oracle_enabled()
@@ -323,18 +415,31 @@ def run_benchmark(
 
     dataset = load_bfcl_v4_dataset(input_file, num_requests)
 
-    # Populate initial_config at runtime
+    # Load Round 1 results for replay mode
+    round1_by_id = {}
+    if replay:
+        with open(replay) as f:
+            round1_data = json.load(f)
+        for q in round1_data["questions"]:
+            qid = q.get("bfcl_id", "")
+            round1_by_id[qid] = q
+        print(f"REPLAY mode: following trajectory from {replay}")
+        print(f"  Round 1 questions: {len(round1_by_id)}")
+
+    # Populate initial_config at runtime (needed for both normal and replay)
     print("Populating initial configs...")
     output_dir = Path(output_file).parent
-    if populate_initial_settings_for_memory_test_cases:
-        mem_dir = output_dir / "memory_snapshots"
-        mem_dir.mkdir(parents=True, exist_ok=True)
-        dataset = populate_initial_settings_for_memory_test_cases(dataset, mem_dir)
-    if populate_initial_settings_for_web_search_test_cases:
-        dataset = populate_initial_settings_for_web_search_test_cases(dataset)
+    if not replay:
+        if populate_initial_settings_for_memory_test_cases:
+            mem_dir = output_dir / "memory_snapshots"
+            mem_dir.mkdir(parents=True, exist_ok=True)
+            dataset = populate_initial_settings_for_memory_test_cases(dataset, mem_dir)
+        if populate_initial_settings_for_web_search_test_cases:
+            dataset = populate_initial_settings_for_web_search_test_cases(dataset)
 
     dataset.sort(key=sort_key)
-    print(f"Running {len(dataset)} BFCLv4 requests against {url}"
+    mode_str = "replay" if replay else "normal"
+    print(f"Running {len(dataset)} BFCLv4 requests ({mode_str}) against {url}"
           f" (workers={num_workers})")
 
     client = OpenAI(base_url=url, api_key="dummy")
@@ -342,9 +447,17 @@ def run_benchmark(
     total_oracle = 0
     total_tokens = 0
 
-    def _process(request):
-        return process_request(
-            client, model, request, max_iterations, collect_oracle)
+    if replay:
+        def _process(request):
+            bfcl_id = request.get("bfcl_id", request.get("id", ""))
+            r1_q = round1_by_id.get(bfcl_id)
+            if not r1_q:
+                return None
+            return replay_request(client, model, request, r1_q)
+    else:
+        def _process(request):
+            return process_request(
+                client, model, request, max_iterations, collect_oracle)
 
     if num_workers <= 1:
         results_iter = (_process(r) for r in dataset)
@@ -354,6 +467,8 @@ def run_benchmark(
         results_iter = executor.map(_process, dataset)
 
     for result in tqdm(results_iter, total=len(dataset), desc="BFCLv4"):
+        if result is None:
+            continue
         questions.append(result)
         for s in result.get("agent_metrics", {}).get("steps", []):
             total_tokens += s.get("completion_tokens", 0)
@@ -394,6 +509,8 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--num-workers", type=int, default=1,
                         help="Concurrent requests to SGLang server")
+    parser.add_argument("--replay", default=None,
+                        help="Path to Round 1 agent_results.json for replay mode")
     args = parser.parse_args()
 
     run_benchmark(
@@ -404,6 +521,7 @@ def main():
         num_requests=args.num_requests,
         max_iterations=args.max_iterations,
         num_workers=args.num_workers,
+        replay=args.replay,
     )
 
 
