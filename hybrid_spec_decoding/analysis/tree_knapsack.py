@@ -166,6 +166,71 @@ def _backtrack(
             _backtrack(child_allocs[node][budget], child_allocs, selected)
 
 
+def tree_knapsack_dp_all_budgets(
+    token_ids: list[int],
+    parents: list[int],
+    p_t: list[float],
+    budgets: list[int],
+) -> dict[int, tuple[float, list[int]]]:
+    """Run DP once and extract results for all budgets.
+
+    Much faster than calling tree_knapsack_dp separately for each budget.
+    Returns {budget: (expected_utility, selected_node_indices)}.
+    """
+    n = len(token_ids)
+    if n == 0:
+        return {b: (0.0, []) for b in budgets}
+
+    max_budget = min(max(budgets), n)
+    if max_budget <= 0:
+        return {b: (0.0, []) for b in budgets}
+
+    children = _build_children(parents)
+    roots = children[-1]
+    B = max_budget
+
+    dp: dict[int, list[float]] = {}
+    child_allocs: dict[int, list[list[tuple[int, int]]]] = {}
+
+    order = _topo_order_bottom_up(children, roots)
+
+    for node in order:
+        ch = children.get(node, [])
+        dp[node] = [0.0] * (B + 1)
+        child_allocs[node] = [[] for _ in range(B + 1)]
+
+        if not ch:
+            for b in range(1, B + 1):
+                dp[node][b] = p_t[node]
+        else:
+            items = [(c, dp[c]) for c in ch]
+            best_children, allocs = _knapsack_over_items(items, B)
+            for b in range(1, B + 1):
+                remaining = b - 1
+                dp[node][b] = p_t[node] * (1.0 + best_children[remaining])
+                child_allocs[node][b] = list(allocs[remaining])
+
+    if not roots:
+        return {b: (0.0, []) for b in budgets}
+
+    root_items = [(r, dp[r]) for r in roots]
+    best_root, root_allocs = _knapsack_over_items(root_items, B)
+
+    results = {}
+    for budget in budgets:
+        b = min(budget, n)
+        if b <= 0:
+            results[budget] = (0.0, [])
+            continue
+        best_eu = best_root[b]
+        top_allocation = root_allocs[b]
+        selected: list[int] = []
+        _backtrack(top_allocation, child_allocs, selected)
+        results[budget] = (best_eu, sorted(selected))
+
+    return results
+
+
 def greedy_tree_walk(
     token_ids: list[int],
     parents: list[int],

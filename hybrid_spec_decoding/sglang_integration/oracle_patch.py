@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 ORACLE_LOG_PATH = Path("/tmp/sglang_oracle_vanilla.jsonl")
+ORACLE_TIMING_PATH = Path("/tmp/sglang_oracle_timing.jsonl")
 ORACLE_REPLAY_PATH = os.environ.get("SGLANG_ORACLE_REPLAY", "")
 ORACLE_DRAFT_BUDGET = os.environ.get("SGLANG_DRAFT_BUDGET", "")  # override draft token count
 ORACLE_VERIFY_TRIES_PATH = os.environ.get("SGLANG_ORACLE_VERIFY_TRIES", "")
@@ -96,6 +97,13 @@ def _log_entry(entry: dict) -> None:
             f.write(json.dumps(entry) + "\n")
     except OSError as e:
         logger.warning(f"Oracle log write failed: {e}")
+
+def _log_timing(entry: dict) -> None:
+    try:
+        with open(ORACLE_TIMING_PATH, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError as e:
+        logger.warning(f"Oracle timing write failed: {e}")
 
 def _load_trajectory(path: str) -> dict[str, list[int]]:
     with open(path) as f:
@@ -385,7 +393,11 @@ def _patch_draft_stash(eagle_worker: "EAGLEWorker", trie_feeder=None) -> None:
     original_draft = eagle_worker.draft
 
     def patched_draft(batch: "ScheduleBatch") -> "EagleVerifyInput":
+        import time as _time
+        _t_draft_start = _time.perf_counter()
         spec_info = original_draft(batch)
+        _t_draft_end = _time.perf_counter()
+        eagle_worker._oracle_last_draft_ms = (_t_draft_end - _t_draft_start) * 1000
 
         # Verify-tries mode: replace draft tree with union trie
         if trie_feeder is not None:
@@ -532,7 +544,13 @@ def _patch_verify_logits(eagle_worker: "EAGLEWorker") -> None:
     original_target_forward = eagle_worker.target_worker.forward_batch_generation
 
     def patched_target_forward(model_worker_batch, is_verify=False):
+        import time as _time
+        _t_fwd_start = _time.perf_counter()
         result = original_target_forward(model_worker_batch, is_verify=is_verify)
+        _t_fwd_end = _time.perf_counter()
+        if is_verify:
+            eagle_worker._oracle_last_target_forward_ms = (
+                _t_fwd_end - _t_fwd_start) * 1000
         if is_verify and result.logits_output is not None:
             try:
                 logits = result.logits_output.next_token_logits
@@ -668,6 +686,19 @@ def _patch_forward_log(
 
             eagle_worker._oracle_stashed_draft = None
             eagle_worker._oracle_stashed_verify_logits = None
+
+            # Log per-step timing (eagle3_draft + target_forward)
+            draft_ms = getattr(eagle_worker, "_oracle_last_draft_ms", None)
+            fwd_ms = getattr(eagle_worker, "_oracle_last_target_forward_ms", None)
+            if draft_ms is not None or fwd_ms is not None:
+                _log_timing({
+                    "eagle3_draft_ms": draft_ms,
+                    "target_forward_ms": fwd_ms,
+                    "num_draft": num_draft,
+                    "num_reqs": num_reqs,
+                })
+                eagle_worker._oracle_last_draft_ms = None
+                eagle_worker._oracle_last_target_forward_ms = None
 
         except Exception as e:
             logger.warning(f"Oracle logging failed: {e}")

@@ -291,14 +291,32 @@ def main():
             kill_server(proc)
             time.sleep(5)
 
+    # --- Decompose into target_forward + eagle3_draft ---
+    # verify_latencies[B] = eagle3_draft(B) + target_forward(B)
+    # We approximate target_forward(B) by measuring vanilla (B=0) as baseline.
+    # The overhead beyond vanilla is EAGLE3 draft cost.
+    # For more accurate decomposition, target_forward(B) should be measured
+    # separately with tree attention but no draft model.
+    target_forward_ms = {}
+    eagle3_draft_ms = {}
+    for B_str, step_ms in verify_latencies.items():
+        # Approximate: target_forward(B) ≈ vanilla_tpot (since tree attention
+        # with B nodes is close to single-token decode for small B).
+        # The remaining cost is attributed to EAGLE3 draft generation.
+        target_forward_ms[B_str] = vanilla_tpot
+        eagle3_draft_ms[B_str] = max(step_ms - vanilla_tpot, 0.0)
+
     # --- Output ---
     output = {
         "vanilla_step_ms": vanilla_tpot,
-        "verify_latencies_ms": verify_latencies,
+        "target_forward_ms": target_forward_ms,
+        "eagle3_draft_ms": eagle3_draft_ms,
+        "eagle3_step_ms": verify_latencies,  # legacy: full step cost
         "measurement": "sglang",
-        "note": "Measured via SGLang server in oracle vanilla mode "
-                "(accept_length=0, 1 token/step). "
-                "TPOT = step_cost = draft(B) + verify(B) per step.",
+        "note": "target_forward_ms: pure target model verify cost (approx). "
+                "eagle3_draft_ms: EAGLE3 draft generation cost. "
+                "eagle3_step_ms: full step = target_forward + eagle3_draft. "
+                "vanilla_step_ms: target TPOT with no speculation.",
     }
     if draft_lm_tpot is not None:
         output["draft_lm_tpot_ms"] = draft_lm_tpot
