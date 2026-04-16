@@ -245,15 +245,32 @@ def parse_configs(config_str: str) -> list[dict]:
             for b in budgets:
                 configs.append({"topk": topk, "steps": steps, "budget": b,
                                 "mode": "tree"})
-    return configs
+    # Deduplicate by (topk, steps, budget)
+    seen = set()
+    deduped = []
+    for c in configs:
+        key = (c["topk"], c["steps"], c["budget"])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(c)
+    return deduped
 
 
-# Default configs (~45 min, ~15 configs × 3 min each)
+# Default configs (~48 min, 16 unique configs × 3 min each)
+# Systematic sweep of 3 variables:
+#   1. Chain baseline: topk=1, steps=budget
+#   2. Topk sweep:  steps=3 fixed, budget=32 fixed, topk=2,4,8
+#   3. Steps sweep: topk=8 fixed, budget=32 fixed, steps=2,3,4,5
+#   4. Budget sweep: topk=8 fixed, steps=3 fixed, budget=4,8,16,32,64
 DEFAULT_CONFIGS = (
+    # Chain baseline
     "chain:1,2,4,8,16,32;"
-    "tree:4-3:4,16,64;"
-    "tree:8-3:8,32,64;"
-    "tree:8-5:16,64"
+    # Topk sweep (steps=3, budget=32)
+    "tree:2-3:32;tree:4-3:32;tree:8-3:32;"
+    # Steps sweep (topk=8, budget=32) — 8-3:32 is deduped
+    "tree:8-2:32;tree:8-4:32;tree:8-5:32;"
+    # Budget sweep (topk=8, steps=3) — 8-3:32 is deduped
+    "tree:8-3:4,8,16,64"
 )
 
 
@@ -266,8 +283,8 @@ def main():
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--dataset", required=True,
                         help="SpecBench dataset.jsonl path")
-    parser.add_argument("--n-requests", type=int, default=10,
-                        help="Number of requests per config")
+    parser.add_argument("--n-requests", type=int, default=8,
+                        help="Number of requests per config (default: 8 = 1 per category)")
     parser.add_argument("--max-tokens", type=int, default=256,
                         help="Max tokens per request")
     parser.add_argument("--n-warmup", type=int, default=2)
