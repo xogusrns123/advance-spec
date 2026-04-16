@@ -25,6 +25,8 @@ PORT=${PORT:-30000}
 REQ_START=${REQ_START:-}
 REQ_END=${REQ_END:-}
 NUM_WORKERS=${NUM_WORKERS:-1}
+SKIP_PT=${SKIP_PT:-}
+ENABLE_EU=${ENABLE_EU:-}
 
 # --- Model preset ---
 case $MODEL_PRESET in
@@ -269,17 +271,23 @@ if [ -n "$DRAFT_LM" ]; then
 fi
 
 # ============================================================
-# Stage 5: Collect Target Model p_t (HuggingFace, multi-GPU parallel)
+# Stage 5: Collect Target Model p_t (skip with SKIP_PT=1)
 # ============================================================
-echo ""
-echo "=== Stage 5: Collect p_t ==="
-
-NUM_GPUS=${NUM_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}
-bash scripts/run_parallel_p_t.sh \
-  "$PT_INPUT" \
-  "$OUTPUT_DIR/union_trie_data_with_pt.jsonl" \
-  "$MODEL" \
-  "$NUM_GPUS"
+SIM_INPUT="$PT_INPUT"
+if [ -n "$SKIP_PT" ]; then
+  echo ""
+  echo "=== Stage 5: SKIPPED (SKIP_PT=1) ==="
+else
+  echo ""
+  echo "=== Stage 5: Collect p_t ==="
+  NUM_GPUS=${NUM_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}
+  bash scripts/run_parallel_p_t.sh \
+    "$PT_INPUT" \
+    "$OUTPUT_DIR/union_trie_data_with_pt.jsonl" \
+    "$MODEL" \
+    "$NUM_GPUS"
+  SIM_INPUT="$OUTPUT_DIR/union_trie_data_with_pt.jsonl"
+fi
 
 # ============================================================
 # Stage 6: Oracle Simulation
@@ -292,11 +300,17 @@ if [ -f "$OUTPUT_DIR/latency_config.json" ]; then
   LATENCY_FLAG="--latency-config $OUTPUT_DIR/latency_config.json"
 fi
 
+EU_FLAG=""
+if [ -n "$ENABLE_EU" ]; then
+  EU_FLAG="--enable-eu"
+fi
+
 python3 -m hybrid_spec_decoding.analysis.run_tree_oracle_sim \
-  --union-trie-data "$OUTPUT_DIR/union_trie_data_with_pt.jsonl" \
-  --budgets 1,2,4,8,16,32,64,128,256 \
+  --union-trie-data "$SIM_INPUT" \
+  --budgets 1,2,4,8,16,32,64,128,256,300 \
   --p-t-key p_t \
   --output "$OUTPUT_DIR/tree_oracle_sim.json" \
+  $EU_FLAG \
   --print-summary \
   $LATENCY_FLAG
 
