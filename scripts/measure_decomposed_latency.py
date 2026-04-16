@@ -115,6 +115,10 @@ def main():
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--algorithm", default="EAGLE3")
     parser.add_argument("--budgets", default="1,2,4,8,16,32,64,128,256")
+    parser.add_argument("--eagle-topk", type=int, default=8,
+                        help="EAGLE3 top-k (must match pipeline Stage 1)")
+    parser.add_argument("--eagle-steps", type=int, default=3,
+                        help="EAGLE3 speculation steps (must match pipeline Stage 1)")
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--n-warmup", type=int, default=3)
     parser.add_argument("--n-measure", type=int, default=10)
@@ -185,8 +189,8 @@ def main():
             "--model-path", args.model,
             "--tp-size", str(args.tp_size),
             "--speculative-algorithm", args.algorithm,
-            "--speculative-num-steps", "3",
-            "--speculative-eagle-topk", "4",
+            "--speculative-num-steps", str(args.eagle_steps),
+            "--speculative-eagle-topk", str(args.eagle_topk),
             "--speculative-num-draft-tokens", str(B),
             "--mem-fraction-static", "0.8",
             "--disable-cuda-graph",
