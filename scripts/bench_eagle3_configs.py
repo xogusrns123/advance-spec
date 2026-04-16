@@ -68,19 +68,35 @@ def kill_server(proc: subprocess.Popen):
 
 
 def load_specbench(path: str, n_requests: int = 10) -> list[dict]:
-    """Load SpecBench prompts."""
-    prompts = []
+    """Load SpecBench prompts with balanced category sampling.
+
+    Picks evenly across categories (round-robin) to ensure diversity.
+    """
+    from collections import defaultdict
+    by_cat: dict[str, list] = defaultdict(list)
     with open(path) as f:
         for line in f:
             d = json.loads(line)
-            prompts.append({
+            by_cat[d["category"]].append({
                 "question_id": d["question_id"],
                 "category": d["category"],
-                "prompt": d["turns"][0],  # first turn only
+                "prompt": d["turns"][0],
             })
-            if len(prompts) >= n_requests:
-                break
-    return prompts
+
+    # Round-robin across categories
+    categories = sorted(by_cat.keys())
+    prompts = []
+    idx = 0
+    while len(prompts) < n_requests:
+        cat = categories[idx % len(categories)]
+        cat_list = by_cat[cat]
+        pick_idx = idx // len(categories)
+        if pick_idx < len(cat_list):
+            prompts.append(cat_list[pick_idx])
+        idx += 1
+        if idx >= n_requests * 10:  # safety
+            break
+    return prompts[:n_requests]
 
 
 def monitor_gpu(interval: float, stop_event: threading.Event) -> list[dict]:
