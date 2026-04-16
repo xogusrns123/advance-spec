@@ -1127,7 +1127,8 @@ def main():
             "budget_sweep": [
                 {
                     "budget": B,
-                    "verify_ms": latency_results[B]["verify_ms"],
+                    "target_forward_ms": latency_results[B].get("target_forward_ms", 0),
+                    "eagle3_draft_ms": latency_results[B].get("eagle3_draft_ms", 0),
                     "eu_speedup": latency_results[B]["eu_speedup"],
                     "c1_speedup": latency_results[B]["c1_speedup"],
                     **{
