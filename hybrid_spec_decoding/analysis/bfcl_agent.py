@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import re
 import time
@@ -224,6 +225,7 @@ def run_single_request(
             step_data["completion_tokens"] = response.usage.completion_tokens
             step_data["content"] = content
             step_data["finish_reason"] = finish_reason
+            step_data["messages"] = copy.deepcopy(formatted_messages)
 
             # Collect oracle entries
             if collect_oracle:

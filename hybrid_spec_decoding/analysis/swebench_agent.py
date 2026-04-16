@@ -25,6 +25,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import shutil
@@ -227,7 +228,15 @@ def process_request(
             ai_msg = llm_with_tools.invoke(messages)
             latency = time.perf_counter() - t_llm
 
-            # Build step data
+            # Build step data — convert langchain messages to OpenAI format
+            openai_msgs = []
+            type_to_role = {"human": "user", "ai": "assistant",
+                            "system": "system", "tool": "tool"}
+            for m in messages:
+                role = type_to_role.get(
+                    type(m).__name__.replace("Message", "").lower(), "user")
+                openai_msgs.append({"role": role, "content": m.content or ""})
+
             step_data = {
                 "type": "llm",
                 "turn": 0,
@@ -235,6 +244,7 @@ def process_request(
                 "latency_s": latency,
                 "content": ai_msg.content or "",
                 "has_tool_calls": bool(ai_msg.tool_calls),
+                "messages": copy.deepcopy(openai_msgs),
             }
 
             # Collect oracle entries

@@ -454,13 +454,10 @@ def precompute_eu_results(
     records: List[dict],
     budgets: List[int],
     p_t_key: str,
-    proposer_pairs: Optional[List[Tuple[str, str]]] = None,
-    proposer_names: Optional[List[str]] = None,
 ) -> None:
-    """Precompute EU Oracle results for all budgets in one DP pass per record.
+    """Precompute EU Oracle (all proposers) for all budgets in one DP pass.
 
-    Stores results in rec["_eu_cache"][cache_key][budget] = accepted_tokens.
-    This avoids running DP 9x per record (once per budget).
+    Stores results in rec["_eu_cache"]["all"][budget] = accepted_tokens.
     """
     t0 = time.time()
     n = len(records)
@@ -493,14 +490,14 @@ def precompute_eu_results(
                 budget_accepted[b] = greedy_tree_walk(sel_tids, sel_pids, gt)
             cache["all"] = budget_accepted
 
-        # EU pair variants
-        if proposer_pairs:
-            for a, b_name in proposer_pairs:
-                pair_key = f"{a},{b_name}"
-                filtered = _filter_union_trie(rec, {a, b_name}, p_t_key)
-                if filtered is None:
-                    cache[pair_key] = {b: 0 for b in budgets}
-                    continue
+        # EU for eagle3+suffix pair
+        source_map = rec.get("source_map", [])
+        proposer_set = set()
+        for sm in source_map:
+            proposer_set.update(sm)
+        if "eagle3" in proposer_set and "suffix" in proposer_set:
+            filtered = _filter_union_trie(rec, {"eagle3", "suffix"}, p_t_key)
+            if filtered is not None:
                 f_tids, f_pids, f_pt = filtered
                 all_results = tree_knapsack_dp_all_budgets(
                     f_tids, f_pids, f_pt, budgets)
@@ -518,37 +515,11 @@ def precompute_eu_results(
                     s_pids = [old_to_new.get(p, -1) if p >= 0 else -1
                               for p in s_pids_raw]
                     budget_accepted[b] = greedy_tree_walk(s_tids, s_pids, gt)
-                cache[pair_key] = budget_accepted
-
-        # Single-proposer precompute (for Choose-One / Single with truncation)
-        if proposer_names:
-            for pname in proposer_names:
-                filtered = _filter_union_trie(rec, {pname}, p_t_key)
-                if filtered is None:
-                    cache[pname] = {b: 0 for b in budgets}
-                    continue
-                f_tids, f_pids, f_pt = filtered
-                all_results = tree_knapsack_dp_all_budgets(
-                    f_tids, f_pids, f_pt, budgets)
-                budget_accepted = {}
-                for b, (eu, selected) in all_results.items():
-                    if not selected:
-                        budget_accepted[b] = 0
-                        continue
-                    sel_set = set(selected)
-                    s_tids = [f_tids[j] for j in range(len(f_tids)) if j in sel_set]
-                    s_pids_raw = [f_pids[j] for j in range(len(f_tids))
-                                  if j in sel_set]
-                    old_to_new = {old: new for new, old in enumerate(
-                        j for j in range(len(f_tids)) if j in sel_set)}
-                    s_pids = [old_to_new.get(p, -1) if p >= 0 else -1
-                              for p in s_pids_raw]
-                    budget_accepted[b] = greedy_tree_walk(s_tids, s_pids, gt)
-                cache[pname] = budget_accepted
+                cache["eagle3,suffix"] = budget_accepted
 
         rec["_eu_cache"] = cache
 
-        if (i + 1) % 5000 == 0 or i == n - 1:
+        if (i + 1) % 500 == 0 or i == n - 1:
             elapsed = time.time() - t0
             rate = (i + 1) / elapsed if elapsed > 0 else 0
             print(f"  EU precompute: [{i+1}/{n}] {rate:.1f} rec/s",
@@ -661,73 +632,69 @@ def _truncate_and_walk(tids, pids, p_t, gt, budget):
     return greedy_tree_walk(sel_tids, sel_pids, gt)
 
 
+def _proposer_tree_walk(per_proposer: dict, name: str, gt: list, budget: int) -> int:
+    """Walk a single proposer's per_proposer tree (truncated to budget by BFS order).
+
+    No union trie, no p_t, no knapsack. Just take first B nodes in tree order
+    and greedy walk against ground truth.
+    """
+    tree_data = per_proposer.get(name)
+    if not tree_data or not tree_data.get("token_ids"):
+        return 0
+
+    tids = tree_data["token_ids"]
+    pids = tree_data["parents"]
+
+    if budget < len(tids):
+        # Truncate: keep first B nodes (BFS/tree order from proposer)
+        tids = tids[:budget]
+        pids = pids[:budget]
+        # Fix parent references that point beyond truncated range
+        pids = [p if p < budget else -1 for p in pids]
+
+    return greedy_tree_walk(tids, pids, gt)
+
+
 def _single_proposer_step(rec: dict, budget: int, proposer_name: str,
                           p_t_key: str = "p_t") -> int:
-    """Single proposer: truncate to budget via knapsack. Uses cache."""
-    # Check precomputed cache
-    cache = rec.get("_eu_cache")
-    if cache is not None:
-        cached = cache.get(proposer_name)
-        if cached is not None:
-            return cached.get(budget, 0)
-
-    # Fallback: compute on the fly
+    """Single proposer: use per_proposer tree directly, truncate to budget."""
     gt = rec.get("ground_truth_future", [])
     if not gt:
         return 0
-    filtered = _filter_union_trie(rec, {proposer_name}, p_t_key)
-    if filtered is None:
-        return 0
-    tids, pids, p_t = filtered
-    return _truncate_and_walk(tids, pids, p_t, gt, budget)
+    return _proposer_tree_walk(rec.get("per_proposer", {}), proposer_name, gt, budget)
 
 
 def _choose_one_step(rec: dict, budget: int, p_t_key: str = "p_t") -> int:
-    """Choose-One Oracle: truncate each proposer to budget, pick best. Uses cache."""
+    """Choose-One Oracle: try each proposer's tree at budget, pick best.
+
+    No union trie. Each proposer's per_proposer tree is truncated to budget
+    and greedy walked. Best result wins.
+    """
     gt = rec.get("ground_truth_future", [])
     if not gt:
         return 0
 
-    cache = rec.get("_eu_cache")
+    per_proposer = rec.get("per_proposer", {})
     best_acc = 0
-    for name in rec.get("per_proposer", {}):
-        if cache is not None:
-            cached = cache.get(name)
-            if cached is not None:
-                best_acc = max(best_acc, cached.get(budget, 0))
-                continue
-        # Fallback
-        filtered = _filter_union_trie(rec, {name}, p_t_key)
-        if filtered is None:
-            continue
-        tids, pids, p_t = filtered
-        acc = _truncate_and_walk(tids, pids, p_t, gt, budget)
+    for name in per_proposer:
+        acc = _proposer_tree_walk(per_proposer, name, gt, budget)
         best_acc = max(best_acc, acc)
     return best_acc
 
 
 def _subset_step(rec: dict, budget: int, proposer_names: List[str],
                  p_t_key: str = "p_t") -> int:
-    """Choose-One over a subset of proposers with budget truncation. Uses cache."""
+    """Choose-One over a subset of proposers. No union trie."""
     gt = rec.get("ground_truth_future", [])
     if not gt:
         return 0
 
-    cache = rec.get("_eu_cache")
+    per_proposer = rec.get("per_proposer", {})
     best_acc = 0
     for name in proposer_names:
-        if name not in rec.get("per_proposer", {}):
+        if name not in per_proposer:
             continue
-        if cache is not None:
-            cached = cache.get(name)
-            if cached is not None:
-                best_acc = max(best_acc, cached.get(budget, 0))
-                continue
-        filtered = _filter_union_trie(rec, {name}, p_t_key)
-        if filtered is None:
-            continue
-        tids, pids, p_t = filtered
-        acc = _truncate_and_walk(tids, pids, p_t, gt, budget)
+        acc = _proposer_tree_walk(per_proposer, name, gt, budget)
         best_acc = max(best_acc, acc)
     return best_acc
 
@@ -809,18 +776,10 @@ def compute_latency_speedup(
         max_draft = max(draft_costs) if draft_costs else 0.0
         return t_fwd + max_draft
 
-    # Generate pairwise combinations
-    pairs: List[Tuple[str, str]] = []
-    for i in range(len(proposers)):
-        for j in range(i + 1, len(proposers)):
-            pairs.append((proposers[i], proposers[j]))
-
-    # Precompute EU Oracle DP for all budgets in one pass (9x speedup)
+    # Precompute EU Oracle DP for all budgets in one pass
     print(f"Precomputing EU Oracle DP for {len(records)} records...",
           file=sys.stderr)
-    precompute_eu_results(records, budgets, p_t_key,
-                          proposer_pairs=pairs if pairs else None,
-                          proposer_names=proposers)
+    precompute_eu_results(records, budgets, p_t_key)
     print("EU precompute done.", file=sys.stderr)
 
     results = {}
@@ -863,30 +822,6 @@ def compute_latency_speedup(
             entry[f"{pname}_speedup"] = sim["speedup"]
             entry[f"{pname}_steps"] = sim["total_steps"]
 
-        # Pairwise combinations: Choose-One (subset) and EU Oracle (eu_pair)
-        for a, b in pairs:
-            pair_key = f"{a}+{b}"
-            step_ms = _step_cost([a, b], B)
-
-            # Choose-One subset
-            sim = simulate_decoding(
-                records, budget=B, method=f"subset:{a},{b}",
-                verify_latency_ms=step_ms,
-                vanilla_latency_ms=vanilla_ms)
-            entry[f"{pair_key}_mat"] = sim["mat"]
-            entry[f"{pair_key}_speedup"] = sim["speedup"]
-            entry[f"{pair_key}_steps"] = sim["total_steps"]
-
-            # EU Oracle subset (union trie filtered to pair)
-            eu_pair_sim = simulate_decoding(
-                records, budget=B, method=f"eu_pair:{a},{b}",
-                verify_latency_ms=step_ms,
-                vanilla_latency_ms=vanilla_ms,
-                p_t_key=p_t_key)
-            entry[f"eu_{pair_key}_mat"] = eu_pair_sim["mat"]
-            entry[f"eu_{pair_key}_speedup"] = eu_pair_sim["speedup"]
-            entry[f"eu_{pair_key}_steps"] = eu_pair_sim["total_steps"]
-
         # Hybrid (suffix score threshold): suffix if score >= t, else fallback
         thresholds = [1.0, 3.0, 5.0]
 
@@ -916,6 +851,29 @@ def compute_latency_speedup(
                     vanilla_latency_ms=vanilla_ms)
                 entry[f"{key}_mat"] = sim["mat"]
                 entry[f"{key}_speedup"] = sim["speedup"]
+
+        # C1 and EU for suffix+eagle3 pair only
+        if "suffix" in proposers and "eagle3" in proposers:
+            pair_step = _step_cost(["eagle3"], B)  # suffix is free
+            # C1(eagle3+suffix): best of eagle3 tree or suffix tree
+            c1_pair_sim = simulate_decoding(
+                records, budget=B, method="subset:eagle3,suffix",
+                verify_latency_ms=pair_step,
+                vanilla_latency_ms=vanilla_ms,
+                p_t_key=p_t_key)
+            entry["c1_e3sfx_mat"] = c1_pair_sim["mat"]
+            entry["c1_e3sfx_speedup"] = c1_pair_sim["speedup"]
+            entry["c1_e3sfx_steps"] = c1_pair_sim["total_steps"]
+
+            # EU(eagle3+suffix): knapsack on filtered union trie
+            eu_pair_sim = simulate_decoding(
+                records, budget=B, method="eu_pair:eagle3,suffix",
+                verify_latency_ms=pair_step,
+                vanilla_latency_ms=vanilla_ms,
+                p_t_key=p_t_key)
+            entry["eu_e3sfx_mat"] = eu_pair_sim["mat"]
+            entry["eu_e3sfx_speedup"] = eu_pair_sim["speedup"]
+            entry["eu_e3sfx_steps"] = eu_pair_sim["total_steps"]
 
         results[B] = entry
 
@@ -1189,15 +1147,10 @@ def main():
                     "budget": B,
                     "target_forward_ms": latency_results[B].get("target_forward_ms", 0),
                     "eagle3_draft_ms": latency_results[B].get("eagle3_draft_ms", 0),
-                    "eu_speedup": latency_results[B]["eu_speedup"],
-                    "c1_speedup": latency_results[B]["c1_speedup"],
                     **{
-                        f"{m}_speedup": latency_results[B].get(f"{m}_speedup", 0)
-                        for m in all_methods
-                    },
-                    **{
-                        f"{m}_mat": latency_results[B].get(f"{m}_mat", 0)
-                        for m in all_methods
+                        k: v for k, v in latency_results[B].items()
+                        if k.endswith('_speedup') or k.endswith('_mat')
+                           or k.endswith('_steps')
                     },
                 }
                 for B in budgets if B in latency_results
