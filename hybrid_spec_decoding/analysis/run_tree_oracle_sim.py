@@ -292,7 +292,7 @@ def simulate_decoding(
 
     # Determine if this method has draft cost
     is_hybrid = method.startswith("hybrid_e3:") or method.startswith("hybrid_dm:")
-    no_draft = method == "single:suffix"  # suffix-only has no draft
+    no_draft = method in ("single:suffix", "extension")  # no draft cost
 
     ratios = draft_ratios or []
     # Ratio-based time accumulation
@@ -347,7 +347,9 @@ def simulate_decoding(
 
             # Dispatch method
             used_suffix = False
-            if method == "extension":
+            if method == "union_trie":
+                accepted = _union_trie_step(rec, budget)
+            elif method == "extension":
                 accepted = _extension_step(rec, budget, suffix_cache,
                                            cache_req_id)
             elif method == "eu":
@@ -643,10 +645,32 @@ def _hybrid_step(rec: dict, budget: int, threshold: float,
         return 0, False
 
 
-def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str) -> int:
-    """Extension: EAGLE3 tree (truncated to budget) + suffix extension at each leaf.
+def _union_trie_step(rec: dict, budget: int) -> int:
+    """Union trie: truncate to budget by BFS order, then greedy walk."""
+    gt = rec.get("ground_truth_future", [])
+    if not gt:
+        return 0
 
-    For each leaf of the truncated EAGLE3 tree, trace root→leaf path,
+    trie = rec.get("union_trie")
+    if not trie or not trie.get("token_ids"):
+        return 0
+
+    tids = trie["token_ids"]
+    pids = trie["parents"]
+
+    n = min(budget, len(tids))
+    if n < len(tids):
+        tids = tids[:n]
+        pids = pids[:n]
+        pids = [p if p < n else -1 for p in pids]
+
+    return greedy_tree_walk(tids, pids, gt)
+
+
+def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str) -> int:
+    """Extension: EAGLE3 tree (truncated to budget) + suffix extension at every node.
+
+    For EVERY node in the truncated EAGLE3 tree, trace root→node path,
     build extended context, and call suffix_cache.speculate() to extend.
     Then greedy walk on the combined (EAGLE3 + suffix extensions) tree.
     """
@@ -667,14 +691,6 @@ def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str) -> 
     pids = pids[:n]
     pids = [p if p < n else -1 for p in pids]
 
-    # Find leaves: nodes that are NOT a parent of any other node
-    is_parent = set(pids)  # includes -1
-    leaves = [i for i in range(n) if i not in is_parent]
-
-    if not leaves:
-        # All nodes are internal (shouldn't happen with truncation)
-        return greedy_tree_walk(tids, pids, gt)
-
     # Build extended tree
     ext_tids = list(tids)
     ext_pids = list(pids)
@@ -683,20 +699,21 @@ def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str) -> 
     if base_context is None or suffix_cache is None:
         return greedy_tree_walk(ext_tids, ext_pids, gt)
 
-    # For each leaf, trace path and extend with suffix
-    for leaf_idx in leaves:
-        # Trace root→leaf path
+    # Precompute root→node paths for all nodes
+    paths = [None] * n
+    for i in range(n):
         path = []
-        node = leaf_idx
+        node = i
         while node >= 0:
             path.append(tids[node])
             node = pids[node]
         path.reverse()
+        paths[i] = path
 
-        # Extension context = base_context + path tokens
-        ext_context = np.array(base_context + path, dtype=np.int32)
+    # For every node, extend with suffix
+    for node_idx in range(n):
+        ext_context = np.array(base_context + paths[node_idx], dtype=np.int32)
 
-        # Suffix lookup
         try:
             draft = suffix_cache.speculate(cache_req_id, ext_context)
         except Exception:
@@ -705,12 +722,12 @@ def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str) -> 
         if not draft.token_ids:
             continue
 
-        # Attach suffix chain to leaf
+        # Attach suffix chain to this node
         offset = len(ext_tids)
         for j, (tid, pid) in enumerate(zip(draft.token_ids, draft.parents)):
             ext_tids.append(tid)
             if pid == -1:
-                ext_pids.append(leaf_idx)  # suffix root children → attach to leaf
+                ext_pids.append(node_idx)  # suffix root children → attach to node
             else:
                 ext_pids.append(offset + pid)
 
@@ -825,10 +842,16 @@ def compute_latency_speedup(
     budgets: List[int],
     latency_config: dict,
     p_t_key: str = "p_t",
+    enable_eu: bool = False,
 ) -> dict:
     """Run step-by-step simulation for each budget with measured latencies.
 
     Returns per-budget simulation results including speedup.
+
+    Parameters
+    ----------
+    enable_eu : bool
+        Enable EU Oracle (tree knapsack DP). Slow for large trees. Default off.
 
     Latency config should contain decomposed costs:
         vanilla_step_ms: target TPOT with no speculation
@@ -903,22 +926,37 @@ def compute_latency_speedup(
         for r, spd in spr_always.items():
             entry[f"{prefix}_always_speedup_r{r}"] = spd
 
-    # Precompute EU Oracle DP for all budgets in one pass
-    print(f"Precomputing EU Oracle DP for {len(records)} records...",
-          file=sys.stderr)
-    precompute_eu_results(records, budgets, p_t_key)
-    print("EU precompute done.", file=sys.stderr)
+    if enable_eu:
+        print(f"Precomputing EU Oracle DP for {len(records)} records...",
+              file=sys.stderr)
+        precompute_eu_results(records, budgets, p_t_key)
+        print("EU precompute done.", file=sys.stderr)
 
     results = {}
     for B in budgets:
         entry = {"budget": B}
 
-        # EU Oracle (all proposers)
-        eu_sim = simulate_decoding(
-            records, budget=B, method="eu", p_t_key=p_t_key,
+        if enable_eu:
+            eu_sim = simulate_decoding(
+                records, budget=B, method="eu", p_t_key=p_t_key,
+                vanilla_latency_ms=vanilla_ms,
+                draft_ratios=DRAFT_RATIOS)
+            _store_sim(entry, "eu", eu_sim)
+
+            if "suffix" in proposers and "eagle3" in proposers:
+                eu_pair_sim = simulate_decoding(
+                    records, budget=B, method="eu_pair:eagle3,suffix",
+                    vanilla_latency_ms=vanilla_ms,
+                    p_t_key=p_t_key,
+                    draft_ratios=DRAFT_RATIOS)
+                _store_sim(entry, "eu_e3sfx", eu_pair_sim)
+
+        # Union trie (BFS truncate to budget, greedy walk)
+        ut_sim = simulate_decoding(
+            records, budget=B, method="union_trie",
             vanilla_latency_ms=vanilla_ms,
             draft_ratios=DRAFT_RATIOS)
-        _store_sim(entry, "eu", eu_sim)
+        _store_sim(entry, "union_trie", ut_sim)
 
         # Choose-One Oracle (all proposers, full tree)
         c1_sim = simulate_decoding(
@@ -954,7 +992,7 @@ def compute_latency_speedup(
                     draft_ratios=DRAFT_RATIOS)
                 _store_sim(entry, f"hybrid_dm_t{t:.1f}", sim)
 
-        # C1 and EU for suffix+eagle3 pair
+        # C1 for suffix+eagle3 pair
         if "suffix" in proposers and "eagle3" in proposers:
             c1_pair_sim = simulate_decoding(
                 records, budget=B, method="subset:eagle3,suffix",
@@ -962,13 +1000,6 @@ def compute_latency_speedup(
                 p_t_key=p_t_key,
                 draft_ratios=DRAFT_RATIOS)
             _store_sim(entry, "c1_e3sfx", c1_pair_sim)
-
-            eu_pair_sim = simulate_decoding(
-                records, budget=B, method="eu_pair:eagle3,suffix",
-                vanilla_latency_ms=vanilla_ms,
-                p_t_key=p_t_key,
-                draft_ratios=DRAFT_RATIOS)
-            _store_sim(entry, "eu_e3sfx", eu_pair_sim)
 
         # Extension: EAGLE3 tree + suffix extension at leaves
         if "suffix" in proposers and "eagle3" in proposers:
@@ -1173,6 +1204,8 @@ def main():
                              "'eagle3=3.3,mtp=2.0,suffix=0.3'. "
                              "Multi-proposer methods use max() (parallel).")
     parser.add_argument("--print-summary", action="store_true")
+    parser.add_argument("--enable-eu", action="store_true",
+                        help="Enable EU Oracle (slow tree knapsack DP)")
     args = parser.parse_args()
 
     if not args.output and not args.print_summary:
@@ -1212,13 +1245,18 @@ def main():
     with open(args.latency_config) as f:
         latency_config = json.load(f)
     latency_results = compute_latency_speedup(
-        records, budgets, latency_config, p_t_key=args.p_t_key)
+        records, budgets, latency_config, p_t_key=args.p_t_key,
+        enable_eu=args.enable_eu)
 
     if args.print_summary:
         print_summary(choose_one, {}, choose_one_budget,
                       budgets, args.p_t_key)
-        print_latency_summary(latency_results, budgets,
-                              latency_config["vanilla_step_ms"])
+        try:
+            print_latency_summary(latency_results, budgets,
+                                  latency_config["vanilla_step_ms"])
+        except Exception as e:
+            print(f"Warning: print_latency_summary failed: {e}",
+                  file=sys.stderr)
 
     if args.output:
         output = {
@@ -1259,8 +1297,8 @@ def main():
                     "eagle3_draft_ms": latency_results[B].get("eagle3_draft_ms", 0),
                     **{
                         k: v for k, v in latency_results[B].items()
-                        if k.endswith('_speedup') or k.endswith('_mat')
-                           or k.endswith('_steps')
+                        if k != 'budget'
+                           and k not in ('target_forward_ms', 'eagle3_draft_ms')
                     },
                 }
                 for B in budgets if B in latency_results
