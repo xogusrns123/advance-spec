@@ -244,19 +244,13 @@ def print_summary(
 
     # Budget sweep comparison
     print(f"\n--- Budget Sweep (p_t: {p_t_key}) ---", file=sys.stderr)
-    print(f"{'Budget':>8} | {'EU(expect)':>11} | {'EU(actual)':>11} | "
-          f"{'Choose-1':>9} | {'Gap(act)':>9} | {'Gap%':>7}", file=sys.stderr)
-    print("-" * 68, file=sys.stderr)
+    print(f"{'Budget':>8} | {'Choose-1':>9}", file=sys.stderr)
+    print("-" * 22, file=sys.stderr)
     for B in budgets:
-        eu_exp = eu_results[B]["avg_eu"]
-        eu_act = eu_results[B].get("avg_actual_acc", eu_exp)
         c1 = choose_one_budget[B]["avg_acc"]
-        gap = eu_act - c1
-        gap_pct = (gap / max(c1, 1e-9)) * 100
-        print(f"{B:>8} | {eu_exp:>11.4f} | {eu_act:>11.4f} | "
-              f"{c1:>9.4f} | {gap:>9.4f} | {gap_pct:>6.1f}%", file=sys.stderr)
+        print(f"{B:>8} | {c1:>9.4f}", file=sys.stderr)
 
-    print("=" * 68, file=sys.stderr)
+    print("=" * 22, file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -370,12 +364,13 @@ def simulate_decoding(
                 accepted = _hybrid_step(rec, budget, threshold, fallback="draft_model")
             elif method.startswith("single:"):
                 proposer_name = method.split(":", 1)[1]
-                accepted = _single_proposer_step(rec, budget, proposer_name)
+                accepted = _single_proposer_step(rec, budget, proposer_name,
+                                                 p_t_key)
             elif method.startswith("subset:"):
                 names = method.split(":", 1)[1].split(",")
-                accepted = _subset_step(rec, budget, names)
+                accepted = _subset_step(rec, budget, names, p_t_key)
             else:  # choose_one
-                accepted = _choose_one_step(rec, budget)
+                accepted = _choose_one_step(rec, budget, p_t_key)
 
             advance = accepted + 1  # accepted + bonus token
             total_generated += advance
@@ -460,6 +455,7 @@ def precompute_eu_results(
     budgets: List[int],
     p_t_key: str,
     proposer_pairs: Optional[List[Tuple[str, str]]] = None,
+    proposer_names: Optional[List[str]] = None,
 ) -> None:
     """Precompute EU Oracle results for all budgets in one DP pass per record.
 
@@ -524,6 +520,32 @@ def precompute_eu_results(
                     budget_accepted[b] = greedy_tree_walk(s_tids, s_pids, gt)
                 cache[pair_key] = budget_accepted
 
+        # Single-proposer precompute (for Choose-One / Single with truncation)
+        if proposer_names:
+            for pname in proposer_names:
+                filtered = _filter_union_trie(rec, {pname}, p_t_key)
+                if filtered is None:
+                    cache[pname] = {b: 0 for b in budgets}
+                    continue
+                f_tids, f_pids, f_pt = filtered
+                all_results = tree_knapsack_dp_all_budgets(
+                    f_tids, f_pids, f_pt, budgets)
+                budget_accepted = {}
+                for b, (eu, selected) in all_results.items():
+                    if not selected:
+                        budget_accepted[b] = 0
+                        continue
+                    sel_set = set(selected)
+                    s_tids = [f_tids[j] for j in range(len(f_tids)) if j in sel_set]
+                    s_pids_raw = [f_pids[j] for j in range(len(f_tids))
+                                  if j in sel_set]
+                    old_to_new = {old: new for new, old in enumerate(
+                        j for j in range(len(f_tids)) if j in sel_set)}
+                    s_pids = [old_to_new.get(p, -1) if p >= 0 else -1
+                              for p in s_pids_raw]
+                    budget_accepted[b] = greedy_tree_walk(s_tids, s_pids, gt)
+                cache[pname] = budget_accepted
+
         rec["_eu_cache"] = cache
 
         if (i + 1) % 5000 == 0 or i == n - 1:
@@ -581,25 +603,6 @@ def _eu_step(rec: dict, budget: int, p_t_key: str,
     return greedy_tree_walk(sel_tids, sel_pids, gt)
 
 
-def _choose_one_step(rec: dict, budget: int) -> int:
-    """Choose-One Oracle: pick best proposer's full tree, return accepted tokens.
-
-    No budget truncation — uses each proposer's entire tree and picks the
-    best result. The budget parameter is ignored (kept for API compat).
-    """
-    gt = rec.get("ground_truth_future", [])
-    if not gt:
-        return 0
-
-    best_acc = 0
-    for name, tree_data in rec.get("per_proposer", {}).items():
-        tids = tree_data["token_ids"]
-        pids = tree_data["parents"]
-        acc = greedy_tree_walk(tids, pids, gt)
-        best_acc = max(best_acc, acc)
-    return best_acc
-
-
 def _hybrid_step(rec: dict, budget: int, threshold: float,
                  fallback: str = "eagle3") -> int:
     """Hybrid: use suffix if score >= threshold, else fallback proposer.
@@ -631,35 +634,100 @@ def _hybrid_step(rec: dict, budget: int, threshold: float,
     return greedy_tree_walk(tids, pids, gt)
 
 
-def _single_proposer_step(rec: dict, budget: int, proposer_name: str) -> int:
-    """Single proposer: use full tree, return accepted tokens."""
+def _truncate_and_walk(tids, pids, p_t, gt, budget):
+    """Truncate tree to budget nodes via knapsack DP, then greedy walk."""
+    if not tids or not gt:
+        return 0
+
+    n = len(tids)
+    if budget >= n:
+        # Budget covers full tree, no truncation needed
+        return greedy_tree_walk(tids, pids, gt)
+
+    if not p_t or len(p_t) < n:
+        # No p_t available, fall back to full tree
+        return greedy_tree_walk(tids, pids, gt)
+
+    _, selected = tree_knapsack_dp(tids, pids, p_t, budget=budget)
+    if not selected:
+        return 0
+
+    sel_set = set(selected)
+    sel_tids = [tids[j] for j in range(n) if j in sel_set]
+    sel_pids_raw = [pids[j] for j in range(n) if j in sel_set]
+    old_to_new = {old: new for new, old in enumerate(
+        j for j in range(n) if j in sel_set)}
+    sel_pids = [old_to_new.get(p, -1) if p >= 0 else -1 for p in sel_pids_raw]
+    return greedy_tree_walk(sel_tids, sel_pids, gt)
+
+
+def _single_proposer_step(rec: dict, budget: int, proposer_name: str,
+                          p_t_key: str = "p_t") -> int:
+    """Single proposer: truncate to budget via knapsack. Uses cache."""
+    # Check precomputed cache
+    cache = rec.get("_eu_cache")
+    if cache is not None:
+        cached = cache.get(proposer_name)
+        if cached is not None:
+            return cached.get(budget, 0)
+
+    # Fallback: compute on the fly
+    gt = rec.get("ground_truth_future", [])
+    if not gt:
+        return 0
+    filtered = _filter_union_trie(rec, {proposer_name}, p_t_key)
+    if filtered is None:
+        return 0
+    tids, pids, p_t = filtered
+    return _truncate_and_walk(tids, pids, p_t, gt, budget)
+
+
+def _choose_one_step(rec: dict, budget: int, p_t_key: str = "p_t") -> int:
+    """Choose-One Oracle: truncate each proposer to budget, pick best. Uses cache."""
     gt = rec.get("ground_truth_future", [])
     if not gt:
         return 0
 
-    tree_data = rec.get("per_proposer", {}).get(proposer_name)
-    if not tree_data:
-        return 0
+    cache = rec.get("_eu_cache")
+    best_acc = 0
+    for name in rec.get("per_proposer", {}):
+        if cache is not None:
+            cached = cache.get(name)
+            if cached is not None:
+                best_acc = max(best_acc, cached.get(budget, 0))
+                continue
+        # Fallback
+        filtered = _filter_union_trie(rec, {name}, p_t_key)
+        if filtered is None:
+            continue
+        tids, pids, p_t = filtered
+        acc = _truncate_and_walk(tids, pids, p_t, gt, budget)
+        best_acc = max(best_acc, acc)
+    return best_acc
 
-    tids = tree_data["token_ids"]
-    pids = tree_data["parents"]
-    return greedy_tree_walk(tids, pids, gt)
 
-
-def _subset_step(rec: dict, budget: int, proposer_names: List[str]) -> int:
-    """Choose-One over a subset of proposers. Full trees, no truncation."""
+def _subset_step(rec: dict, budget: int, proposer_names: List[str],
+                 p_t_key: str = "p_t") -> int:
+    """Choose-One over a subset of proposers with budget truncation. Uses cache."""
     gt = rec.get("ground_truth_future", [])
     if not gt:
         return 0
 
+    cache = rec.get("_eu_cache")
     best_acc = 0
     for name in proposer_names:
-        tree_data = rec.get("per_proposer", {}).get(name)
-        if not tree_data:
+        if name not in rec.get("per_proposer", {}):
             continue
-        tids = tree_data["token_ids"]
-        pids = tree_data["parents"]
-        acc = greedy_tree_walk(tids, pids, gt)
+        if cache is not None:
+            cached = cache.get(name)
+            if cached is not None:
+                best_acc = max(best_acc, cached.get(budget, 0))
+                continue
+        filtered = _filter_union_trie(rec, {name}, p_t_key)
+        if filtered is None:
+            continue
+        tids, pids, p_t = filtered
+        acc = _truncate_and_walk(tids, pids, p_t, gt, budget)
         best_acc = max(best_acc, acc)
     return best_acc
 
@@ -751,7 +819,8 @@ def compute_latency_speedup(
     print(f"Precomputing EU Oracle DP for {len(records)} records...",
           file=sys.stderr)
     precompute_eu_results(records, budgets, p_t_key,
-                          proposer_pairs=pairs if pairs else None)
+                          proposer_pairs=pairs if pairs else None,
+                          proposer_names=proposers)
     print("EU precompute done.", file=sys.stderr)
 
     results = {}
@@ -1066,11 +1135,6 @@ def main():
     choose_one = evaluate_choose_one(records)
     print(f"Choose-One Oracle: {time.time() - t0:.2f}s", file=sys.stderr)
 
-    # Evaluate Expected-Utility Oracle (DP) across budgets
-    t0 = time.time()
-    eu_results = evaluate_expected_utility(records, budgets, args.p_t_key)
-    print(f"Expected-Utility Oracle: {time.time() - t0:.2f}s", file=sys.stderr)
-
     # Evaluate Choose-One at each budget (for fair comparison)
     t0 = time.time()
     choose_one_budget = evaluate_choose_one_at_budget(records, budgets)
@@ -1083,7 +1147,7 @@ def main():
         records, budgets, latency_config, p_t_key=args.p_t_key)
 
     if args.print_summary:
-        print_summary(choose_one, eu_results, choose_one_budget,
+        print_summary(choose_one, {}, choose_one_budget,
                       budgets, args.p_t_key)
         print_latency_summary(latency_results, budgets,
                               latency_config["vanilla_step_ms"])
@@ -1100,15 +1164,11 @@ def main():
                 "aggregate": choose_one["aggregate"],
                 # Omit per_step for compactness (can be large)
             },
-            "expected_utility": {
+            "choose_one_budget": {
                 "budget_sweep": [
                     {
                         "budget": B,
-                        "avg_eu": eu_results[B]["avg_eu"],
-                        "total_eu": eu_results[B]["total_eu"],
-                        "avg_selected_nodes": eu_results[B]["avg_selected_nodes"],
-                        "choose_one_avg_acc": choose_one_budget[B]["avg_acc"],
-                        "gap": eu_results[B]["avg_eu"] - choose_one_budget[B]["avg_acc"],
+                        "avg_acc": choose_one_budget[B]["avg_acc"],
                     }
                     for B in budgets
                 ],
