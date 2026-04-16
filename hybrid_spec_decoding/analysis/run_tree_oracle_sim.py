@@ -265,41 +265,20 @@ def simulate_decoding(
     method: str,
     p_t_key: str = "p_t_oracle",
     *,
-    verify_latency_ms: float,
     vanilla_latency_ms: float,
+    verify_latency_ms: float = 0.0,
     suffix_cache=None,
+    draft_ratios: Optional[List[float]] = None,
 ) -> dict:
-    """Simulate actual speculative decoding with skip-ahead.
+    """Simulate speculative decoding with skip-ahead.
 
-    Walks through the token sequence position by position.
-    At each step:
-    1. Select tree (EU Oracle or Choose-One) at current position
-    2. Verify against ground truth → accepted tokens
-    3. Advance by (accepted + 1) positions (bonus token)
-    4. Accumulate latency
+    Computes MAT + speedup for multiple draft cost ratios in a single pass.
 
-    Parameters
-    ----------
-    records : list[dict]
-        Union trie records indexed by (request_id, call_idx, step_idx).
-    budget : int
-        Number of nodes in the verification tree.
-    method : str
-        "eu" for Expected-Utility Oracle, "choose_one" for Choose-One.
-    p_t_key : str
-        Key for p_t values (only used for method="eu").
-    verify_latency_ms : float
-        Time for one tree verification step. Must be from measured latency config.
-    vanilla_latency_ms : float
-        Time for one vanilla decode step (baseline). Must be from measured latency config.
-
-    Returns
-    -------
-    dict with total_tokens, total_steps, total_time_ms, speedup, per_step, etc.
+    draft_ratios: list of ratios (e.g. [0.05, 0.1, 0.2, 0.3, 0.5]).
+        step_cost = vanilla_ms * (1 + ratio) for methods with draft cost.
+        step_cost = vanilla_ms for suffix-only (no draft cost).
     """
-    # Index records by (request_id, call_idx, step_idx)
     record_index: Dict[Tuple, dict] = {}
-    # Group by (request_id, call_idx) to find sequence boundaries
     sequences: Dict[Tuple, List[int]] = {}
 
     for rec in records:
@@ -308,15 +287,24 @@ def simulate_decoding(
         seq_key = (rec["request_id"], rec.get("call_idx", 0))
         sequences.setdefault(seq_key, []).append(rec.get("step_idx", 0))
 
-    # Sort step indices within each sequence
     for sk in sequences:
         sequences[sk].sort()
 
-    total_generated = 0   # accepted + bonus (actual tokens produced)
-    total_accepted = 0    # accepted only (no bonus)
+    # Determine if this method has draft cost
+    is_hybrid = method.startswith("hybrid_e3:") or method.startswith("hybrid_dm:")
+    no_draft = method == "single:suffix"  # suffix-only has no draft
+
+    ratios = draft_ratios or []
+    # Ratio-based time accumulation
+    time_per_ratio = {r: 0.0 for r in ratios}
+    # For hybrid: conditional (draft only on fallback) + always (draft every step)
+    time_per_ratio_always = {r: 0.0 for r in ratios} if is_hybrid else None
+
+    total_generated = 0
+    total_accepted = 0
     total_steps = 0
     total_time_ms = 0.0
-    per_step_log = []
+    v_ms = vanilla_latency_ms
 
     for seq_key, step_indices in sorted(sequences.items()):
         req_id, call_idx = seq_key
@@ -327,7 +315,6 @@ def simulate_decoding(
         first_rec = record_index.get((req_id, call_idx, step_indices[0]))
         if not first_rec:
             continue
-        # Detect data format to compute total sequence length:
         last_rec = record_index.get((req_id, call_idx, step_indices[-1]))
         last_gt_len = len(last_rec.get("ground_truth_future", [])) if last_rec else 1
         first_gt_len = len(first_rec.get("ground_truth_future", []))
@@ -336,7 +323,6 @@ def simulate_decoding(
         else:
             seq_len = step_indices[0] + first_gt_len
 
-        # Suffix cache lifecycle for extension method
         cache_req_id = f"{req_id}_{call_idx}"
         if suffix_cache is not None:
             prompt = first_rec.get("context_token_ids", [])
@@ -351,11 +337,16 @@ def simulate_decoding(
             if rec is None:
                 total_generated += 1
                 total_steps += 1
-                total_time_ms += vanilla_latency_ms
+                total_time_ms += v_ms
+                for r in ratios:
+                    time_per_ratio[r] += v_ms
+                    if time_per_ratio_always is not None:
+                        time_per_ratio_always[r] += v_ms
                 pos += 1
                 continue
 
-            # Select tree and compute acceptance
+            # Dispatch method
+            used_suffix = False
             if method == "extension":
                 accepted = _extension_step(rec, budget, suffix_cache,
                                            cache_req_id)
@@ -365,12 +356,15 @@ def simulate_decoding(
                 names = method.split(":", 1)[1].split(",")
                 accepted = _eu_step(rec, budget, p_t_key,
                                     allowed_proposers=set(names))
-            elif method.startswith("hybrid_e3:"):
-                threshold = float(method.split(":", 1)[1])
-                accepted = _hybrid_step(rec, budget, threshold, fallback="eagle3")
-            elif method.startswith("hybrid_dm:"):
-                threshold = float(method.split(":", 1)[1])
-                accepted = _hybrid_step(rec, budget, threshold, fallback="draft_model")
+            elif is_hybrid:
+                if method.startswith("hybrid_e3:"):
+                    threshold = float(method.split(":", 1)[1])
+                    accepted, used_suffix = _hybrid_step(
+                        rec, budget, threshold, fallback="eagle3")
+                else:
+                    threshold = float(method.split(":", 1)[1])
+                    accepted, used_suffix = _hybrid_step(
+                        rec, budget, threshold, fallback="draft_model")
             elif method.startswith("single:"):
                 proposer_name = method.split(":", 1)[1]
                 accepted = _single_proposer_step(rec, budget, proposer_name,
@@ -381,11 +375,26 @@ def simulate_decoding(
             else:  # choose_one
                 accepted = _choose_one_step(rec, budget, p_t_key)
 
-            advance = accepted + 1  # accepted + bonus token
+            advance = accepted + 1
             total_generated += advance
             total_accepted += accepted
             total_steps += 1
-            total_time_ms += verify_latency_ms
+            total_time_ms += verify_latency_ms if verify_latency_ms > 0 else v_ms
+
+            # Accumulate ratio-based time
+            for r in ratios:
+                if no_draft:
+                    time_per_ratio[r] += v_ms  # no draft cost
+                elif is_hybrid:
+                    # conditional: draft only when fallback used
+                    if used_suffix:
+                        time_per_ratio[r] += v_ms
+                    else:
+                        time_per_ratio[r] += v_ms * (1 + r)
+                    # always: draft cost every step
+                    time_per_ratio_always[r] += v_ms * (1 + r)
+                else:
+                    time_per_ratio[r] += v_ms * (1 + r)
 
             # Feed accepted tokens to suffix cache
             if suffix_cache is not None:
@@ -394,37 +403,50 @@ def simulate_decoding(
                     suffix_cache.add_active_response(
                         cache_req_id, gt[:advance])
 
-            per_step_log.append({
-                "pos": pos,
-                "accepted": accepted,
-                "advance": advance,
-            })
-
             pos += advance
 
-        # Remaining tokens after last speculative step (vanilla decode)
         remaining = seq_len - pos
         if remaining > 0:
             total_generated += remaining
             total_steps += remaining
-            total_time_ms += remaining * vanilla_latency_ms
+            total_time_ms += remaining * v_ms
+            for r in ratios:
+                time_per_ratio[r] += remaining * v_ms
+                if time_per_ratio_always is not None:
+                    time_per_ratio_always[r] += remaining * v_ms
 
         if suffix_cache is not None:
             suffix_cache.stop_request(cache_req_id)
 
-    vanilla_time_ms = total_generated * vanilla_latency_ms
+    vanilla_time_ms = total_generated * v_ms
     speedup = vanilla_time_ms / total_time_ms if total_time_ms > 0 else 1.0
     mat = total_accepted / total_steps if total_steps > 0 else 0.0
 
-    return {
-        "total_generated": total_generated,  # accepted + bonus
-        "total_accepted": total_accepted,    # accepted only
+    # Compute speedup per ratio
+    speedup_per_ratio = {}
+    for r in ratios:
+        t = time_per_ratio[r]
+        speedup_per_ratio[r] = vanilla_time_ms / t if t > 0 else 1.0
+    speedup_per_ratio_always = {}
+    if time_per_ratio_always is not None:
+        for r in ratios:
+            t = time_per_ratio_always[r]
+            speedup_per_ratio_always[r] = vanilla_time_ms / t if t > 0 else 1.0
+
+    result = {
+        "total_generated": total_generated,
+        "total_accepted": total_accepted,
         "total_steps": total_steps,
         "total_time_ms": total_time_ms,
         "vanilla_time_ms": vanilla_time_ms,
         "speedup": speedup,
-        "mat": mat,  # Mean Accepted Tokens (bonus excluded)
+        "mat": mat,
     }
+    if speedup_per_ratio:
+        result["speedup_per_ratio"] = speedup_per_ratio
+    if speedup_per_ratio_always:
+        result["speedup_per_ratio_always"] = speedup_per_ratio_always
+    return result
 
 
 def _filter_union_trie(rec: dict, allowed: set, p_t_key: str = "p_t"):
@@ -594,17 +616,16 @@ def _eu_step(rec: dict, budget: int, p_t_key: str,
 
 
 def _hybrid_step(rec: dict, budget: int, threshold: float,
-                 fallback: str = "eagle3") -> int:
+                 fallback: str = "eagle3") -> tuple:
     """Hybrid: use suffix if score >= threshold, else fallback proposer.
 
-    fallback="eagle3" → suffix + EAGLE3  (hybrid_e3)
-    fallback="draft_model" → suffix + draft model  (hybrid_dm)
-
-    Uses per_proposer trees truncated to budget (BFS order).
+    Returns (accepted_tokens, used_suffix: bool).
+    used_suffix=True → suffix was chosen (no draft cost).
+    used_suffix=False → fallback was chosen (draft cost applies).
     """
     gt = rec.get("ground_truth_future", [])
     if not gt:
-        return 0
+        return 0, False
 
     per_proposer = rec.get("per_proposer", {})
     suffix_data = per_proposer.get("suffix")
@@ -615,11 +636,11 @@ def _hybrid_step(rec: dict, budget: int, threshold: float,
                   and suffix_data.get("token_ids"))
 
     if use_suffix:
-        return _proposer_tree_walk(per_proposer, "suffix", gt, budget)
+        return _proposer_tree_walk(per_proposer, "suffix", gt, budget), True
     elif fallback_data and fallback_data.get("token_ids"):
-        return _proposer_tree_walk(per_proposer, fallback, gt, budget)
+        return _proposer_tree_walk(per_proposer, fallback, gt, budget), False
     else:
-        return 0
+        return 0, False
 
 
 def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str) -> int:
@@ -868,6 +889,20 @@ def compute_latency_speedup(
         max_draft = max(draft_costs) if draft_costs else 0.0
         return t_fwd + max_draft
 
+    DRAFT_RATIOS = [0.05, 0.10, 0.20, 0.30, 0.50]
+
+    def _store_sim(entry, prefix, sim):
+        """Store MAT + ratio-based speedups from a simulation result."""
+        entry[f"{prefix}_mat"] = sim["mat"]
+        entry[f"{prefix}_steps"] = sim.get("total_steps", 0)
+        spr = sim.get("speedup_per_ratio", {})
+        for r, spd in spr.items():
+            entry[f"{prefix}_speedup_r{r}"] = spd
+        # Hybrid always-draft variant
+        spr_always = sim.get("speedup_per_ratio_always", {})
+        for r, spd in spr_always.items():
+            entry[f"{prefix}_always_speedup_r{r}"] = spd
+
     # Precompute EU Oracle DP for all budgets in one pass
     print(f"Precomputing EU Oracle DP for {len(records)} records...",
           file=sys.stderr)
@@ -876,96 +911,64 @@ def compute_latency_speedup(
 
     results = {}
     for B in budgets:
-        t_fwd_ms = _target_forward(B)
+        entry = {"budget": B}
 
-        # Oracle methods: all proposers draft in parallel + target verify
-        oracle_step = _step_cost(proposers, B)
+        # EU Oracle (all proposers)
         eu_sim = simulate_decoding(
             records, budget=B, method="eu", p_t_key=p_t_key,
-            verify_latency_ms=oracle_step,
-            vanilla_latency_ms=vanilla_ms)
+            vanilla_latency_ms=vanilla_ms,
+            draft_ratios=DRAFT_RATIOS)
+        _store_sim(entry, "eu", eu_sim)
+
+        # Choose-One Oracle (all proposers, full tree)
         c1_sim = simulate_decoding(
             records, budget=B, method="choose_one",
-            verify_latency_ms=oracle_step,
-            vanilla_latency_ms=vanilla_ms)
-
-        entry = {
-            "target_forward_ms": t_fwd_ms,
-            "eagle3_draft_ms": _eagle3_draft(B),
-            "draft_lm_tpot_ms": draft_lm_tpot,
-            "eu_mat": eu_sim["mat"],
-            "c1_mat": c1_sim["mat"],
-            "eu_speedup": eu_sim["speedup"],
-            "c1_speedup": c1_sim["speedup"],
-            "eu_steps": eu_sim["total_steps"],
-            "c1_steps": c1_sim["total_steps"],
-            "eu_tokens": eu_sim["total_generated"],
-            "c1_tokens": c1_sim["total_generated"],
-        }
+            vanilla_latency_ms=vanilla_ms,
+            draft_ratios=DRAFT_RATIOS)
+        _store_sim(entry, "c1", c1_sim)
 
         # Single-proposer baselines
         for pname in proposers:
-            step_ms = _step_cost([pname], B)
             sim = simulate_decoding(
                 records, budget=B, method=f"single:{pname}",
-                verify_latency_ms=step_ms,
-                vanilla_latency_ms=vanilla_ms)
-            entry[f"{pname}_mat"] = sim["mat"]
-            entry[f"{pname}_speedup"] = sim["speedup"]
-            entry[f"{pname}_steps"] = sim["total_steps"]
+                vanilla_latency_ms=vanilla_ms,
+                draft_ratios=DRAFT_RATIOS)
+            _store_sim(entry, pname, sim)
 
         # Hybrid (suffix score threshold): suffix if score >= t, else fallback
         thresholds = [1.0, 3.0, 5.0]
 
-        # hybrid_e3: suffix + EAGLE3
         if "suffix" in proposers and "eagle3" in proposers:
-            # When suffix wins → step = target_forward (no draft)
-            # When eagle3 wins → step = target_forward + eagle3_draft
-            # Use worst case (eagle3 fallback) for step cost
-            hybrid_cost = _step_cost(["eagle3"], B)
             for t in thresholds:
-                key = f"hybrid_e3_t{t:.1f}"
                 sim = simulate_decoding(
                     records, budget=B, method=f"hybrid_e3:{t}",
-                    verify_latency_ms=hybrid_cost,
-                    vanilla_latency_ms=vanilla_ms)
-                entry[f"{key}_mat"] = sim["mat"]
-                entry[f"{key}_speedup"] = sim["speedup"]
+                    vanilla_latency_ms=vanilla_ms,
+                    draft_ratios=DRAFT_RATIOS)
+                _store_sim(entry, f"hybrid_e3_t{t:.1f}", sim)
 
-        # hybrid_dm: suffix + draft model
         if "suffix" in proposers and "draft_model" in proposers:
-            hybrid_cost = _step_cost(["draft_model"], B)
             for t in thresholds:
-                key = f"hybrid_dm_t{t:.1f}"
                 sim = simulate_decoding(
                     records, budget=B, method=f"hybrid_dm:{t}",
-                    verify_latency_ms=hybrid_cost,
-                    vanilla_latency_ms=vanilla_ms)
-                entry[f"{key}_mat"] = sim["mat"]
-                entry[f"{key}_speedup"] = sim["speedup"]
+                    vanilla_latency_ms=vanilla_ms,
+                    draft_ratios=DRAFT_RATIOS)
+                _store_sim(entry, f"hybrid_dm_t{t:.1f}", sim)
 
-        # C1 and EU for suffix+eagle3 pair only
+        # C1 and EU for suffix+eagle3 pair
         if "suffix" in proposers and "eagle3" in proposers:
-            pair_step = _step_cost(["eagle3"], B)  # suffix is free
-            # C1(eagle3+suffix): best of eagle3 tree or suffix tree
             c1_pair_sim = simulate_decoding(
                 records, budget=B, method="subset:eagle3,suffix",
-                verify_latency_ms=pair_step,
                 vanilla_latency_ms=vanilla_ms,
-                p_t_key=p_t_key)
-            entry["c1_e3sfx_mat"] = c1_pair_sim["mat"]
-            entry["c1_e3sfx_speedup"] = c1_pair_sim["speedup"]
-            entry["c1_e3sfx_steps"] = c1_pair_sim["total_steps"]
+                p_t_key=p_t_key,
+                draft_ratios=DRAFT_RATIOS)
+            _store_sim(entry, "c1_e3sfx", c1_pair_sim)
 
-            # EU(eagle3+suffix): knapsack on filtered union trie
             eu_pair_sim = simulate_decoding(
                 records, budget=B, method="eu_pair:eagle3,suffix",
-                verify_latency_ms=pair_step,
                 vanilla_latency_ms=vanilla_ms,
-                p_t_key=p_t_key)
-            entry["eu_e3sfx_mat"] = eu_pair_sim["mat"]
-            entry["eu_e3sfx_speedup"] = eu_pair_sim["speedup"]
-            entry["eu_e3sfx_steps"] = eu_pair_sim["total_steps"]
+                p_t_key=p_t_key,
+                draft_ratios=DRAFT_RATIOS)
+            _store_sim(entry, "eu_e3sfx", eu_pair_sim)
 
         # Extension: EAGLE3 tree + suffix extension at leaves
         if "suffix" in proposers and "eagle3" in proposers:
@@ -975,15 +978,12 @@ def compute_latency_speedup(
             if not hasattr(compute_latency_speedup, '_ext_cache'):
                 compute_latency_speedup._ext_cache = SuffixDecodingCache(
                     max_tree_depth=64, max_cached_requests=100000)
-            ext_step = _step_cost(["eagle3"], B)
             sim = simulate_decoding(
                 records, budget=B, method="extension",
-                verify_latency_ms=ext_step,
                 vanilla_latency_ms=vanilla_ms,
-                suffix_cache=compute_latency_speedup._ext_cache)
-            entry["extension_mat"] = sim["mat"]
-            entry["extension_speedup"] = sim["speedup"]
-            entry["extension_steps"] = sim["total_steps"]
+                suffix_cache=compute_latency_speedup._ext_cache,
+                draft_ratios=DRAFT_RATIOS)
+            _store_sim(entry, "extension", sim)
 
         results[B] = entry
 
