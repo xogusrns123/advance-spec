@@ -580,6 +580,8 @@ def _hybrid_step(rec: dict, budget: int, threshold: float,
 
     fallback="eagle3" → suffix + EAGLE3  (hybrid_e3)
     fallback="draft_model" → suffix + draft model  (hybrid_dm)
+
+    Uses per_proposer trees truncated to budget (BFS order).
     """
     gt = rec.get("ground_truth_future", [])
     if not gt:
@@ -594,15 +596,11 @@ def _hybrid_step(rec: dict, budget: int, threshold: float,
                   and suffix_data.get("token_ids"))
 
     if use_suffix:
-        tids = suffix_data["token_ids"]
-        pids = suffix_data["parents"]
+        return _proposer_tree_walk(per_proposer, "suffix", gt, budget)
     elif fallback_data and fallback_data.get("token_ids"):
-        tids = fallback_data["token_ids"]
-        pids = fallback_data["parents"]
+        return _proposer_tree_walk(per_proposer, fallback, gt, budget)
     else:
         return 0
-
-    return greedy_tree_walk(tids, pids, gt)
 
 
 def _truncate_and_walk(tids, pids, p_t, gt, budget):
