@@ -19,12 +19,25 @@ INPUT=${1:?}; OUTPUT_DIR=${2:?}; MODEL=${3:?}; DRAFT_MODEL=${4:?}; AGENT_MODULE=
 NUM_GPUS=${6:-4}; shift 6 || shift $#
 EXTRA_ARGS="$*"
 
+# GPU_IDS: comma-separated list of GPU indices (e.g. "0,2,3" to skip GPU 1)
+# If not set, uses 0..NUM_GPUS-1
+if [ -n "${GPU_IDS:-}" ]; then
+  IFS=',' read -ra GPU_LIST <<< "$GPU_IDS"
+  NUM_GPUS=${#GPU_LIST[@]}
+else
+  GPU_LIST=()
+  for i in $(seq 0 $((NUM_GPUS - 1))); do GPU_LIST+=($i); done
+fi
+
 # Count input lines
 TOTAL=$(wc -l < "$INPUT")
-if [ "$TOTAL" -lt "$NUM_GPUS" ]; then NUM_GPUS=$TOTAL; fi
+if [ "$TOTAL" -lt "$NUM_GPUS" ]; then
+  NUM_GPUS=$TOTAL
+  GPU_LIST=("${GPU_LIST[@]:0:$NUM_GPUS}")
+fi
 
 echo "======================================"
-echo "Parallel Stage 1: $NUM_GPUS GPUs, $TOTAL requests"
+echo "Parallel Stage 1: $NUM_GPUS GPUs (${GPU_LIST[*]}), $TOTAL requests"
 echo "======================================"
 
 export SGLANG_ORACLE_VANILLA=1
@@ -35,17 +48,18 @@ unset SGLANG_ORACLE_REPLAY SGLANG_ORACLE_VERIFY_TRIES
 python3 -m hybrid_spec_decoding.sglang_integration.install_hook
 
 PIDS=()
-for GPU_ID in $(seq 0 $((NUM_GPUS - 1))); do
-  PORT=$((30000 + GPU_ID))
-  SHARD_DIR="$OUTPUT_DIR/_stage1_shard${GPU_ID}"
+for SHARD_IDX in $(seq 0 $((NUM_GPUS - 1))); do
+  GPU_ID=${GPU_LIST[$SHARD_IDX]}
+  PORT=$((30000 + SHARD_IDX))
+  SHARD_DIR="$OUTPUT_DIR/_stage1_shard${SHARD_IDX}"
   mkdir -p "$SHARD_DIR"
 
   # Slice input for this shard
   python3 -c "
 lines = open('$INPUT').readlines()
-shard = [lines[i] for i in range(len(lines)) if i % $NUM_GPUS == $GPU_ID]
+shard = [lines[i] for i in range(len(lines)) if i % $NUM_GPUS == $SHARD_IDX]
 open('$SHARD_DIR/input.jsonl','w').writelines(shard)
-print(f'Shard $GPU_ID: {len(shard)} requests')
+print(f'Shard $SHARD_IDX (GPU $GPU_ID): {len(shard)} requests')
 import sys; sys.stdout.flush()
 "
 
@@ -54,8 +68,8 @@ import sys; sys.stdout.flush()
     CUDA_VISIBLE_DEVICES=$GPU_ID python3 -m sglang.launch_server \
       --model-path "$MODEL" --tp-size 1 \
       --speculative-algorithm EAGLE3 --speculative-draft-model-path "$DRAFT_MODEL" \
-      --speculative-num-steps 5 --speculative-eagle-topk 8 --speculative-num-draft-tokens 256 \
-      --mem-fraction-static 0.85 --disable-cuda-graph --watchdog-timeout 600 \
+      --speculative-num-steps 5 --speculative-eagle-topk 4 --speculative-num-draft-tokens 256 \
+      --mem-fraction-static 0.75 --disable-cuda-graph --watchdog-timeout 600 \
       --host 0.0.0.0 --port $PORT > "$SHARD_DIR/server.log" 2>&1 &
     SRV_PID=$!
 
@@ -94,8 +108,8 @@ merged_questions = []
 total_tokens = 0
 total_oracle = 0
 
-for gpu_id in range(num_gpus):
-    shard_path = f'{output_dir}/_stage1_shard{gpu_id}/agent_results.json'
+for shard_idx in range(num_gpus):
+    shard_path = f'{output_dir}/_stage1_shard{shard_idx}/agent_results.json'
     try:
         d = json.load(open(shard_path))
         merged_questions.extend(d.get('questions', []))
@@ -103,7 +117,7 @@ for gpu_id in range(num_gpus):
         total_tokens += m.get('total_tokens', 0)
         total_oracle += m.get('total_oracle_entries', 0)
     except Exception as e:
-        print(f'WARN: shard {gpu_id} failed: {e}', file=sys.stderr)
+        print(f'WARN: shard {shard_idx} failed: {e}', file=sys.stderr)
 
 output = {
     'metadata': {
@@ -121,8 +135,8 @@ print(f'Merged: {len(merged_questions)} requests, {total_tokens} tokens, {total_
 "
 
 # Cleanup shard dirs
-for GPU_ID in $(seq 0 $((NUM_GPUS - 1))); do
-  rm -rf "$OUTPUT_DIR/_stage1_shard${GPU_ID}"
+for SHARD_IDX in $(seq 0 $((NUM_GPUS - 1))); do
+  rm -rf "$OUTPUT_DIR/_stage1_shard${SHARD_IDX}"
 done
 
 echo "Stage 1 parallel done"
