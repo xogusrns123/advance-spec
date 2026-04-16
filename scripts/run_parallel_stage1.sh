@@ -54,7 +54,7 @@ import sys; sys.stdout.flush()
     CUDA_VISIBLE_DEVICES=$GPU_ID python3 -m sglang.launch_server \
       --model-path "$MODEL" --tp-size 1 \
       --speculative-algorithm EAGLE3 --speculative-draft-model-path "$DRAFT_MODEL" \
-      --speculative-num-steps 3 --speculative-eagle-topk 8 --speculative-num-draft-tokens 256 \
+      --speculative-num-steps 5 --speculative-eagle-topk 8 --speculative-num-draft-tokens 256 \
       --mem-fraction-static 0.85 --disable-cuda-graph --watchdog-timeout 600 \
       --host 0.0.0.0 --port $PORT > "$SHARD_DIR/server.log" 2>&1 &
     SRV_PID=$!

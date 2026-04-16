@@ -117,7 +117,7 @@ def main():
     parser.add_argument("--budgets", default="1,2,4,8,16,32,64,128,256")
     parser.add_argument("--eagle-topk", type=int, default=8,
                         help="EAGLE3 top-k (must match pipeline Stage 1)")
-    parser.add_argument("--eagle-steps", type=int, default=3,
+    parser.add_argument("--eagle-steps", type=int, default=5,
                         help="EAGLE3 speculation steps (must match pipeline Stage 1)")
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--n-warmup", type=int, default=3)

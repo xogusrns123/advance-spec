@@ -120,8 +120,8 @@ def launch_server(
         "--model-path", model,
         "--tp-size", str(tp_size),
         "--speculative-algorithm", algorithm,
-        "--speculative-num-steps", "3",
-        "--speculative-eagle-topk", "4",
+        "--speculative-num-steps", "5",
+        "--speculative-eagle-topk", "8",
         # Pass budget directly as num-draft-tokens so all
         # initialization (buffers, masks) uses the correct size
         "--speculative-num-draft-tokens", str(draft_budget or 16),
