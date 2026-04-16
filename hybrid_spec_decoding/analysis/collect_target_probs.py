@@ -246,31 +246,21 @@ def collect_p_t_for_records(
     past_kv = None
     cached_ctx_len = 0
 
-    for i, rec in enumerate(records):
-        context_ids = rec.get("context_token_ids", [])
-        trie_tids = rec["union_trie"]["token_ids"]
-        trie_parents = rec["union_trie"]["parents"]
-
-        if not context_ids or not trie_tids:
-            rec["p_t"] = [0.0] * len(trie_tids)
-            continue
-
+    def _forward_step(rec, context_ids, trie_tids, trie_parents,
+                      past_kv, cached_ctx_len, use_cache):
+        """Run a single forward step. Returns (p_t, past_kv, cached_ctx_len)."""
         context_len = len(context_ids)
         n_trie = len(trie_tids)
         curr_key = (rec.get("request_id"), rec.get("call_idx"))
 
-        # Check if we can reuse KV cache from previous step
-        if (prev_key == curr_key and past_kv is not None
-                and cached_ctx_len < context_len):
+        if (past_kv is not None and cached_ctx_len < context_len and use_cache):
             # Incremental: only forward the new context tokens + trie
             new_ctx = context_ids[cached_ctx_len:]
             input_ids = new_ctx + trie_tids
             new_ctx_len = len(new_ctx)
             total_new = len(input_ids)
 
-            # Position IDs: continue from cached_ctx_len
             pos_ctx = list(range(cached_ctx_len, context_len))
-            # Trie nodes: depth-based positions
             depths = [0] * n_trie
             for j in range(n_trie):
                 if trie_parents[j] == -1:
@@ -280,18 +270,15 @@ def collect_p_t_for_records(
             pos_trie = [context_len + d - 1 for d in depths]
             pos_ids = pos_ctx + pos_trie
 
-            # Attention mask: (total_new) attends to (cached + total_new)
             full_len = cached_ctx_len + total_new
             mask = torch.full((1, 1, total_new, full_len), torch.finfo(model_dtype).min,
                               dtype=model_dtype, device=device)
-            # New context tokens: causal over cached + new context
             for j in range(new_ctx_len):
                 mask[0, 0, j, :cached_ctx_len + j + 1] = 0.0
-            # Trie nodes: attend to all context (cached + new) + ancestors
             for j in range(n_trie):
                 row = new_ctx_len + j
-                mask[0, 0, row, :cached_ctx_len + new_ctx_len] = 0.0  # all context
-                mask[0, 0, row, new_ctx_len + j] = 0.0  # self
+                mask[0, 0, row, :cached_ctx_len + new_ctx_len] = 0.0
+                mask[0, 0, row, new_ctx_len + j] = 0.0
                 parent = trie_parents[j]
                 while parent != -1:
                     mask[0, 0, row, new_ctx_len + parent] = 0.0
@@ -308,33 +295,24 @@ def collect_p_t_for_records(
                     past_key_values=past_kv,
                     use_cache=True,
                 )
-                all_logits = outputs.logits[0].float().cpu()  # [total_new, vocab]
+                raw_logits = outputs.logits[0]
+                parent_positions = []
+                for j in range(n_trie):
+                    if trie_parents[j] == -1:
+                        parent_positions.append(new_ctx_len - 1)
+                    else:
+                        parent_positions.append(new_ctx_len + trie_parents[j])
+                parent_logits = raw_logits[parent_positions].float().cpu()
+                del raw_logits
 
-            # Extract p_t: parent logits are at positions relative to new output
-            # For trie node i, parent is at:
-            #   root child (parent=-1): last new context token = new_ctx_len - 1
-            #   deeper (parent=j): new_ctx_len + j
-            p_t = []
-            for j in range(n_trie):
-                if trie_parents[j] == -1:
-                    parent_pos = new_ctx_len - 1
-                else:
-                    parent_pos = new_ctx_len + trie_parents[j]
-                probs = F.softmax(all_logits[parent_pos], dim=-1)
-                p_t.append(probs[trie_tids[j]].item())
-            rec["p_t"] = p_t
-
-            # Update cache: trim to context only (discard trie KV entries)
-            past_kv = _trim_past_kv(outputs.past_key_values, context_len)
-            cached_ctx_len = context_len if past_kv is not None else 0
+            p_t = compute_p_t_from_parent_logits(parent_logits, trie_tids)
+            new_past_kv = _trim_past_kv(outputs.past_key_values, context_len)
+            new_cached = context_len if new_past_kv is not None else 0
+            return p_t, new_past_kv, new_cached
 
         else:
             # Full forward: no cache or different request
-            past_kv = None
-            cached_ctx_len = 0
-
             input_ids = context_ids + trie_tids
-            total_len = len(input_ids)
 
             mask = _build_mask_tensor(context_len, trie_tids, trie_parents, model_dtype, device)
             pos_ids = build_position_ids(context_len, trie_parents)
@@ -349,15 +327,47 @@ def collect_p_t_for_records(
                     position_ids=pos_tensor,
                     use_cache=True,
                 )
-                logits = outputs.logits[0].float().cpu()
+                raw_logits = outputs.logits[0]
+                parent_logits = extract_parent_logits(
+                    raw_logits, context_len, trie_parents).float().cpu()
+                del raw_logits
 
-            parent_logits = extract_parent_logits(logits, context_len, trie_parents)
             p_t = compute_p_t_from_parent_logits(parent_logits, trie_tids)
-            rec["p_t"] = p_t
+            new_past_kv = _trim_past_kv(outputs.past_key_values, context_len)
+            new_cached = context_len if new_past_kv is not None else 0
+            return p_t, new_past_kv, new_cached
 
-            # Cache context KV for next step
-            past_kv = _trim_past_kv(outputs.past_key_values, context_len)
-            cached_ctx_len = context_len if past_kv is not None else 0
+    for i, rec in enumerate(records):
+        context_ids = rec.get("context_token_ids", [])
+        trie_tids = rec["union_trie"]["token_ids"]
+        trie_parents = rec["union_trie"]["parents"]
+
+        if not context_ids or not trie_tids:
+            rec["p_t"] = [0.0] * len(trie_tids)
+            continue
+
+        curr_key = (rec.get("request_id"), rec.get("call_idx"))
+        use_cache = (prev_key == curr_key and past_kv is not None)
+
+        try:
+            p_t, past_kv, cached_ctx_len = _forward_step(
+                rec, context_ids, trie_tids, trie_parents,
+                past_kv, cached_ctx_len, use_cache)
+            rec["p_t"] = p_t
+        except torch.cuda.OutOfMemoryError:
+            # OOM recovery: drop KV cache, clear GPU memory, retry without cache
+            print(f"  OOM at step {i} (ctx={len(context_ids)}), "
+                  "dropping cache and retrying...", file=sys.stderr)
+            del past_kv
+            past_kv = None
+            cached_ctx_len = 0
+            torch.cuda.empty_cache()
+            import gc; gc.collect()
+
+            p_t, past_kv, cached_ctx_len = _forward_step(
+                rec, context_ids, trie_tids, trie_parents,
+                None, 0, False)
+            rec["p_t"] = p_t
 
         prev_key = curr_key
 
@@ -489,12 +499,20 @@ def main():
     # Shard: select subset of records by request_id
     if args.shard:
         shard_id, num_shards = map(int, args.shard.split("/"))
-        all_req_ids = sorted(set(r.get("request_id", "") for r in records))
-        my_req_ids = set(all_req_ids[i] for i in range(len(all_req_ids))
-                         if i % num_shards == shard_id)
+        from collections import Counter
+        req_counts = Counter(r.get("request_id", "") for r in records)
+        sorted_reqs = sorted(req_counts.items(), key=lambda x: -x[1])
+        shard_loads = [0] * num_shards
+        shard_assignment = {}
+        for req_id, count in sorted_reqs:
+            target = min(range(num_shards), key=lambda s: shard_loads[s])
+            shard_assignment[req_id] = target
+            shard_loads[target] += count
+        my_req_ids = set(rid for rid, sid in shard_assignment.items()
+                         if sid == shard_id)
         records = [r for r in records if r.get("request_id", "") in my_req_ids]
         print(f"Shard {shard_id}/{num_shards}: {len(records)} records "
-              f"({len(my_req_ids)} requests)", file=sys.stderr)
+              f"(balanced load: {shard_loads})", file=sys.stderr)
 
     print(f"Loaded {len(records)} step records", file=sys.stderr)
 

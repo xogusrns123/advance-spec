@@ -558,7 +558,7 @@ def run_benchmark(
             pass
 
     if patches:
-        patches_path = out_path.parent / "patches.json"
+        patches_path = Path(output_file).parent / "patches.json"
         with open(patches_path, "w") as f:
             json.dump(patches, f, indent=2)
         print(f"  Saved {len(patches)} patches to {patches_path}")

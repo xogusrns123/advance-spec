@@ -563,8 +563,13 @@ def _extract_bfcl(questions, exclude_ids, dm_by_id=None,
             if steps_with_msgs:
                 per_call_prompt_ids = []
                 for s in steps_with_msgs:
-                    prompt_ids = tokenizer.apply_chat_template(
+                    result = tokenizer.apply_chat_template(
                         s["messages"], add_generation_prompt=True)
+                    # Handle both list[int] and BatchEncoding returns
+                    if isinstance(result, list):
+                        prompt_ids = result
+                    else:
+                        prompt_ids = result["input_ids"]
                     per_call_prompt_ids.append(prompt_ids)
             else:
                 # Fallback: SWE-bench or BFCL v3 reconstruction

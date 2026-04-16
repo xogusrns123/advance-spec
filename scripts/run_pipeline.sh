@@ -165,44 +165,16 @@ kill_server() {
 }
 
 # ============================================================
-# Stage 1: EAGLE3 Oracle Vanilla (Round 1)
+# Stage 1: EAGLE3 Oracle Vanilla (multi-GPU parallel)
 # ============================================================
 echo ""
 echo "=== Stage 1: EAGLE3 Oracle Vanilla ==="
 
-kill_server
-
-export SGLANG_ORACLE_VANILLA=1
-export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
-export TORCHINDUCTOR_COMPILE_THREADS=1
-
-# Install oracle patch + SUFFIX algorithm into SGLang
-python3 -m hybrid_spec_decoding.sglang_integration.install_hook
-
-python3 -m sglang.launch_server \
-  --model-path "$MODEL" \
-  --tp-size $TP_SIZE \
-  --speculative-algorithm EAGLE3 \
-  --speculative-draft-model-path "$DRAFT_MODEL" \
-  --speculative-num-steps 5 \
-  --speculative-eagle-topk 4 \
-  --speculative-num-draft-tokens 256 \
-  --mem-fraction-static $MEM_FRAC \
-  --disable-cuda-graph \
-  --host 0.0.0.0 --port $PORT \
-  > /tmp/sglang_pipeline.log 2>&1 &
-SERVER_PID=$!
-
-wait_for_server || exit 1
-
-python3 -m $AGENT_MODULE \
-  --url http://localhost:$PORT/v1 \
-  --model "$MODEL" \
-  --input-file "$INPUT_FILE" \
-  --output-file "$OUTPUT_DIR/agent_results_eagle3.json" \
-  --num-workers $NUM_WORKERS $TEMP_FLAG $NUM_REQ_FLAG $MAX_ITER_FLAG
-
-kill_server
+NUM_GPUS=${NUM_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}
+bash scripts/run_parallel_stage1.sh \
+  "$INPUT_FILE" "$OUTPUT_DIR" "$MODEL" "$DRAFT_MODEL" \
+  "$AGENT_MODULE" "$NUM_GPUS" \
+  $TEMP_FLAG $NUM_REQ_FLAG $MAX_ITER_FLAG
 
 # ============================================================
 # Stage 2: Extract Trajectory

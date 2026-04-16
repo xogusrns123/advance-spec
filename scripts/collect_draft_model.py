@@ -126,6 +126,61 @@ def collect_draft_chains_hf(
     torch.cuda.empty_cache()
 
 
+def collect_draft_chains_sglang(
+    records: List[dict],
+    server_url: str,
+    max_tokens: int = 16,
+) -> None:
+    """Generate draft chains via SGLang server. Much faster with prefix caching."""
+    import requests as http_requests
+
+    n = len(records)
+    t0 = time.time()
+
+    for i, rec in enumerate(records):
+        context_ids = rec.get("context_token_ids", [])
+        if not context_ids:
+            continue
+
+        try:
+            resp = http_requests.post(
+                f"{server_url}/generate",
+                json={
+                    "input_ids": context_ids,
+                    "sampling_params": {
+                        "max_new_tokens": max_tokens,
+                        "temperature": 0,
+                    },
+                },
+                timeout=120,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            # output_ids contains only generated tokens (no prompt)
+            draft_tokens = data.get("output_ids", [])
+        except Exception as e:
+            draft_tokens = []
+
+        n_draft = len(draft_tokens)
+        parents = [-1] + list(range(n_draft - 1))
+
+        if "per_proposer" not in rec:
+            rec["per_proposer"] = {}
+        rec["per_proposer"]["draft_model"] = {
+            "token_ids": draft_tokens,
+            "parents": parents[:n_draft],
+            "size": n_draft,
+        }
+        _rebuild_union_trie(rec)
+
+        if (i + 1) % 100 == 0 or i == n - 1:
+            elapsed = time.time() - t0
+            rate = (i + 1) / elapsed
+            eta = (n - i - 1) / rate if rate > 0 else 0
+            print(f"  [{i+1}/{n}] {rate:.1f} steps/s, ETA {eta:.0f}s",
+                  file=sys.stderr)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -138,6 +193,9 @@ def main():
     parser.add_argument("--max-draft-tokens", type=int, default=16,
                         help="Max tokens to generate per step")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--server-url", default=None,
+                        help="SGLang server URL (e.g. http://localhost:30010). "
+                             "If set, uses SGLang instead of HuggingFace.")
     parser.add_argument("--shard", default=None,
                         help="Process shard M/N, e.g. '0/4'")
     parser.add_argument("--checkpoint-every", type=int, default=1,
@@ -152,20 +210,38 @@ def main():
             if line.strip():
                 records.append(json.loads(line))
 
-    # Shard
+    # Shard: greedy bin-packing by step count for balanced distribution
     if args.shard:
         shard_id, num_shards = map(int, args.shard.split("/"))
-        all_req_ids = sorted(set(r.get("request_id", "") for r in records))
-        my_req_ids = set(all_req_ids[i] for i in range(len(all_req_ids))
-                         if i % num_shards == shard_id)
+        from collections import Counter
+        req_counts = Counter(r.get("request_id", "") for r in records)
+        # Sort requests largest-first, assign to smallest shard
+        sorted_reqs = sorted(req_counts.items(), key=lambda x: -x[1])
+        shard_loads = [0] * num_shards
+        shard_assignment = {}  # req_id → shard_id
+        for req_id, count in sorted_reqs:
+            target = min(range(num_shards), key=lambda s: shard_loads[s])
+            shard_assignment[req_id] = target
+            shard_loads[target] += count
+        my_req_ids = set(rid for rid, sid in shard_assignment.items()
+                         if sid == shard_id)
         records = [r for r in records if r.get("request_id", "") in my_req_ids]
-        print(f"Shard {shard_id}/{num_shards}: {len(records)} records",
-              file=sys.stderr)
+        print(f"Shard {shard_id}/{num_shards}: {len(records)} records "
+              f"(balanced load: {shard_loads})", file=sys.stderr)
 
     print(f"Records: {len(records)}", file=sys.stderr)
 
-    if args.checkpoint_every > 0:
-        # Per-request checkpointing
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if args.server_url:
+        # SGLang server mode (fast, uses prefix caching)
+        collect_draft_chains_sglang(records, args.server_url, args.max_draft_tokens)
+        with open(output_path, "w") as f:
+            for rec in records:
+                f.write(json.dumps(rec) + "\n")
+    elif args.checkpoint_every > 0:
+        # HuggingFace with per-request checkpointing
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -180,8 +256,6 @@ def main():
         for rec in records:
             by_req.setdefault(rec.get("request_id", ""), []).append(rec)
 
-        output_path = Path(args.output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
         t0 = time.time()
         processed = 0
 
@@ -211,7 +285,6 @@ def main():
                         "parents": parents[:n_draft],
                         "size": n_draft,
                     }
-                    # Rebuild union trie to include draft_model nodes
                     _rebuild_union_trie(rec)
 
                 for rec in req_records:
@@ -230,8 +303,6 @@ def main():
         del model
     else:
         collect_draft_chains_hf(records, args.model, args.device, args.max_draft_tokens)
-        output_path = Path(args.output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, "w") as f:
             for rec in records:
                 f.write(json.dumps(rec) + "\n")

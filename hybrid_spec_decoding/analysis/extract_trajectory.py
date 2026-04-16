@@ -29,13 +29,25 @@ def extract_trajectories(agent_results_path: str) -> dict[str, list[int]]:
     trajectories: dict[str, list[int]] = defaultdict(list)
 
     for question in data["questions"]:
-        for step in question["agent_metrics"]["steps"]:
-            entries = step.get("spec_decode", {}).get("oracle_vanilla_entries", [])
-            for entry in entries:
-                req_id = entry.get("req_id", "")
-                tokens = entry.get("tokens", [[]])
-                if tokens and tokens[0]:
-                    trajectories[req_id].extend(tokens[0])
+        if "agent_metrics" in question:
+            # BFCL / SWE-bench format: agent_metrics.steps[].spec_decode
+            for step in question["agent_metrics"]["steps"]:
+                entries = step.get("spec_decode", {}).get("oracle_vanilla_entries", [])
+                for entry in entries:
+                    req_id = entry.get("req_id", "")
+                    tokens = entry.get("tokens", [[]])
+                    if tokens and tokens[0]:
+                        trajectories[req_id].extend(tokens[0])
+        elif "turns" in question:
+            # SpecBench format: turns[].spec_decode
+            for turn in question["turns"]:
+                if isinstance(turn, dict):
+                    entries = turn.get("spec_decode", {}).get("oracle_vanilla_entries", [])
+                    for entry in entries:
+                        req_id = entry.get("req_id", "")
+                        tokens = entry.get("tokens", [[]])
+                        if tokens and tokens[0]:
+                            trajectories[req_id].extend(tokens[0])
 
     return dict(trajectories)
 
