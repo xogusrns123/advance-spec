@@ -26,6 +26,8 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+
 from hybrid_spec_decoding.analysis.tree_knapsack import (
     greedy_tree_walk,
     tree_knapsack_dp,
@@ -265,6 +267,7 @@ def simulate_decoding(
     *,
     verify_latency_ms: float,
     vanilla_latency_ms: float,
+    suffix_cache=None,
 ) -> dict:
     """Simulate actual speculative decoding with skip-ahead.
 
@@ -325,9 +328,6 @@ def simulate_decoding(
         if not first_rec:
             continue
         # Detect data format to compute total sequence length:
-        # NEW format (gt = tokens[pos:]): seq_len = pos + len(gt)
-        # OLD format (gt = tokens[pos+1:]): seq_len = pos + 1 + len(gt)
-        # Detection: OLD format has gt_len=1 at last step, NEW has gt_len>=2
         last_rec = record_index.get((req_id, call_idx, step_indices[-1]))
         last_gt_len = len(last_rec.get("ground_truth_future", [])) if last_rec else 1
         first_gt_len = len(first_rec.get("ground_truth_future", []))
@@ -336,13 +336,19 @@ def simulate_decoding(
         else:
             seq_len = step_indices[0] + first_gt_len
 
-        pos = step_indices[0]  # start from first available position
+        # Suffix cache lifecycle for extension method
+        cache_req_id = f"{req_id}_{call_idx}"
+        if suffix_cache is not None:
+            prompt = first_rec.get("context_token_ids", [])
+            suffix_cache.start_request(cache_req_id,
+                                       np.array(prompt, dtype=np.int32))
+
+        pos = step_indices[0]
         step_set = set(step_indices)
 
         while pos <= max_pos and pos in step_set:
             rec = record_index.get((req_id, call_idx, pos))
             if rec is None:
-                # No record at this position, advance by 1 (vanilla)
                 total_generated += 1
                 total_steps += 1
                 total_time_ms += vanilla_latency_ms
@@ -350,7 +356,10 @@ def simulate_decoding(
                 continue
 
             # Select tree and compute acceptance
-            if method == "eu":
+            if method == "extension":
+                accepted = _extension_step(rec, budget, suffix_cache,
+                                           cache_req_id)
+            elif method == "eu":
                 accepted = _eu_step(rec, budget, p_t_key)
             elif method.startswith("eu_pair:"):
                 names = method.split(":", 1)[1].split(",")
@@ -378,6 +387,13 @@ def simulate_decoding(
             total_steps += 1
             total_time_ms += verify_latency_ms
 
+            # Feed accepted tokens to suffix cache
+            if suffix_cache is not None:
+                gt = rec.get("ground_truth_future", [])
+                if gt and advance <= len(gt):
+                    suffix_cache.add_active_response(
+                        cache_req_id, gt[:advance])
+
             per_step_log.append({
                 "pos": pos,
                 "accepted": accepted,
@@ -392,6 +408,9 @@ def simulate_decoding(
             total_generated += remaining
             total_steps += remaining
             total_time_ms += remaining * vanilla_latency_ms
+
+        if suffix_cache is not None:
+            suffix_cache.stop_request(cache_req_id)
 
     vanilla_time_ms = total_generated * vanilla_latency_ms
     speedup = vanilla_time_ms / total_time_ms if total_time_ms > 0 else 1.0
@@ -603,6 +622,80 @@ def _hybrid_step(rec: dict, budget: int, threshold: float,
         return 0
 
 
+def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str) -> int:
+    """Extension: EAGLE3 tree (truncated to budget) + suffix extension at each leaf.
+
+    For each leaf of the truncated EAGLE3 tree, trace root→leaf path,
+    build extended context, and call suffix_cache.speculate() to extend.
+    Then greedy walk on the combined (EAGLE3 + suffix extensions) tree.
+    """
+    gt = rec.get("ground_truth_future", [])
+    if not gt:
+        return 0
+
+    eagle3 = rec.get("per_proposer", {}).get("eagle3")
+    if not eagle3 or not eagle3.get("token_ids"):
+        return 0
+
+    tids = eagle3["token_ids"]
+    pids = eagle3["parents"]
+
+    # Truncate EAGLE3 tree to budget
+    n = min(budget, len(tids))
+    tids = tids[:n]
+    pids = pids[:n]
+    pids = [p if p < n else -1 for p in pids]
+
+    # Find leaves: nodes that are NOT a parent of any other node
+    is_parent = set(pids)  # includes -1
+    leaves = [i for i in range(n) if i not in is_parent]
+
+    if not leaves:
+        # All nodes are internal (shouldn't happen with truncation)
+        return greedy_tree_walk(tids, pids, gt)
+
+    # Build extended tree
+    ext_tids = list(tids)
+    ext_pids = list(pids)
+
+    base_context = rec.get("context_token_ids")
+    if base_context is None or suffix_cache is None:
+        return greedy_tree_walk(ext_tids, ext_pids, gt)
+
+    # For each leaf, trace path and extend with suffix
+    for leaf_idx in leaves:
+        # Trace root→leaf path
+        path = []
+        node = leaf_idx
+        while node >= 0:
+            path.append(tids[node])
+            node = pids[node]
+        path.reverse()
+
+        # Extension context = base_context + path tokens
+        ext_context = np.array(base_context + path, dtype=np.int32)
+
+        # Suffix lookup
+        try:
+            draft = suffix_cache.speculate(cache_req_id, ext_context)
+        except Exception:
+            continue
+
+        if not draft.token_ids:
+            continue
+
+        # Attach suffix chain to leaf
+        offset = len(ext_tids)
+        for j, (tid, pid) in enumerate(zip(draft.token_ids, draft.parents)):
+            ext_tids.append(tid)
+            if pid == -1:
+                ext_pids.append(leaf_idx)  # suffix root children → attach to leaf
+            else:
+                ext_pids.append(offset + pid)
+
+    return greedy_tree_walk(ext_tids, ext_pids, gt)
+
+
 def _truncate_and_walk(tids, pids, p_t, gt, budget):
     """Truncate tree to budget nodes via knapsack DP, then greedy walk."""
     if not tids or not gt:
@@ -663,36 +756,37 @@ def _single_proposer_step(rec: dict, budget: int, proposer_name: str,
 
 
 def _choose_one_step(rec: dict, budget: int, p_t_key: str = "p_t") -> int:
-    """Choose-One Oracle: try each proposer's tree at budget, pick best.
+    """Choose-One Oracle: try each proposer's full tree, pick best.
 
-    No union trie. Each proposer's per_proposer tree is truncated to budget
-    and greedy walked. Best result wins.
+    No budget truncation — each proposer uses its full tree.
+    This is an oracle that picks the best proposer per step.
     """
     gt = rec.get("ground_truth_future", [])
     if not gt:
         return 0
 
-    per_proposer = rec.get("per_proposer", {})
     best_acc = 0
-    for name in per_proposer:
-        acc = _proposer_tree_walk(per_proposer, name, gt, budget)
+    for name, tree_data in rec.get("per_proposer", {}).items():
+        if not tree_data or not tree_data.get("token_ids"):
+            continue
+        acc = greedy_tree_walk(tree_data["token_ids"], tree_data["parents"], gt)
         best_acc = max(best_acc, acc)
     return best_acc
 
 
 def _subset_step(rec: dict, budget: int, proposer_names: List[str],
                  p_t_key: str = "p_t") -> int:
-    """Choose-One over a subset of proposers. No union trie."""
+    """Choose-One over a subset of proposers. Full trees, no truncation."""
     gt = rec.get("ground_truth_future", [])
     if not gt:
         return 0
 
-    per_proposer = rec.get("per_proposer", {})
     best_acc = 0
     for name in proposer_names:
-        if name not in per_proposer:
+        tree_data = rec.get("per_proposer", {}).get(name)
+        if not tree_data or not tree_data.get("token_ids"):
             continue
-        acc = _proposer_tree_walk(per_proposer, name, gt, budget)
+        acc = greedy_tree_walk(tree_data["token_ids"], tree_data["parents"], gt)
         best_acc = max(best_acc, acc)
     return best_acc
 
@@ -872,6 +966,24 @@ def compute_latency_speedup(
             entry["eu_e3sfx_mat"] = eu_pair_sim["mat"]
             entry["eu_e3sfx_speedup"] = eu_pair_sim["speedup"]
             entry["eu_e3sfx_steps"] = eu_pair_sim["total_steps"]
+
+        # Extension: EAGLE3 tree + suffix extension at leaves
+        if "suffix" in proposers and "eagle3" in proposers:
+            from hybrid_spec_decoding.suffix_decoding.suffix_tree import (
+                SuffixDecodingCache,
+            )
+            if not hasattr(compute_latency_speedup, '_ext_cache'):
+                compute_latency_speedup._ext_cache = SuffixDecodingCache(
+                    max_tree_depth=64, max_cached_requests=100000)
+            ext_step = _step_cost(["eagle3"], B)
+            sim = simulate_decoding(
+                records, budget=B, method="extension",
+                verify_latency_ms=ext_step,
+                vanilla_latency_ms=vanilla_ms,
+                suffix_cache=compute_latency_speedup._ext_cache)
+            entry["extension_mat"] = sim["mat"]
+            entry["extension_speedup"] = sim["speedup"]
+            entry["extension_steps"] = sim["total_steps"]
 
         results[B] = entry
 
