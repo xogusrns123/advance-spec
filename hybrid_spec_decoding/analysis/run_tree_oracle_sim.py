@@ -269,6 +269,8 @@ def simulate_decoding(
     verify_latency_ms: float = 0.0,
     suffix_cache=None,
     draft_ratios: Optional[List[float]] = None,
+    real_step_cost_ms: Optional[float] = None,
+    real_step_cost_suffix_ms: Optional[float] = None,
 ) -> dict:
     """Simulate speculative decoding with skip-ahead.
 
@@ -277,6 +279,11 @@ def simulate_decoding(
     draft_ratios: list of ratios (e.g. [0.05, 0.1, 0.2, 0.3, 0.5]).
         step_cost = vanilla_ms * (1 + ratio) for methods with draft cost.
         step_cost = vanilla_ms for suffix-only (no draft cost).
+
+    real_step_cost_ms: measured step cost in ms (when draft is active). Used to
+        compute a second speedup based on actual measured latencies.
+    real_step_cost_suffix_ms: for hybrid only, cost when suffix branch selected
+        (no draft cost). If None, defaults to vanilla_latency_ms.
     """
     record_index: Dict[Tuple, dict] = {}
     sequences: Dict[Tuple, List[int]] = {}
@@ -292,13 +299,18 @@ def simulate_decoding(
 
     # Determine if this method has draft cost
     is_hybrid = method.startswith("hybrid_e3:") or method.startswith("hybrid_dm:")
-    no_draft = method in ("single:suffix", "extension")  # no draft cost
+    no_draft = method in ("single:suffix", "extension", "extension_dmsfx")  # no draft cost
 
     ratios = draft_ratios or []
     # Ratio-based time accumulation
     time_per_ratio = {r: 0.0 for r in ratios}
     # For hybrid: conditional (draft only on fallback) + always (draft every step)
     time_per_ratio_always = {r: 0.0 for r in ratios} if is_hybrid else None
+
+    # Real-cost accumulators (use measured latencies)
+    sfx_cost_ms = real_step_cost_suffix_ms if real_step_cost_suffix_ms is not None else vanilla_latency_ms
+    total_time_real_ms = 0.0 if real_step_cost_ms is not None else None
+    total_time_real_always_ms = 0.0 if (real_step_cost_ms is not None and is_hybrid) else None
 
     total_generated = 0
     total_accepted = 0
@@ -342,6 +354,10 @@ def simulate_decoding(
                     time_per_ratio[r] += v_ms
                     if time_per_ratio_always is not None:
                         time_per_ratio_always[r] += v_ms
+                if total_time_real_ms is not None:
+                    total_time_real_ms += v_ms
+                    if total_time_real_always_ms is not None:
+                        total_time_real_always_ms += v_ms
                 pos += 1
                 continue
 
@@ -349,9 +365,15 @@ def simulate_decoding(
             used_suffix = False
             if method == "union_trie":
                 accepted = _union_trie_step(rec, budget)
+            elif method.startswith("union_trie:"):
+                names = frozenset(method.split(":", 1)[1].split(","))
+                accepted = _union_trie_step(rec, budget, proposer_set=names)
             elif method == "extension":
                 accepted = _extension_step(rec, budget, suffix_cache,
-                                           cache_req_id)
+                                           cache_req_id, base_proposer="eagle3")
+            elif method == "extension_dmsfx":
+                accepted = _extension_step(rec, budget, suffix_cache,
+                                           cache_req_id, base_proposer="draft_model")
             elif method == "eu":
                 accepted = _eu_step(rec, budget, p_t_key)
             elif method.startswith("eu_pair:"):
@@ -398,6 +420,19 @@ def simulate_decoding(
                 else:
                     time_per_ratio[r] += v_ms * (1 + r)
 
+            # Accumulate real-cost time (measured latencies)
+            if total_time_real_ms is not None:
+                if no_draft:
+                    total_time_real_ms += sfx_cost_ms
+                elif is_hybrid:
+                    if used_suffix:
+                        total_time_real_ms += sfx_cost_ms
+                    else:
+                        total_time_real_ms += real_step_cost_ms
+                    total_time_real_always_ms += real_step_cost_ms
+                else:
+                    total_time_real_ms += real_step_cost_ms
+
             # Feed accepted tokens to suffix cache
             if suffix_cache is not None:
                 gt = rec.get("ground_truth_future", [])
@@ -416,6 +451,10 @@ def simulate_decoding(
                 time_per_ratio[r] += remaining * v_ms
                 if time_per_ratio_always is not None:
                     time_per_ratio_always[r] += remaining * v_ms
+            if total_time_real_ms is not None:
+                total_time_real_ms += remaining * v_ms
+                if total_time_real_always_ms is not None:
+                    total_time_real_always_ms += remaining * v_ms
 
         if suffix_cache is not None:
             suffix_cache.stop_request(cache_req_id)
@@ -448,6 +487,13 @@ def simulate_decoding(
         result["speedup_per_ratio"] = speedup_per_ratio
     if speedup_per_ratio_always:
         result["speedup_per_ratio_always"] = speedup_per_ratio_always
+    # Real-cost speedups (measured latencies)
+    if total_time_real_ms is not None:
+        result["speedup_real"] = (vanilla_time_ms / total_time_real_ms
+                                  if total_time_real_ms > 0 else 1.0)
+    if total_time_real_always_ms is not None:
+        result["speedup_real_always"] = (vanilla_time_ms / total_time_real_always_ms
+                                         if total_time_real_always_ms > 0 else 1.0)
     return result
 
 
@@ -645,18 +691,40 @@ def _hybrid_step(rec: dict, budget: int, threshold: float,
         return 0, False
 
 
-def _union_trie_step(rec: dict, budget: int) -> int:
-    """Union trie: truncate to budget by BFS order, then greedy walk."""
+def _union_trie_step(rec: dict, budget: int,
+                     proposer_set: Optional[frozenset] = None) -> int:
+    """Union trie: truncate to budget by BFS order, then greedy walk.
+
+    proposer_set: if None, uses precomputed rec["union_trie"] (eagle3+suffix
+    by default). Otherwise rebuilds union from the specified proposers in
+    rec["per_proposer"].
+    """
     gt = rec.get("ground_truth_future", [])
     if not gt:
         return 0
 
-    trie = rec.get("union_trie")
-    if not trie or not trie.get("token_ids"):
-        return 0
-
-    tids = trie["token_ids"]
-    pids = trie["parents"]
+    if proposer_set is None:
+        trie = rec.get("union_trie")
+        if not trie or not trie.get("token_ids"):
+            return 0
+        tids = trie["token_ids"]
+        pids = trie["parents"]
+    else:
+        # Rebuild union trie on the fly from per_proposer subset
+        from hybrid_spec_decoding.analysis.collect_union_trie import (
+            build_union_trie,
+        )
+        per_prop = rec.get("per_proposer", {})
+        trees = {}
+        for name in proposer_set:
+            pd = per_prop.get(name)
+            if pd and pd.get("token_ids"):
+                trees[name] = (pd["token_ids"], pd["parents"])
+        if not trees:
+            return 0
+        tids, pids, _ = build_union_trie(trees)
+        if not tids:
+            return 0
 
     n = min(budget, len(tids))
     if n < len(tids):
@@ -667,25 +735,29 @@ def _union_trie_step(rec: dict, budget: int) -> int:
     return greedy_tree_walk(tids, pids, gt)
 
 
-def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str) -> int:
-    """Extension: EAGLE3 tree (truncated to budget) + suffix extension at every node.
+def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str,
+                    base_proposer: str = "eagle3") -> int:
+    """Extension: base proposer's tree (truncated to budget) + suffix extension
+    at every node.
 
-    For EVERY node in the truncated EAGLE3 tree, trace root→node path,
-    build extended context, and call suffix_cache.speculate() to extend.
-    Then greedy walk on the combined (EAGLE3 + suffix extensions) tree.
+    For EVERY node in the base tree, trace root→node path, build extended context,
+    and call suffix_cache.speculate() to extend. Then greedy walk on the combined
+    (base + suffix extensions) tree.
+
+    base_proposer: "eagle3" (default) or "draft_model".
     """
     gt = rec.get("ground_truth_future", [])
     if not gt:
         return 0
 
-    eagle3 = rec.get("per_proposer", {}).get("eagle3")
-    if not eagle3 or not eagle3.get("token_ids"):
+    base = rec.get("per_proposer", {}).get(base_proposer)
+    if not base or not base.get("token_ids"):
         return 0
 
-    tids = eagle3["token_ids"]
-    pids = eagle3["parents"]
+    tids = base["token_ids"]
+    pids = base["parents"]
 
-    # Truncate EAGLE3 tree to budget
+    # Truncate base tree to budget
     n = min(budget, len(tids))
     tids = tids[:n]
     pids = pids[:n]
@@ -762,10 +834,10 @@ def _truncate_and_walk(tids, pids, p_t, gt, budget):
 
 
 def _proposer_tree_walk(per_proposer: dict, name: str, gt: list, budget: int) -> int:
-    """Walk a single proposer's per_proposer tree (truncated to budget by BFS order).
+    """Walk a single proposer's per_proposer tree.
 
-    No union trie, no p_t, no knapsack. Just take first B nodes in tree order
-    and greedy walk against ground truth.
+    Suffix has no draft cost (CPU-free), so its tree is never budget-limited.
+    EAGLE3/draft_model trees are truncated to budget by BFS order.
     """
     tree_data = per_proposer.get(name)
     if not tree_data or not tree_data.get("token_ids"):
@@ -774,7 +846,8 @@ def _proposer_tree_walk(per_proposer: dict, name: str, gt: list, budget: int) ->
     tids = tree_data["token_ids"]
     pids = tree_data["parents"]
 
-    if budget < len(tids):
+    # Suffix is free — always use full tree
+    if name != "suffix" and budget < len(tids):
         # Truncate: keep first B nodes (BFS/tree order from proposer)
         tids = tids[:budget]
         pids = pids[:budget]
@@ -914,17 +987,28 @@ def compute_latency_speedup(
 
     DRAFT_RATIOS = [0.05, 0.10, 0.20, 0.30, 0.50]
 
+    def _real_cost(active_proposers, B):
+        """Step cost in ms using measured latencies.
+        target_forward + max(draft costs of non-suffix active proposers)."""
+        tf = _target_forward(B)
+        drafts = [_proposer_draft_cost(p, B) for p in active_proposers
+                  if p != "suffix"]
+        return tf + (max(drafts) if drafts else 0.0)
+
     def _store_sim(entry, prefix, sim):
-        """Store MAT + ratio-based speedups from a simulation result."""
+        """Store MAT + ratio-based + real-cost speedups from a simulation result."""
         entry[f"{prefix}_mat"] = sim["mat"]
         entry[f"{prefix}_steps"] = sim.get("total_steps", 0)
         spr = sim.get("speedup_per_ratio", {})
         for r, spd in spr.items():
             entry[f"{prefix}_speedup_r{r}"] = spd
-        # Hybrid always-draft variant
         spr_always = sim.get("speedup_per_ratio_always", {})
         for r, spd in spr_always.items():
             entry[f"{prefix}_always_speedup_r{r}"] = spd
+        if "speedup_real" in sim:
+            entry[f"{prefix}_speedup_real"] = sim["speedup_real"]
+        if "speedup_real_always" in sim:
+            entry[f"{prefix}_always_speedup_real"] = sim["speedup_real_always"]
 
     if enable_eu:
         print(f"Precomputing EU Oracle DP for {len(records)} records...",
@@ -932,91 +1016,127 @@ def compute_latency_speedup(
         precompute_eu_results(records, budgets, p_t_key)
         print("EU precompute done.", file=sys.stderr)
 
+    def _run(method_key, sim_fn_kwargs, prefix):
+        """Run one simulation and log timing. sim_fn_kwargs is kwargs dict for simulate_decoding."""
+        t0 = time.time()
+        sim = simulate_decoding(**sim_fn_kwargs)
+        dt = time.time() - t0
+        _store_sim(entry, prefix, sim)
+        print(f"    {method_key}: {dt:5.1f}s  mat={sim['mat']:.2f} spd={sim['speedup']:.2f}x",
+              file=sys.stderr)
+        sys.stderr.flush()
+
     results = {}
-    for B in budgets:
-        entry = {"budget": B}
+    total_budgets = len(budgets)
+    for b_idx, B in enumerate(budgets):
+        entry = {
+            "budget": B,
+            "target_forward_ms": _target_forward(B),
+            "eagle3_draft_ms": _eagle3_draft(B),
+            "draft_lm_tpot_ms": draft_lm_tpot,
+        }
+        b_t0 = time.time()
+        print(f"\n[{b_idx+1}/{total_budgets}] Budget={B} ---", file=sys.stderr)
+        sys.stderr.flush()
 
         if enable_eu:
-            eu_sim = simulate_decoding(
-                records, budget=B, method="eu", p_t_key=p_t_key,
-                vanilla_latency_ms=vanilla_ms,
-                draft_ratios=DRAFT_RATIOS)
-            _store_sim(entry, "eu", eu_sim)
+            _run("eu", dict(records=records, budget=B, method="eu",
+                            p_t_key=p_t_key, vanilla_latency_ms=vanilla_ms,
+                            draft_ratios=DRAFT_RATIOS), "eu")
 
             if "suffix" in proposers and "eagle3" in proposers:
-                eu_pair_sim = simulate_decoding(
-                    records, budget=B, method="eu_pair:eagle3,suffix",
-                    vanilla_latency_ms=vanilla_ms,
-                    p_t_key=p_t_key,
-                    draft_ratios=DRAFT_RATIOS)
-                _store_sim(entry, "eu_e3sfx", eu_pair_sim)
+                _run("eu_e3sfx", dict(records=records, budget=B,
+                                      method="eu_pair:eagle3,suffix",
+                                      vanilla_latency_ms=vanilla_ms,
+                                      p_t_key=p_t_key,
+                                      draft_ratios=DRAFT_RATIOS), "eu_e3sfx")
 
-        # Union trie (BFS truncate to budget, greedy walk)
-        ut_sim = simulate_decoding(
-            records, budget=B, method="union_trie",
-            vanilla_latency_ms=vanilla_ms,
-            draft_ratios=DRAFT_RATIOS)
-        _store_sim(entry, "union_trie", ut_sim)
+        common = dict(records=records, budget=B,
+                      vanilla_latency_ms=vanilla_ms,
+                      draft_ratios=DRAFT_RATIOS)
+
+        # Union trie
+        _run("union_trie_e3sfx", {**common,
+             "method": "union_trie:eagle3,suffix",
+             "real_step_cost_ms": _real_cost(["eagle3", "suffix"], B)},
+             "union_trie_e3sfx")
+
+        if "draft_model" in proposers:
+            _run("union_trie_all", {**common,
+                 "method": "union_trie:eagle3,suffix,draft_model",
+                 "real_step_cost_ms": _real_cost(["eagle3", "suffix", "draft_model"], B)},
+                 "union_trie_all")
 
         # Choose-One Oracle (all proposers, full tree)
-        c1_sim = simulate_decoding(
-            records, budget=B, method="choose_one",
-            vanilla_latency_ms=vanilla_ms,
-            draft_ratios=DRAFT_RATIOS)
-        _store_sim(entry, "c1", c1_sim)
+        _run("c1", {**common, "method": "choose_one",
+             "real_step_cost_ms": _real_cost(list(proposers), B)}, "c1")
 
         # Single-proposer baselines
         for pname in proposers:
-            sim = simulate_decoding(
-                records, budget=B, method=f"single:{pname}",
-                vanilla_latency_ms=vanilla_ms,
-                draft_ratios=DRAFT_RATIOS)
-            _store_sim(entry, pname, sim)
+            _run(f"single:{pname}",
+                 {**common, "method": f"single:{pname}",
+                  "real_step_cost_ms": _real_cost([pname], B)},
+                 pname)
 
         # Hybrid (suffix score threshold): suffix if score >= t, else fallback
         thresholds = [1.0, 3.0, 5.0]
 
         if "suffix" in proposers and "eagle3" in proposers:
+            e3_cost = _real_cost(["eagle3"], B)
             for t in thresholds:
-                sim = simulate_decoding(
-                    records, budget=B, method=f"hybrid_e3:{t}",
-                    vanilla_latency_ms=vanilla_ms,
-                    draft_ratios=DRAFT_RATIOS)
-                _store_sim(entry, f"hybrid_e3_t{t:.1f}", sim)
+                _run(f"hybrid_e3:{t}",
+                     {**common, "method": f"hybrid_e3:{t}",
+                      "real_step_cost_ms": e3_cost,
+                      "real_step_cost_suffix_ms": _target_forward(B)},
+                     f"hybrid_e3_t{t:.1f}")
 
         if "suffix" in proposers and "draft_model" in proposers:
+            dm_cost = _real_cost(["draft_model"], B)
             for t in thresholds:
-                sim = simulate_decoding(
-                    records, budget=B, method=f"hybrid_dm:{t}",
-                    vanilla_latency_ms=vanilla_ms,
-                    draft_ratios=DRAFT_RATIOS)
-                _store_sim(entry, f"hybrid_dm_t{t:.1f}", sim)
+                _run(f"hybrid_dm:{t}",
+                     {**common, "method": f"hybrid_dm:{t}",
+                      "real_step_cost_ms": dm_cost,
+                      "real_step_cost_suffix_ms": _target_forward(B)},
+                     f"hybrid_dm_t{t:.1f}")
 
         # C1 for suffix+eagle3 pair
         if "suffix" in proposers and "eagle3" in proposers:
-            c1_pair_sim = simulate_decoding(
-                records, budget=B, method="subset:eagle3,suffix",
-                vanilla_latency_ms=vanilla_ms,
-                p_t_key=p_t_key,
-                draft_ratios=DRAFT_RATIOS)
-            _store_sim(entry, "c1_e3sfx", c1_pair_sim)
+            _run("c1_e3sfx",
+                 {**common, "method": "subset:eagle3,suffix",
+                  "p_t_key": p_t_key,
+                  "real_step_cost_ms": _real_cost(["eagle3", "suffix"], B)},
+                 "c1_e3sfx")
 
-        # Extension: EAGLE3 tree + suffix extension at leaves
+        # Extension: base tree + suffix extension at every node
+        from hybrid_spec_decoding.suffix_decoding.suffix_tree import (
+            SuffixDecodingCache,
+        )
         if "suffix" in proposers and "eagle3" in proposers:
-            from hybrid_spec_decoding.suffix_decoding.suffix_tree import (
-                SuffixDecodingCache,
-            )
             if not hasattr(compute_latency_speedup, '_ext_cache'):
                 compute_latency_speedup._ext_cache = SuffixDecodingCache(
                     max_tree_depth=64, max_cached_requests=100000)
-            sim = simulate_decoding(
-                records, budget=B, method="extension",
-                vanilla_latency_ms=vanilla_ms,
-                suffix_cache=compute_latency_speedup._ext_cache,
-                draft_ratios=DRAFT_RATIOS)
-            _store_sim(entry, "extension", sim)
+            _run("extension",
+                 {**common, "method": "extension",
+                  "suffix_cache": compute_latency_speedup._ext_cache,
+                  "real_step_cost_ms": _real_cost(["eagle3"], B)},
+                 "extension")
+
+        # Extension with draft_model base + suffix extensions
+        if "suffix" in proposers and "draft_model" in proposers:
+            if not hasattr(compute_latency_speedup, '_ext_cache_dm'):
+                compute_latency_speedup._ext_cache_dm = SuffixDecodingCache(
+                    max_tree_depth=64, max_cached_requests=100000)
+            _run("extension_dmsfx",
+                 {**common, "method": "extension_dmsfx",
+                  "suffix_cache": compute_latency_speedup._ext_cache_dm,
+                  "real_step_cost_ms": _real_cost(["draft_model"], B)},
+                 "extension_dmsfx")
 
         results[B] = entry
+        b_dt = time.time() - b_t0
+        print(f"[{b_idx+1}/{total_budgets}] Budget={B} done in {b_dt:.1f}s",
+              file=sys.stderr)
+        sys.stderr.flush()
 
     return results
 
@@ -1026,162 +1146,74 @@ def print_latency_summary(
     budgets: List[int],
     vanilla_ms: float,
 ):
-    """Print latency-aware speedup summary."""
-    # Discover proposer names from first budget entry
+    """Print latency-aware speedup summary.
+
+    Groups methods by prefix and prints MAT + best-available speedup per
+    budget. Speedup preference: real (measured costs) > lowest ratio.
+    Silently skips sections with no data so it stays useful even when only
+    a subset of methods was evaluated.
+    """
     first = latency_results[budgets[0]]
-    proposers = sorted(k.replace("_speedup", "") for k in first
-                       if k.endswith("_speedup") and k not in
-                       ("eu_speedup", "c1_speedup") and "+" not in k)
-    pair_keys = sorted(k.replace("_speedup", "") for k in first
-                       if k.endswith("_speedup") and "+" in k
-                       and not k.startswith("eu_"))
 
-    # --- Single-proposer baselines ---
-    if proposers:
-        print("\n" + "=" * 85, file=sys.stderr)
-        print("SINGLE-PROPOSER BASELINES", file=sys.stderr)
-        print("=" * 85, file=sys.stderr)
-        print(f"Vanilla TPOT: {vanilla_ms:.2f} ms/tok", file=sys.stderr)
-        e3_draft = first.get("eagle3_draft_ms", 0)
-        dm_tpot = first.get("draft_lm_tpot_ms", 0)
-        t_fwd = first.get("target_forward_ms", vanilla_ms)
-        print(f"Target forward: {t_fwd:.2f} ms | "
-              f"EAGLE3 draft: {e3_draft:.2f} ms | "
-              f"Draft LM TPOT: {dm_tpot:.2f} ms", file=sys.stderr)
-        print("Step cost = target_forward(B) + max(draft costs); "
-              "suffix=0 (CPU)", file=sys.stderr)
-        print(file=sys.stderr)
+    # Collect all prefixes that have a MAT column. A prefix is a method tag
+    # like "c1", "eu", "single:eagle3", "extension", "union_trie_e3sfx".
+    prefixes = sorted({k[:-4] for k in first if k.endswith("_mat")})
+    if not prefixes:
+        return
 
-        # Header
-        hdr = f"{'Budget':>6} | {'T_fwd':>8} | {'E3_dft':>7}"
-        for p in proposers:
-            hdr += f" | {p:>10}"
-        print(hdr, file=sys.stderr)
-        print("-" * len(hdr), file=sys.stderr)
+    def _best_speedup(r: dict, prefix: str) -> tuple:
+        """Return (speedup, source_label) for a method at a budget."""
+        if f"{prefix}_speedup_real" in r:
+            return r[f"{prefix}_speedup_real"], "real"
+        ratio_keys = sorted(
+            [k for k in r if k.startswith(f"{prefix}_speedup_r")],
+            key=lambda k: float(k.split("_r")[-1]))
+        if ratio_keys:
+            k = ratio_keys[0]
+            return r[k], k.split("_speedup_")[1]
+        return 0.0, ""
 
-        best_per_proposer: Dict[str, tuple] = {p: (0, 0.0) for p in proposers}
+    t_fwd = first.get("target_forward_ms", vanilla_ms)
+    e3_draft = first.get("eagle3_draft_ms", 0.0)
+    dm_tpot = first.get("draft_lm_tpot_ms", 0.0)
 
-        for B in budgets:
-            r = latency_results[B]
-            row = f"{B:>6} | {r['target_forward_ms']:>7.2f}ms | {r['eagle3_draft_ms']:>6.1f}ms"
-            for p in proposers:
-                spd = r.get(f"{p}_speedup", 0)
-                mat = r.get(f"{p}_mat", 0)
-                row += f" | {spd:>6.2f}x/{mat:.2f}"
-                if spd > best_per_proposer[p][1]:
-                    best_per_proposer[p] = (B, spd)
-            print(row, file=sys.stderr)
-
-        print(file=sys.stderr)
-        for p in proposers:
-            b, s = best_per_proposer[p]
-            print(f"  Best {p}: budget={b}, speedup={s:.2f}x", file=sys.stderr)
-        print("=" * len(hdr), file=sys.stderr)
-
-    # --- Pairwise combinations ---
-    # Discover choose-one pairs and EU pairs separately
-    eu_pair_keys = sorted(k.replace("_speedup", "") for k in first
-                          if k.endswith("_speedup") and k.startswith("eu_")
-                          and "+" in k)
-
-    if pair_keys:
-        print("\n" + "=" * 85, file=sys.stderr)
-        print("PAIRWISE COMBINATIONS (choose-one over 2 proposers)", file=sys.stderr)
-        print("=" * 85, file=sys.stderr)
-        print(file=sys.stderr)
-
-        hdr = f"{'Budget':>6} | {'T_fwd':>8}"
-        for pk in pair_keys:
-            hdr += f" | {pk:>14}"
-        print(hdr, file=sys.stderr)
-        print("-" * len(hdr), file=sys.stderr)
-
-        best_per_pair: Dict[str, tuple] = {pk: (0, 0.0) for pk in pair_keys}
-
-        for B in budgets:
-            r = latency_results[B]
-            row = f"{B:>6} | {r['target_forward_ms']:>7.2f}ms"
-            for pk in pair_keys:
-                spd = r.get(f"{pk}_speedup", 0)
-                mat = r.get(f"{pk}_mat", 0)
-                row += f" | {spd:>7.2f}x/{mat:.2f}"
-                if spd > best_per_pair[pk][1]:
-                    best_per_pair[pk] = (B, spd)
-            print(row, file=sys.stderr)
-
-        print(file=sys.stderr)
-        for pk in pair_keys:
-            b, s = best_per_pair[pk]
-            print(f"  Best {pk}: budget={b}, speedup={s:.2f}x", file=sys.stderr)
-        print("=" * len(hdr), file=sys.stderr)
-
-    # --- EU Oracle pairwise ---
-    if eu_pair_keys:
-        print("\n" + "=" * 85, file=sys.stderr)
-        print("EU ORACLE PAIRWISE (union trie filtered to 2 proposers + knapsack)",
-              file=sys.stderr)
-        print("=" * 85, file=sys.stderr)
-        print(file=sys.stderr)
-
-        hdr = f"{'Budget':>6} | {'T_fwd':>8}"
-        for pk in eu_pair_keys:
-            hdr += f" | {pk:>18}"
-        print(hdr, file=sys.stderr)
-        print("-" * len(hdr), file=sys.stderr)
-
-        best_eu_pair: Dict[str, tuple] = {pk: (0, 0.0) for pk in eu_pair_keys}
-
-        for B in budgets:
-            r = latency_results[B]
-            row = f"{B:>6} | {r['target_forward_ms']:>7.2f}ms"
-            for pk in eu_pair_keys:
-                spd = r.get(f"{pk}_speedup", 0)
-                mat = r.get(f"{pk}_mat", 0)
-                row += f" | {spd:>10.2f}x/{mat:.2f}"
-                if spd > best_eu_pair[pk][1]:
-                    best_eu_pair[pk] = (B, spd)
-            print(row, file=sys.stderr)
-
-        print(file=sys.stderr)
-        for pk in eu_pair_keys:
-            b, s = best_eu_pair[pk]
-            print(f"  Best {pk}: budget={b}, speedup={s:.2f}x", file=sys.stderr)
-        print("=" * len(hdr), file=sys.stderr)
-
-    # --- Oracle methods ---
-    print("\n" + "=" * 85, file=sys.stderr)
-    print("ORACLE METHODS (all proposers)", file=sys.stderr)
-    print("=" * 85, file=sys.stderr)
-    print(f"Vanilla: {vanilla_ms:.2f} ms/tok", file=sys.stderr)
-    print(f"Step cost = target_forward(B) + max(all draft costs)", file=sys.stderr)
-    print(file=sys.stderr)
-    print(f"{'Budget':>6} | {'T_fwd':>8} | {'E3_dft':>7} | {'EU MAT':>7} | {'C1 MAT':>7} | "
-          f"{'EU speed':>9} | {'C1 speed':>9} | {'EU steps':>9} | {'C1 steps':>9}",
+    print("\n" + "=" * 90, file=sys.stderr)
+    print("LATENCY-AWARE SPEEDUP SUMMARY", file=sys.stderr)
+    print("=" * 90, file=sys.stderr)
+    print(f"Vanilla TPOT: {vanilla_ms:.2f} ms/tok  |  "
+          f"Target fwd (B={budgets[0]}): {t_fwd:.2f} ms  |  "
+          f"EAGLE3 draft: {e3_draft:.2f} ms  |  "
+          f"Draft LM TPOT: {dm_tpot:.2f} ms", file=sys.stderr)
+    print("Step cost = target_forward(B) + max(draft costs); suffix = 0 (CPU)",
           file=sys.stderr)
-    print("-" * 95, file=sys.stderr)
 
-    best_eu = (0, 0.0)
-    best_c1 = (0, 0.0)
+    # One row per (budget, method), columns: budget | mat | speedup(source)
+    label_w = max(len(p) for p in prefixes)
+    hdr = (f"{'Budget':>6} | {'Method':<{label_w}} | "
+           f"{'MAT':>6} | {'Speedup':>8} | Source")
+    print("\n" + hdr, file=sys.stderr)
+    print("-" * len(hdr), file=sys.stderr)
+
+    best: Dict[str, tuple] = {p: (0, 0.0, "") for p in prefixes}
 
     for B in budgets:
         r = latency_results[B]
-        print(f"{B:>6} | {r['target_forward_ms']:>7.2f}ms | {r['eagle3_draft_ms']:>6.1f}ms | "
-              f"{r['eu_mat']:>7.2f} | {r['c1_mat']:>7.2f} | "
-              f"{r['eu_speedup']:>8.2f}x | {r['c1_speedup']:>8.2f}x | "
-              f"{r['eu_steps']:>8} | {r['c1_steps']:>8}",
-              file=sys.stderr)
-        if r['eu_speedup'] > best_eu[1]:
-            best_eu = (B, r['eu_speedup'])
-        if r['c1_speedup'] > best_c1[1]:
-            best_c1 = (B, r['c1_speedup'])
+        for p in prefixes:
+            mat = r.get(f"{p}_mat", 0.0)
+            spd, src = _best_speedup(r, p)
+            print(f"{B:>6} | {p:<{label_w}} | "
+                  f"{mat:>6.2f} | {spd:>7.2f}x | {src}",
+                  file=sys.stderr)
+            if spd > best[p][1]:
+                best[p] = (B, spd, src)
 
-    print(file=sys.stderr)
-    print(f"Best EU Oracle:  budget={best_eu[0]}, speedup={best_eu[1]:.2f}x", file=sys.stderr)
-    print(f"Best Choose-One: budget={best_c1[0]}, speedup={best_c1[1]:.2f}x", file=sys.stderr)
-    if best_c1[1] > 0:
-        advantage = (best_eu[1] / best_c1[1] - 1) * 100
-        print(f"EU advantage: {advantage:+.1f}%", file=sys.stderr)
-    print("=" * 85, file=sys.stderr)
+    print("\n-- Best speedup per method --", file=sys.stderr)
+    for p in prefixes:
+        b, s, src = best[p]
+        src_tag = f" ({src})" if src else ""
+        print(f"  {p:<{label_w}}: budget={b:>4}, speedup={s:.2f}x{src_tag}",
+              file=sys.stderr)
+    print("=" * 90, file=sys.stderr)
 
 
 def main():

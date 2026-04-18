@@ -152,9 +152,9 @@ def build_union_trie(
 def collect_union_tries(
     requests: List[dict],
     suffix_cache,
-    max_spec_tokens: int = 64,
-    max_spec_factor: float = 1.0,
-    min_token_prob: float = 0.1,
+    max_spec_tokens: int = 256,
+    max_spec_factor: float = 4.0,
+    min_token_prob: float = 0.0,
     mtp_requests: Optional[List[dict]] = None,
 ) -> List[dict]:
     """Collect per-step union trie data for all requests.
@@ -246,7 +246,8 @@ def collect_union_tries(
                     req_id, suffix_context,
                     max_spec_tokens=max_spec_tokens,
                     max_spec_factor=max_spec_factor,
-                    min_token_prob=min_token_prob)
+                    min_token_prob=min_token_prob,
+                    use_tree_spec=True)
 
                 # Context for p_t collection: ends at tokens[pos-1]
                 # so that logits at context[-1] predict tokens[pos],

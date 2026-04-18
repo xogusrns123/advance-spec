@@ -296,6 +296,9 @@ echo ""
 echo "=== Stage 6: Oracle Simulation ==="
 
 LATENCY_FLAG=""
+if [ ! -f "$OUTPUT_DIR/latency_config.json" ] && [ -f "results/${MODEL_SHORT}/latency_config.json" ]; then
+  cp "results/${MODEL_SHORT}/latency_config.json" "$OUTPUT_DIR/latency_config.json"
+fi
 if [ -f "$OUTPUT_DIR/latency_config.json" ]; then
   LATENCY_FLAG="--latency-config $OUTPUT_DIR/latency_config.json"
 fi
@@ -307,7 +310,7 @@ fi
 
 python3 -m hybrid_spec_decoding.analysis.run_tree_oracle_sim \
   --union-trie-data "$SIM_INPUT" \
-  --budgets 1,2,4,8,16,32,64,128,256,300 \
+  --budgets 1,2,4,8,16,32,64,128,256,512 \
   --p-t-key p_t \
   --output "$OUTPUT_DIR/tree_oracle_sim.json" \
   $EU_FLAG \

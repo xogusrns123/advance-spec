@@ -99,9 +99,16 @@ tests/
   test_online_integration.py    SGLang server + oracle patches integration test
 
 scripts/
-  run_oracle_pipeline.sh        Full oracle vanilla + replay + 88-method simulation
-  test_full_pipeline.sh         End-to-end pipeline test (collect → p_t → tree oracle)
-  test_qwen3_pipeline.sh        Qwen3-8B specific pipeline
+  run_pipeline.sh               Canonical end-to-end oracle pipeline (Stages 1-6)
+                                Usage: bash scripts/run_pipeline.sh <bench> <preset> [n]
+                                Env:   REQ_START/REQ_END (shard slices), GPU_IDS,
+                                       NUM_GPUS, SKIP_PT, ENABLE_EU, PORT
+  run_parallel_stage1.sh        Stage 1: multi-GPU EAGLE3 oracle vanilla (shard by GPU)
+  run_parallel_draft_model.sh   Stage 4b: multi-GPU SGLang draft-model proposals
+  run_parallel_p_t.sh           Stage 5: multi-GPU target-model p_t collection
+  merge_shards.sh               Merge REQ_START/REQ_END partial runs and rerun Stage 6
+  rerun_from_stage4.sh          Re-run Stages 4-6 reusing existing draft_model data
+  rerun_stage6_sharded.sh       Re-run Stage 6 only, sharding budgets across processes
   run_online_test.sh            Online SGLang server integration test
   measure_step_latency.py       Measure per-token TPOT via SGLang server
   measure_verify_latency.py     Measure budget-specific tree verification latency
