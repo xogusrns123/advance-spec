@@ -361,12 +361,18 @@ def _patch_verify_greedy_func() -> None:
         candidates, retrive_index, retrive_next_token,
         retrive_next_sibling, target_predict, topk,
     ):
+        import time as _time
+        _t0 = _time.perf_counter()
         # Run original to get correct target_predict (bonus token)
         predicts, accept_index, accept_token_num = original_func(
             predicts, accept_index, accept_token_num,
             candidates, retrive_index, retrive_next_token,
             retrive_next_sibling, target_predict, topk,
         )
+        _t1 = _time.perf_counter()
+
+        # Store timing in module-level var (eagle_worker not in scope)
+        eagle_info._oracle_last_greedy_ms = (_t1 - _t0) * 1000
 
         # Force accept_length=0: only keep the first accepted token (bonus)
         # accept_index[i] = [first_idx, -1, -1, ...] → only bonus token
@@ -526,21 +532,20 @@ def _inject_union_trie(spec_info, batch, trie_feeder, eagle_worker):
 
 
 def _patch_verify_logits(eagle_worker: "EAGLEWorker") -> None:
-    """Patch verify() to stash full target-model logits before acceptance filtering."""
+    """Patch verify() to measure total verify time and stash logits."""
     original_verify = eagle_worker.verify
 
     def patched_verify(batch, spec_info):
+        import time as _time
+        _t0 = _time.perf_counter()
         result = original_verify(batch, spec_info)
-        # result is (logits_output, verify_output, model_worker_batch, can_run_cuda_graph)
-        # At this point logits_output.next_token_logits is already filtered to accepted_indices.
-        # But we need the FULL logits before filtering.
-        # Unfortunately verify() modifies logits_output in-place.
-        # So we need to capture them inside verify() before the filtering.
-        # Alternative: we stash from the target_worker forward result directly.
+        _t1 = _time.perf_counter()
+        eagle_worker._oracle_last_verify_total_ms = (_t1 - _t0) * 1000
         return result
 
-    # Instead of patching verify(), patch target_worker.forward_batch_generation
-    # to capture logits before verify filters them.
+    eagle_worker.verify = patched_verify
+
+    # Patch target_worker.forward_batch_generation for target forward timing + logit stashing
     original_target_forward = eagle_worker.target_worker.forward_batch_generation
 
     def patched_target_forward(model_worker_batch, is_verify=False):
@@ -577,9 +582,13 @@ def _patch_forward_log(
     original_forward = eagle_worker.forward_batch_generation
 
     def patched_forward(batch: "ScheduleBatch") -> "GenerationBatchResult":
+        import time as _time
         import torch
 
+        _t_step_start = _time.perf_counter()
         result = original_forward(batch)
+        _t_step_end = _time.perf_counter()
+        eagle_worker._oracle_last_step_total_ms = (_t_step_end - _t_step_start) * 1000
 
         # Only process decode steps
         is_decode = not (
@@ -687,18 +696,46 @@ def _patch_forward_log(
             eagle_worker._oracle_stashed_draft = None
             eagle_worker._oracle_stashed_verify_logits = None
 
-            # Log per-step timing (eagle3_draft + target_forward)
+            # Log per-step decomposed timing
+            import sglang.srt.speculative.eagle_info as _eagle_info
             draft_ms = getattr(eagle_worker, "_oracle_last_draft_ms", None)
             fwd_ms = getattr(eagle_worker, "_oracle_last_target_forward_ms", None)
+            verify_total_ms = getattr(eagle_worker, "_oracle_last_verify_total_ms", None)
+            step_total_ms = getattr(eagle_worker, "_oracle_last_step_total_ms", None)
+            greedy_ms = getattr(_eagle_info, "_oracle_last_greedy_ms", None)
+
             if draft_ms is not None or fwd_ms is not None:
+                # Decompose verify: pre-forward + forward + greedy + post-greedy
+                verify_pre_ms = None
+                verify_post_ms = None
+                post_verify_ms = None
+                if verify_total_ms is not None and fwd_ms is not None:
+                    # verify_total = verify_pre + target_forward + greedy + verify_post
+                    greedy_t = greedy_ms or 0
+                    verify_other = verify_total_ms - fwd_ms - greedy_t
+                    # We can't easily split pre/post without more hooks,
+                    # but we log verify_other = pre + post
+                    verify_pre_ms = None  # unknown split
+                    verify_post_ms = None
+                if step_total_ms is not None and draft_ms is not None and verify_total_ms is not None:
+                    post_verify_ms = step_total_ms - draft_ms - verify_total_ms
+
                 _log_timing({
                     "eagle3_draft_ms": draft_ms,
                     "target_forward_ms": fwd_ms,
+                    "verify_total_ms": verify_total_ms,
+                    "verify_greedy_ms": greedy_ms,
+                    "verify_overhead_ms": round(verify_total_ms - fwd_ms - (greedy_ms or 0), 3) if verify_total_ms and fwd_ms else None,
+                    "step_total_ms": step_total_ms,
+                    "post_verify_ms": round(post_verify_ms, 3) if post_verify_ms is not None else None,
                     "num_draft": num_draft,
                     "num_reqs": num_reqs,
                 })
                 eagle_worker._oracle_last_draft_ms = None
                 eagle_worker._oracle_last_target_forward_ms = None
+                eagle_worker._oracle_last_verify_total_ms = None
+                eagle_worker._oracle_last_step_total_ms = None
+                _eagle_info._oracle_last_greedy_ms = None
 
         except Exception as e:
             logger.warning(f"Oracle logging failed: {e}")

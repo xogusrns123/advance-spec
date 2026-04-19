@@ -41,7 +41,7 @@ from pathlib import Path
 from openai import OpenAI
 
 
-def wait_for_server(url: str, timeout: int = 300) -> bool:
+def wait_for_server(url: str, timeout: int = 600) -> bool:
     import requests
     t0 = time.time()
     while time.time() - t0 < timeout:
@@ -300,49 +300,101 @@ def main():
     prompts = load_specbench(args.dataset, args.n_requests)
     server_log = Path("/tmp/sglang_bench_server.log")
 
+    # --- Try to resume from existing output ---
+    cached_vanilla = None
+    cached_results = {}
+    output_path = os.path.abspath(args.output)
+    if os.path.exists(output_path):
+        try:
+            with open(output_path) as f:
+                prev = json.load(f)
+            if (prev.get("model") == args.model
+                    and prev.get("vanilla_tpot_ms") is not None):
+                cached_vanilla = {
+                    "tpot_ms": prev["vanilla_tpot_ms"],
+                    "tps": prev["vanilla_tps"],
+                }
+                for r in prev.get("results", []):
+                    if "error" not in r:
+                        key = (r["topk"], r["steps"], r["budget"])
+                        cached_results[key] = r
+                print(f"Resuming from {args.output}: vanilla cached, "
+                      f"{len(cached_results)} configs already done.",
+                      file=sys.stderr)
+        except (json.JSONDecodeError, KeyError):
+            pass
+
     print(f"SpecBench prompts: {len(prompts)}", file=sys.stderr)
     print(f"Configs: {len(configs)}", file=sys.stderr)
-    print(f"Estimated time: ~{len(configs) * 3} min\n", file=sys.stderr)
 
     # --- Vanilla baseline ---
-    print("=" * 80, file=sys.stderr)
-    print("Measuring vanilla baseline (no speculation)...", file=sys.stderr)
-    print("=" * 80, file=sys.stderr)
+    if cached_vanilla:
+        vanilla_tpot = cached_vanilla["tpot_ms"]
+        vanilla_tps = cached_vanilla["tps"]
+        print(f"Using cached vanilla: TPOT={vanilla_tpot:.2f} ms/tok, "
+              f"TPS={vanilla_tps:.1f}\n", file=sys.stderr)
+        vanilla_result = {"overall_tps": vanilla_tps}
+    else:
+        print("=" * 80, file=sys.stderr)
+        print("Measuring vanilla baseline (no speculation)...", file=sys.stderr)
+        print("=" * 80, file=sys.stderr)
 
-    env = os.environ.copy()
-    env["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
-    cmd = [
-        sys.executable, "-m", "sglang.launch_server",
-        "--model-path", args.model,
-        "--tp-size", str(args.tp_size),
-        "--mem-fraction-static", "0.8",
-        "--disable-cuda-graph",
-        "--host", "0.0.0.0", "--port", str(args.port),
-    ] + args.extra_args
+        env = os.environ.copy()
+        env["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
+        cmd = [
+            sys.executable, "-m", "sglang.launch_server",
+            "--model-path", args.model,
+            "--tp-size", str(args.tp_size),
+            "--mem-fraction-static", "0.85",
+            "--disable-cuda-graph",
+            "--host", "0.0.0.0", "--port", str(args.port),
+        ] + args.extra_args
 
-    proc = subprocess.Popen(cmd, env=env,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            preexec_fn=os.setsid)
-    if not wait_for_server(url):
+        vanilla_log = "/tmp/sglang_vanilla_server.log"
+        vanilla_fh = open(vanilla_log, "w")
+        proc = subprocess.Popen(cmd, env=env,
+                                stdout=vanilla_fh, stderr=vanilla_fh)
+        if not wait_for_server(url):
+            kill_server(proc)
+            vanilla_fh.close()
+            print("ERROR: Vanilla server failed. Log tail:", file=sys.stderr)
+            try:
+                with open(vanilla_log) as f:
+                    lines = f.readlines()
+                for line in lines[-50:]:
+                    print(f"  {line}", end="", file=sys.stderr)
+            except Exception:
+                pass
+            sys.exit(1)
+        vanilla_fh.close()
+
+        vanilla_result = run_workload(url, args.model, prompts,
+                                      args.max_tokens, args.n_warmup)
+        vanilla_tpot = statistics.median(
+            [r["tpot_ms"] for r in vanilla_result["requests"] if "tpot_ms" in r])
+        print(f"  Vanilla TPOT: {vanilla_tpot:.2f} ms/tok, "
+              f"TPS: {vanilla_result['overall_tps']:.1f}\n", file=sys.stderr)
         kill_server(proc)
-        print("ERROR: Vanilla server failed", file=sys.stderr)
-        sys.exit(1)
+        time.sleep(5)
 
-    vanilla_result = run_workload(url, args.model, prompts,
-                                  args.max_tokens, args.n_warmup)
-    vanilla_tpot = statistics.median(
-        [r["tpot_ms"] for r in vanilla_result["requests"] if "tpot_ms" in r])
-    print(f"  Vanilla TPOT: {vanilla_tpot:.2f} ms/tok, "
-          f"TPS: {vanilla_result['overall_tps']:.1f}\n", file=sys.stderr)
-    kill_server(proc)
-    time.sleep(5)
+    remaining = [c for c in configs
+                 if (c["topk"], c["steps"], c["budget"]) not in cached_results]
+    print(f"Remaining configs: {len(remaining)}/{len(configs)} "
+          f"(~{len(remaining) * 3} min)\n", file=sys.stderr)
 
     # --- Sweep configs ---
-    all_results = []
+    all_results = [cached_results[(c["topk"], c["steps"], c["budget"])]
+                   for c in configs
+                   if (c["topk"], c["steps"], c["budget"]) in cached_results]
 
     for ci, cfg in enumerate(configs):
         topk, steps, budget = cfg["topk"], cfg["steps"], cfg["budget"]
         mode = cfg["mode"]
+
+        if (topk, steps, budget) in cached_results:
+            print(f"[{ci+1}/{len(configs)}] {mode}: topk={topk}, steps={steps}, "
+                  f"budget={budget} — CACHED, skipping", file=sys.stderr)
+            continue
 
         print("=" * 80, file=sys.stderr)
         print(f"[{ci+1}/{len(configs)}] {mode}: topk={topk}, steps={steps}, "
@@ -363,7 +415,7 @@ def main():
             "--speculative-num-steps", str(steps),
             "--speculative-eagle-topk", str(topk),
             "--speculative-num-draft-tokens", str(budget),
-            "--mem-fraction-static", "0.8",
+            "--mem-fraction-static", "0.85",
             "--disable-cuda-graph",
             "--host", "0.0.0.0", "--port", str(args.port),
         ] + args.extra_args
@@ -374,7 +426,15 @@ def main():
         if not wait_for_server(url):
             kill_server(proc)
             log_fh.close()
-            print(f"  ERROR: Server failed\n", file=sys.stderr)
+            print(f"  ERROR: Server failed. Log tail:", file=sys.stderr)
+            try:
+                with open(server_log) as f:
+                    lines = f.readlines()
+                for line in lines[-30:]:
+                    print(f"    {line}", end="", file=sys.stderr)
+            except Exception:
+                pass
+            print(file=sys.stderr)
             all_results.append({**cfg, "error": "server_failed"})
             time.sleep(3)
             continue
@@ -440,7 +500,7 @@ def main():
             "tpot_ms": round(med_tpot, 2),
             "speedup": round(speedup, 2),
             "mat": round(mat, 2),
-            "accept_rate": round(avg_accept / budget if budget > 0 else 0, 4),
+            "accept_rate": round((avg_accept - 1) / budget if budget > 0 else 0, 4),
             "overall_tps": round(workload["overall_tps"], 1),
             "server_throughput": round(avg_throughput, 1),
             "total_tokens": workload["total_tokens"],
@@ -451,6 +511,7 @@ def main():
             "cpu_util_pct": round(avg_cpu_util, 1),
             "n_requests": len(workload["requests"]),
             "n_accept_samples": len(accept_lens),
+            "per_request": workload["requests"],
         }
         all_results.append(entry)
 
@@ -458,6 +519,21 @@ def main():
               f"MAT={mat:.2f}, accept_rate={entry['accept_rate']:.3f}, "
               f"TPS={workload['overall_tps']:.1f}, "
               f"GPU={avg_gpu_util:.0f}%\n", file=sys.stderr)
+
+        # Save intermediate results so we can resume on crash
+        _interim = {
+            "model": args.model,
+            "draft_model": args.draft_model,
+            "dataset": args.dataset,
+            "n_requests": args.n_requests,
+            "max_tokens": args.max_tokens,
+            "vanilla_tpot_ms": round(vanilla_tpot, 2),
+            "vanilla_tps": round(vanilla_result["overall_tps"], 1),
+            "results": all_results,
+        }
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "w") as f:
+            json.dump(_interim, f, indent=2)
 
     # --- Output ---
     output = {
