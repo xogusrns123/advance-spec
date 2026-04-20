@@ -401,43 +401,56 @@ def _setup_latency_only(eagle_worker) -> None:
             batch.forward_mode.is_extend()
             or getattr(batch, "is_extend_in_batch", False)
         )
+        phase = "decode" if is_decode else "prefill"
+
+        draft_ms = getattr(eagle_worker, "_oracle_last_draft_ms", None)
+        fwd_ms = getattr(eagle_worker, "_oracle_last_target_forward_ms", None)
+        verify_total_ms = getattr(eagle_worker, "_oracle_last_verify_total_ms", None)
+        accept_lens = getattr(eagle_worker, "_oracle_last_accept_lengths", []) or []
+
+        entry = {
+            "phase": phase,
+            "step_total_ms": round(step_total_ms, 3),
+        }
+        # Number of tokens processed this forward (prefill: prompt length;
+        # decode: 1 + num_draft_tokens across the tree per request)
+        try:
+            entry["num_tokens"] = int(batch.input_ids.numel())
+        except Exception:
+            pass
+        if draft_ms is not None:
+            entry["eagle3_draft_ms"] = round(draft_ms, 3)
+        if fwd_ms is not None:
+            entry["target_forward_ms"] = round(fwd_ms, 3)
+        if verify_total_ms is not None:
+            entry["verify_total_ms"] = round(verify_total_ms, 3)
+        if verify_total_ms is not None and fwd_ms is not None:
+            entry["verify_overhead_ms"] = round(verify_total_ms - fwd_ms, 3)
+        if (step_total_ms is not None and draft_ms is not None
+                and verify_total_ms is not None):
+            entry["post_verify_ms"] = round(
+                step_total_ms - draft_ms - verify_total_ms, 3)
+
         if is_decode:
-            draft_ms = getattr(eagle_worker, "_oracle_last_draft_ms", None)
-            fwd_ms = getattr(eagle_worker, "_oracle_last_target_forward_ms", None)
-            verify_total_ms = getattr(eagle_worker, "_oracle_last_verify_total_ms", None)
-            accept_lens = getattr(eagle_worker, "_oracle_last_accept_lengths", []) or []
+            # Real accepted draft tokens per request this step (excludes bonus)
+            entry["accept_lengths"] = accept_lens
+            # Committed tokens this step = accept_length + 1 per request (bonus)
+            entry["committed_tokens"] = [n + 1 for n in accept_lens] if accept_lens else []
 
-            entry = {
-                "step_total_ms": round(step_total_ms, 3),
-                "eagle3_draft_ms": round(draft_ms, 3) if draft_ms is not None else None,
-                "target_forward_ms": round(fwd_ms, 3) if fwd_ms is not None else None,
-                "verify_total_ms": round(verify_total_ms, 3) if verify_total_ms is not None else None,
-                # Real accepted draft tokens per request this step (does not include bonus)
-                "accept_lengths": accept_lens,
-                # Committed tokens this step = accept_length + 1 per request (bonus)
-                "committed_tokens": [n + 1 for n in accept_lens] if accept_lens else [],
-            }
-            if verify_total_ms is not None and fwd_ms is not None:
-                entry["verify_overhead_ms"] = round(verify_total_ms - fwd_ms, 3)
-            if (step_total_ms is not None and draft_ms is not None
-                    and verify_total_ms is not None):
-                entry["post_verify_ms"] = round(
-                    step_total_ms - draft_ms - verify_total_ms, 3)
+        detail = getattr(eagle_worker, "_oracle_last_verify_detail", None)
+        if detail:
+            for k, v in detail.items():
+                entry[f"vd_{k}"] = v
+            eagle_worker._oracle_last_verify_detail = None
 
-            detail = getattr(eagle_worker, "_oracle_last_verify_detail", None)
-            if detail:
-                for k, v in detail.items():
-                    entry[f"vd_{k}"] = v
-                eagle_worker._oracle_last_verify_detail = None
+        _log_timing(entry)
 
-            _log_timing(entry)
-
-            # Reset per-step stashes
-            eagle_worker._oracle_last_draft_ms = None
-            eagle_worker._oracle_last_target_forward_ms = None
-            eagle_worker._oracle_last_verify_total_ms = None
-            eagle_worker._oracle_last_step_total_ms = None
-            eagle_worker._oracle_last_accept_lengths = []
+        # Reset per-step stashes
+        eagle_worker._oracle_last_draft_ms = None
+        eagle_worker._oracle_last_target_forward_ms = None
+        eagle_worker._oracle_last_verify_total_ms = None
+        eagle_worker._oracle_last_step_total_ms = None
+        eagle_worker._oracle_last_accept_lengths = []
 
         return result
 

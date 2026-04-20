@@ -87,20 +87,27 @@ def kill_server(proc: subprocess.Popen):
     proc.wait(timeout=30)
 
 
-def read_timing_log(skip_warmup: int = 400) -> dict:
+def read_timing_log(skip_warmup: int = 400,
+                    skip_warmup_prefill: int = 2) -> dict:
     """Read timing log and return median values for all timing fields.
+
+    Separates DECODE steps from PREFILL steps (entries tagged with `phase`
+    field by the latency-only patch). Decode series skip `skip_warmup` samples
+    at the head; prefill series skip `skip_warmup_prefill` samples (one per
+    warmup request).
 
     Dynamically includes any numeric field ending in `_ms`, so detail-patch
     fields (vd_outer_*, vd_inner_*) are automatically aggregated when present.
-    Also flattens per-step `accept_lengths` / `committed_tokens` lists and
-    aggregates mean/median across steps.
+    Also flattens per-step `accept_lengths` / `committed_tokens` lists.
     """
     base_fields = [
         "eagle3_draft_ms", "target_forward_ms", "verify_total_ms",
         "verify_greedy_ms", "verify_overhead_ms", "step_total_ms",
         "post_verify_ms",
     ]
-    data: dict[str, list[float]] = {f: [] for f in base_fields}
+    decode: dict[str, list[float]] = {f: [] for f in base_fields}
+    prefill: dict[str, list[float]] = {f: [] for f in base_fields}
+    prefill_ntoks: list[float] = []
     discovered: set[str] = set()
     accept_flat: list[float] = []
     committed_flat: list[float] = []
@@ -111,40 +118,65 @@ def read_timing_log(skip_warmup: int = 400) -> dict:
                     e = json.loads(line.strip())
                 except json.JSONDecodeError:
                     continue
-                # Flatten accept_lengths / committed_tokens (one entry per req
-                # per step) for real-mode latency analysis
-                for al in (e.get("accept_lengths") or []):
-                    if isinstance(al, (int, float)):
-                        accept_flat.append(float(al))
-                for ct in (e.get("committed_tokens") or []):
-                    if isinstance(ct, (int, float)):
-                        committed_flat.append(float(ct))
+                phase = e.get("phase", "decode")
+                target = prefill if phase == "prefill" else decode
+
+                if phase == "prefill":
+                    nt = e.get("num_tokens")
+                    if isinstance(nt, (int, float)):
+                        prefill_ntoks.append(float(nt))
+                else:
+                    for al in (e.get("accept_lengths") or []):
+                        if isinstance(al, (int, float)):
+                            accept_flat.append(float(al))
+                    for ct in (e.get("committed_tokens") or []):
+                        if isinstance(ct, (int, float)):
+                            committed_flat.append(float(ct))
+
                 for k, v in e.items():
                     if not isinstance(v, (int, float)):
                         continue
-                    if k in base_fields or k.startswith("vd_"):
-                        if k not in data:
-                            data[k] = []
+                    if k in base_fields:
+                        target[k].append(float(v))
+                    elif phase != "prefill" and k.startswith("vd_"):
+                        if k not in decode:
+                            decode[k] = []
                             discovered.add(k)
-                        data[k].append(float(v))
+                        decode[k].append(float(v))
     except FileNotFoundError:
         pass
 
-    # Skip warmup on every series individually
-    for k in list(data.keys()):
-        vals = data[k]
-        data[k] = vals[skip_warmup:] if len(vals) > skip_warmup else vals
+    # Skip warmup separately for each series
+    for k in list(decode.keys()):
+        vals = decode[k]
+        decode[k] = vals[skip_warmup:] if len(vals) > skip_warmup else vals
+    for k in list(prefill.keys()):
+        vals = prefill[k]
+        prefill[k] = vals[skip_warmup_prefill:] if len(vals) > skip_warmup_prefill else vals
+    prefill_ntoks_post = (prefill_ntoks[skip_warmup_prefill:]
+                          if len(prefill_ntoks) > skip_warmup_prefill else prefill_ntoks)
     accept_flat_post = accept_flat[skip_warmup:] if len(accept_flat) > skip_warmup else accept_flat
-    committed_flat_post = committed_flat[skip_warmup:] if len(committed_flat) > skip_warmup else committed_flat
+    committed_flat_post = (committed_flat[skip_warmup:]
+                           if len(committed_flat) > skip_warmup else committed_flat)
 
     result = {}
-    for k, vals in data.items():
+    # Decode medians (primary fields — keep same names as before for back compat)
+    for k, vals in decode.items():
         result[k] = statistics.median(vals) if vals else 0.0
     result["n_samples"] = min(
-        len(data["eagle3_draft_ms"]), len(data["target_forward_ms"]))
+        len(decode["eagle3_draft_ms"]), len(decode["target_forward_ms"]))
     result["_detail_keys"] = sorted(discovered)
 
-    # Real-accept statistics (latency-only mode)
+    # Prefill medians (prefixed)
+    for k in base_fields:
+        vals = prefill[k]
+        if vals:
+            result[f"prefill_{k}"] = statistics.median(vals)
+    if prefill_ntoks_post:
+        result["prefill_num_tokens_median"] = statistics.median(prefill_ntoks_post)
+        result["prefill_n_samples"] = len(prefill_ntoks_post)
+
+    # Real-accept statistics (decode only)
     if accept_flat_post:
         result["accept_length_mean"] = statistics.mean(accept_flat_post)
         result["accept_length_median"] = statistics.median(accept_flat_post)
@@ -405,6 +437,13 @@ def main():
         # Real-mode accept statistics (latency-only runs)
         for k in ("accept_length_mean", "accept_length_median", "accept_length_max",
                   "committed_tokens_mean", "committed_tokens_median"):
+            if k in timing:
+                entry[k] = round(timing[k], 3)
+        # Prefill statistics (medians, one per request)
+        for k in ("prefill_step_total_ms", "prefill_target_forward_ms",
+                  "prefill_eagle3_draft_ms", "prefill_verify_total_ms",
+                  "prefill_verify_overhead_ms", "prefill_post_verify_ms",
+                  "prefill_num_tokens_median", "prefill_n_samples"):
             if k in timing:
                 entry[k] = round(timing[k], 3)
         results.append(entry)
