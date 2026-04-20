@@ -88,35 +88,70 @@ def kill_server(proc: subprocess.Popen):
 
 
 def read_timing_log(skip_warmup: int = 400) -> dict:
-    """Read timing log and return median values for all timing fields."""
-    fields = [
+    """Read timing log and return median values for all timing fields.
+
+    Dynamically includes any numeric field ending in `_ms`, so detail-patch
+    fields (vd_outer_*, vd_inner_*) are automatically aggregated when present.
+    Also flattens per-step `accept_lengths` / `committed_tokens` lists and
+    aggregates mean/median across steps.
+    """
+    base_fields = [
         "eagle3_draft_ms", "target_forward_ms", "verify_total_ms",
         "verify_greedy_ms", "verify_overhead_ms", "step_total_ms",
         "post_verify_ms",
     ]
-    data = {f: [] for f in fields}
+    data: dict[str, list[float]] = {f: [] for f in base_fields}
+    discovered: set[str] = set()
+    accept_flat: list[float] = []
+    committed_flat: list[float] = []
     try:
         with open(TIMING_LOG) as f:
             for line in f:
-                e = json.loads(line.strip())
-                for f_name in fields:
-                    v = e.get(f_name)
-                    if v is not None:
-                        data[f_name].append(v)
+                try:
+                    e = json.loads(line.strip())
+                except json.JSONDecodeError:
+                    continue
+                # Flatten accept_lengths / committed_tokens (one entry per req
+                # per step) for real-mode latency analysis
+                for al in (e.get("accept_lengths") or []):
+                    if isinstance(al, (int, float)):
+                        accept_flat.append(float(al))
+                for ct in (e.get("committed_tokens") or []):
+                    if isinstance(ct, (int, float)):
+                        committed_flat.append(float(ct))
+                for k, v in e.items():
+                    if not isinstance(v, (int, float)):
+                        continue
+                    if k in base_fields or k.startswith("vd_"):
+                        if k not in data:
+                            data[k] = []
+                            discovered.add(k)
+                        data[k].append(float(v))
     except FileNotFoundError:
         pass
 
-    # Skip warmup
-    for f_name in fields:
-        vals = data[f_name]
-        data[f_name] = vals[skip_warmup:] if len(vals) > skip_warmup else vals
+    # Skip warmup on every series individually
+    for k in list(data.keys()):
+        vals = data[k]
+        data[k] = vals[skip_warmup:] if len(vals) > skip_warmup else vals
+    accept_flat_post = accept_flat[skip_warmup:] if len(accept_flat) > skip_warmup else accept_flat
+    committed_flat_post = committed_flat[skip_warmup:] if len(committed_flat) > skip_warmup else committed_flat
 
     result = {}
-    for f_name in fields:
-        vals = data[f_name]
-        result[f_name] = statistics.median(vals) if vals else 0.0
+    for k, vals in data.items():
+        result[k] = statistics.median(vals) if vals else 0.0
     result["n_samples"] = min(
         len(data["eagle3_draft_ms"]), len(data["target_forward_ms"]))
+    result["_detail_keys"] = sorted(discovered)
+
+    # Real-accept statistics (latency-only mode)
+    if accept_flat_post:
+        result["accept_length_mean"] = statistics.mean(accept_flat_post)
+        result["accept_length_median"] = statistics.median(accept_flat_post)
+        result["accept_length_max"] = max(accept_flat_post)
+    if committed_flat_post:
+        result["committed_tokens_mean"] = statistics.mean(committed_flat_post)
+        result["committed_tokens_median"] = statistics.median(committed_flat_post)
     return result
 
 
@@ -274,7 +309,12 @@ def main():
         TREE_LOG.unlink(missing_ok=True)
 
         env = os.environ.copy()
+        # Activate the oracle-patch hook (needed to install our timing wrapper)
         env["SGLANG_ORACLE_VANILLA"] = "1"
+        # Run REAL speculative decoding: no force-accept, no tree/p_t extraction.
+        # Timing instrumentation is kept so step_total_ms / target_forward_ms /
+        # verify_total_ms / eagle3_draft_ms + real accept_lengths are logged.
+        env["SGLANG_LATENCY_ONLY"] = "1"
         env["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
 
         cmd = [
@@ -322,7 +362,7 @@ def main():
         timing = read_timing_log(
             skip_warmup=args.n_warmup * args.max_tokens)
 
-        # Save per-config tree log to a mounted path
+        # Save per-config tree log + raw timing log to a mounted path
         tree_out_dir = Path(output_path).parent / "trees"
         tree_out_dir.mkdir(parents=True, exist_ok=True)
         tree_out_path = tree_out_dir / f"topk{topk}_steps{steps}_budget{B}.jsonl"
@@ -332,6 +372,16 @@ def main():
                 shutil.copyfile(TREE_LOG, tree_out_path)
         except Exception as e:
             print(f"  WARNING: Failed to save tree log: {e}", file=sys.stderr)
+
+        timing_out_dir = Path(output_path).parent / "timing_logs"
+        timing_out_dir.mkdir(parents=True, exist_ok=True)
+        timing_out_path = timing_out_dir / f"topk{topk}_steps{steps}_budget{B}.jsonl"
+        try:
+            if TIMING_LOG.exists():
+                import shutil
+                shutil.copyfile(TIMING_LOG, timing_out_path)
+        except Exception as e:
+            print(f"  WARNING: Failed to save timing log: {e}", file=sys.stderr)
 
         entry = {
             "topk": topk,
@@ -349,6 +399,14 @@ def main():
             "overhead_ms": round(step_tpot - timing["target_forward_ms"] - timing["eagle3_draft_ms"], 2),
             "n_samples": timing["n_samples"],
         }
+        # Carry over any detail-patch medians (vd_outer_*, vd_inner_*)
+        for k in timing.get("_detail_keys", []):
+            entry[k] = round(timing[k], 3)
+        # Real-mode accept statistics (latency-only runs)
+        for k in ("accept_length_mean", "accept_length_median", "accept_length_max",
+                  "committed_tokens_mean", "committed_tokens_median"):
+            if k in timing:
+                entry[k] = round(timing[k], 3)
         results.append(entry)
         _save_output()  # Save after each successful config (resume safety)
 

@@ -333,13 +333,120 @@ def patch_eagle_worker_full(eagle_worker: "EAGLEWorker") -> None:
         from .oracle_verify_patch import UnionTrieFeeder
         trie_feeder = UnionTrieFeeder(ORACLE_VERIFY_TRIES_PATH)
 
+    # LATENCY-ONLY mode: pure timing instrumentation. No force-accept, no tree
+    # extraction, no p_t computation — so the server runs REAL speculative
+    # decoding (target actually skips accepted draft tokens) and we just measure
+    # each step's sub-costs + the real accept_length.
+    if os.environ.get("SGLANG_LATENCY_ONLY", "0") == "1":
+        _setup_latency_only(eagle_worker)
+        return
+
     _patch_verify_greedy_func()
     _patch_draft_stash(eagle_worker, trie_feeder)
-    _patch_verify_logits(eagle_worker)
+    _patch_verify_logits(eagle_worker, stash_verify_logits=True)
+
+    # Optional: replace eagle_worker.verify + EagleVerifyInput.verify with
+    # instrumented versions that time each sub-section (see verify_detail_patch.py).
+    if os.environ.get("SGLANG_VERIFY_DETAILED", "0") == "1":
+        from .verify_detail_patch import install_detailed_verify_patch
+        install_detailed_verify_patch(eagle_worker)
+
     _patch_forward_log(eagle_worker, replay_state, trie_feeder)
 
     mode = "VERIFY_TRIES" if trie_feeder else ("REPLAY" if replay_state else "VANILLA")
     logger.info(f"Oracle {mode} patch applied to EAGLEWorker")
+
+
+def _setup_latency_only(eagle_worker) -> None:
+    """Pure timing instrumentation for real speculative decoding.
+
+    Wraps draft / target_forward / verify / forward_batch_generation with
+    perf_counter timers and writes per-step timing + accept_length to the
+    oracle timing log. Does NOT force accept_length=0 (target actually commits
+    accepted draft tokens) and does NOT extract draft tree or p_t.
+    """
+    import time as _time
+
+    # Draft timer
+    original_draft = eagle_worker.draft
+
+    def timed_draft(batch):
+        t0 = _time.perf_counter()
+        result = original_draft(batch)
+        eagle_worker._oracle_last_draft_ms = (_time.perf_counter() - t0) * 1000
+        return result
+
+    eagle_worker.draft = timed_draft
+
+    # verify + target_forward timers. stash_verify_logits=False: skip the
+    # .cpu().clone() so target_forward_ms reflects only CPU dispatch (the true
+    # GPU wall time flows into verify_overhead, and the sum equals real target).
+    _patch_verify_logits(eagle_worker, stash_verify_logits=False)
+
+    # Optional detailed verify instrumentation
+    if os.environ.get("SGLANG_VERIFY_DETAILED", "0") == "1":
+        from .verify_detail_patch import install_detailed_verify_patch
+        install_detailed_verify_patch(eagle_worker)
+
+    # Forward-batch timer + JSONL log (timing + accept_length only)
+    original_forward = eagle_worker.forward_batch_generation
+
+    def timed_forward(batch):
+        t0 = _time.perf_counter()
+        result = original_forward(batch)
+        step_total_ms = (_time.perf_counter() - t0) * 1000
+        eagle_worker._oracle_last_step_total_ms = step_total_ms
+
+        is_decode = not (
+            batch.forward_mode.is_extend()
+            or getattr(batch, "is_extend_in_batch", False)
+        )
+        if is_decode:
+            draft_ms = getattr(eagle_worker, "_oracle_last_draft_ms", None)
+            fwd_ms = getattr(eagle_worker, "_oracle_last_target_forward_ms", None)
+            verify_total_ms = getattr(eagle_worker, "_oracle_last_verify_total_ms", None)
+            accept_lens = getattr(eagle_worker, "_oracle_last_accept_lengths", []) or []
+
+            entry = {
+                "step_total_ms": round(step_total_ms, 3),
+                "eagle3_draft_ms": round(draft_ms, 3) if draft_ms is not None else None,
+                "target_forward_ms": round(fwd_ms, 3) if fwd_ms is not None else None,
+                "verify_total_ms": round(verify_total_ms, 3) if verify_total_ms is not None else None,
+                # Real accepted draft tokens per request this step (does not include bonus)
+                "accept_lengths": accept_lens,
+                # Committed tokens this step = accept_length + 1 per request (bonus)
+                "committed_tokens": [n + 1 for n in accept_lens] if accept_lens else [],
+            }
+            if verify_total_ms is not None and fwd_ms is not None:
+                entry["verify_overhead_ms"] = round(verify_total_ms - fwd_ms, 3)
+            if (step_total_ms is not None and draft_ms is not None
+                    and verify_total_ms is not None):
+                entry["post_verify_ms"] = round(
+                    step_total_ms - draft_ms - verify_total_ms, 3)
+
+            detail = getattr(eagle_worker, "_oracle_last_verify_detail", None)
+            if detail:
+                for k, v in detail.items():
+                    entry[f"vd_{k}"] = v
+                eagle_worker._oracle_last_verify_detail = None
+
+            _log_timing(entry)
+
+            # Reset per-step stashes
+            eagle_worker._oracle_last_draft_ms = None
+            eagle_worker._oracle_last_target_forward_ms = None
+            eagle_worker._oracle_last_verify_total_ms = None
+            eagle_worker._oracle_last_step_total_ms = None
+            eagle_worker._oracle_last_accept_lengths = []
+
+        return result
+
+    eagle_worker.forward_batch_generation = timed_forward
+
+    logger.info(
+        "Oracle LATENCY-ONLY patch applied "
+        "(real speculative decoding, timing instrumentation only)"
+    )
 
 
 def _patch_verify_greedy_func() -> None:
@@ -531,8 +638,15 @@ def _inject_union_trie(spec_info, batch, trie_feeder, eagle_worker):
                 rns[i, pos] = req_offset + 1 + siblings[my_idx + 1]
 
 
-def _patch_verify_logits(eagle_worker: "EAGLEWorker") -> None:
-    """Patch verify() to measure total verify time and stash logits."""
+def _patch_verify_logits(eagle_worker: "EAGLEWorker",
+                         stash_verify_logits: bool = True) -> None:
+    """Patch verify() to measure total verify time + stash accept lengths.
+
+    `stash_verify_logits` controls whether the target's verify logits are
+    copied to CPU for later p_t extraction. In latency-only mode this should
+    be False to avoid the .cpu().clone() sync overhead contaminating the
+    target forward timing.
+    """
     original_verify = eagle_worker.verify
 
     def patched_verify(batch, spec_info):
@@ -541,11 +655,18 @@ def _patch_verify_logits(eagle_worker: "EAGLEWorker") -> None:
         result = original_verify(batch, spec_info)
         _t1 = _time.perf_counter()
         eagle_worker._oracle_last_verify_total_ms = (_t1 - _t0) * 1000
+        # Stash real accept_length per request (list of ints; does NOT include bonus)
+        try:
+            _, _res, _, _ = result
+            eagle_worker._oracle_last_accept_lengths = list(
+                getattr(_res, "accept_length_per_req_cpu", []) or [])
+        except Exception:
+            eagle_worker._oracle_last_accept_lengths = []
         return result
 
     eagle_worker.verify = patched_verify
 
-    # Patch target_worker.forward_batch_generation for target forward timing + logit stashing
+    # Patch target_worker.forward_batch_generation for target forward timing + (optionally) logit stashing
     original_target_forward = eagle_worker.target_worker.forward_batch_generation
 
     def patched_target_forward(model_worker_batch, is_verify=False):
@@ -556,7 +677,7 @@ def _patch_verify_logits(eagle_worker: "EAGLEWorker") -> None:
         if is_verify:
             eagle_worker._oracle_last_target_forward_ms = (
                 _t_fwd_end - _t_fwd_start) * 1000
-        if is_verify and result.logits_output is not None:
+        if stash_verify_logits and is_verify and result.logits_output is not None:
             try:
                 logits = result.logits_output.next_token_logits
                 if logits is not None and logits.numel() > 0:
@@ -720,7 +841,7 @@ def _patch_forward_log(
                 if step_total_ms is not None and draft_ms is not None and verify_total_ms is not None:
                     post_verify_ms = step_total_ms - draft_ms - verify_total_ms
 
-                _log_timing({
+                entry = {
                     "eagle3_draft_ms": draft_ms,
                     "target_forward_ms": fwd_ms,
                     "verify_total_ms": verify_total_ms,
@@ -730,7 +851,14 @@ def _patch_forward_log(
                     "post_verify_ms": round(post_verify_ms, 3) if post_verify_ms is not None else None,
                     "num_draft": num_draft,
                     "num_reqs": num_reqs,
-                })
+                }
+                # Flatten the verify-detail dict into the log row if present
+                detail = getattr(eagle_worker, "_oracle_last_verify_detail", None)
+                if detail:
+                    for k, v in detail.items():
+                        entry[f"vd_{k}"] = v
+                    eagle_worker._oracle_last_verify_detail = None
+                _log_timing(entry)
                 eagle_worker._oracle_last_draft_ms = None
                 eagle_worker._oracle_last_target_forward_ms = None
                 eagle_worker._oracle_last_verify_total_ms = None
