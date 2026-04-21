@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.2.2-devel-ubuntu22.04
+FROM nvidia/cuda:12.8.1-devel-ubuntu22.04
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -22,10 +22,10 @@ RUN apt-get update && \
 # Install uv
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
-# Layer 1: PyTorch (CUDA 12.2)
+# Layer 1: PyTorch (CUDA 12.8, Blackwell SM_120 지원)
 RUN uv venv /opt/venv && \
     . /opt/venv/bin/activate && \
-    uv pip install torch --extra-index-url https://download.pytorch.org/whl/cu122
+    uv pip install torch --extra-index-url https://download.pytorch.org/whl/cu128
 
 # Layer 2: SGLang + sgl-kernel (SM89/RTX 4090 호환)
 RUN . /opt/venv/bin/activate && \
