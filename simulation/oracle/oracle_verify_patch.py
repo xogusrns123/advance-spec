@@ -12,7 +12,7 @@ this ensures 1-token advance per step while capturing full tree logits.
 Usage:
     export SGLANG_ORACLE_VANILLA=1
     export SGLANG_ORACLE_VERIFY_TRIES=results/.../union_trie_data.jsonl
-    python3 -m hybrid_spec_decoding.sglang_integration.install_hook \
+    python3 -m simulation.oracle.install_hook \
         --model-path Qwen/Qwen3-8B --tp-size 1 \
         --speculative-algorithm SUFFIX ...
 """

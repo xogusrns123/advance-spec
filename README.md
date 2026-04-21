@@ -294,31 +294,31 @@ python3 -m sglang.launch_server \
   --speculative-num-draft-tokens 64
 
 # 2. Collect EAGLE-3 draft tokens
-python -m hybrid_spec_decoding.analysis.collect_eagle3_drafts \
+python -m simulation.analysis.collect_eagle3_drafts \
   --server-url http://localhost:30000 \
   --dataset humaneval \
   --output-dir results/eagle3_drafts
 
 # 3. Collect SuffixDecoding candidates for the same inputs
-python -m hybrid_spec_decoding.analysis.collect_suffix_candidates \
+python -m simulation.analysis.collect_suffix_candidates \
   --eagle3-results results/eagle3_drafts \
   --output-dir results/suffix_candidates
 
 # 4. Compute case distribution (Case 1-4 ratios)
-python -m hybrid_spec_decoding.analysis.compute_complementarity \
+python -m simulation.analysis.compute_complementarity \
   --eagle3-results results/eagle3_drafts \
   --suffix-results results/suffix_candidates \
   --check-sequential \
   --output-dir results/complementarity
 
 # 5. Compute agreement scores
-python -m hybrid_spec_decoding.analysis.compute_agreement \
+python -m simulation.analysis.compute_agreement \
   --eagle3-results results/eagle3_drafts \
   --suffix-results results/suffix_candidates \
   --output-dir results/agreement
 
 # 6. Generate plots
-python -m hybrid_spec_decoding.analysis.plot_results \
+python -m simulation.analysis.plot_results \
   --complementarity-file results/complementarity/complementarity.json \
   --agreement-file results/agreement/agreement.json \
   --output-dir results/plots
@@ -380,7 +380,7 @@ SGLANG_ORACLE_VANILLA=1 python3 -m sglang.launch_server \
     --mem-fraction-static 0.85 --disable-cuda-graph --port 30000
 
 # BFCL 벤치마크 실행
-python3 -m hybrid_spec_decoding.analysis.bfcl_agent \
+python3 -m simulation.agents.bfcl_agent \
     --url http://localhost:30000/v1 \
     --model Qwen/Qwen3-8B \
     --input-file data/bfcl_multi_turn/dataset.jsonl \
@@ -395,7 +395,7 @@ Oracle entry에는 draft token flat list, tree 구조 (`{token_ids, parents}`, B
 Round 1과 동일한 토큰 시퀀스에서 MTP draft를 수집:
 
 ```bash
-python3 -m hybrid_spec_decoding.analysis.extract_trajectory \
+python3 -m simulation.pipeline.extract_trajectory \
     --agent-results agent_results_eagle3.json \
     --output trajectory.json
 
@@ -408,7 +408,7 @@ python3 -m sglang.launch_server --speculative-algorithm NEXTN ...
 각 decoding step에서 EAGLE3 + SuffixDecoding (+ MTP) draft tree를 하나의 trie로 병합:
 
 ```bash
-python3 -m hybrid_spec_decoding.analysis.collect_union_trie \
+python3 -m simulation.pipeline.collect_union_trie \
     --agent-results agent_results_eagle3.json \
     --output union_trie_data.jsonl \
     --model Qwen/Qwen3-8B \
@@ -425,7 +425,7 @@ python3 -m hybrid_spec_decoding.analysis.collect_union_trie \
 Union trie의 각 node에 대해 target model의 acceptance probability를 tree attention으로 계산:
 
 ```bash
-CUDA_VISIBLE_DEVICES=2,3 python3 -m hybrid_spec_decoding.analysis.collect_target_probs \
+CUDA_VISIBLE_DEVICES=2,3 python3 -m simulation.pipeline.collect_target_probs \
     --union-trie-data union_trie_data.jsonl \
     --output union_trie_data_with_pt.jsonl \
     --model Qwen/Qwen3-8B
@@ -442,7 +442,7 @@ Budget별 tree verification의 실측 latency:
 
 ```bash
 # Verify server 실행
-python3 -m hybrid_spec_decoding.analysis.verify_server --model Qwen/Qwen3-8B --port 8100
+python3 -m simulation.pipeline.verify_server --model Qwen/Qwen3-8B --port 8100
 
 # Latency 벤치마크 (budget 1-15, 50 trials)
 python3 scripts/measure_verify_latency.py http://localhost:8100 union_trie_data.jsonl
@@ -455,7 +455,7 @@ python3 scripts/measure_verify_latency.py http://localhost:8100 union_trie_data.
 두 가지 oracle 전략을 budget sweep + latency-aware simulation으로 평가:
 
 ```bash
-python3 -m hybrid_spec_decoding.analysis.run_tree_oracle_sim \
+python3 -m simulation.evaluation.run_tree_oracle_sim \
     --union-trie-data union_trie_data_with_pt.jsonl \
     --budgets 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
     --p-t-key p_t \
@@ -478,7 +478,7 @@ python3 -m hybrid_spec_decoding.analysis.run_tree_oracle_sim \
 Tree oracle과 별개로, chain 기반 방법론 비교 (`run_oracle_sim.py`):
 
 ```bash
-python3 -m hybrid_spec_decoding.analysis.run_oracle_sim \
+python3 -m simulation.evaluation.run_oracle_sim \
     --agent-results agent_results.json \
     --output oracle_sim.json \
     --model Qwen/Qwen3-8B --print-summary

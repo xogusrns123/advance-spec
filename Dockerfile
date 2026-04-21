@@ -51,7 +51,7 @@ RUN sed -i 's/if self.enable_a2a_moe and i > self.first_k_dense_replace:/if geta
 RUN EAGLE_PY=/opt/venv/lib/python3.11/site-packages/sglang/srt/speculative/eagle_worker.py && \
     SENTINEL="self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)" && \
     if ! grep -q "oracle_patch" "$EAGLE_PY"; then \
-        sed -i "s|$SENTINEL|$SENTINEL\n\n        # Oracle vanilla patch: log draft tokens per step\n        import os as _os\n        if _os.environ.get('SGLANG_ORACLE_VANILLA', '0') == '1':\n            from hybrid_spec_decoding.sglang_integration.oracle_patch import patch_eagle_worker_full\n            patch_eagle_worker_full(self)|" "$EAGLE_PY"; \
+        sed -i "s|$SENTINEL|$SENTINEL\n\n        # Oracle vanilla patch: log draft tokens per step\n        import os as _os\n        if _os.environ.get('SGLANG_ORACLE_VANILLA', '0') == '1':\n            from simulation.oracle.oracle_patch import patch_eagle_worker_full\n            patch_eagle_worker_full(self)|" "$EAGLE_PY"; \
     fi
 
 # Layer 6: 소스코드

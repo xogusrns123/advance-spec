@@ -5,7 +5,7 @@ For each decoding step, merges draft trees from all proposers
 result to a JSONL file for downstream oracle simulation.
 
 Usage:
-    python -m hybrid_spec_decoding.analysis.collect_union_trie \
+    python3 -m simulation.pipeline.collect_union_trie \
         --agent-results results/.../agent_results.json \
         --output results/.../union_trie_data.jsonl \
         --model zai-org/GLM-4.7-Flash
@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from hybrid_spec_decoding.analysis.run_oracle_sim import (
+from simulation.evaluation.run_oracle_sim import (
     _flat_to_tree,
     extract_requests,
     load_exclude_ids,

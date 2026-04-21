@@ -8,11 +8,11 @@ Uses KV cache for consecutive steps within the same request to avoid
 redundant context computation.
 
 Usage:
-    python -m hybrid_spec_decoding.analysis.verify_server \
+    python3 -m simulation.pipeline.verify_server \
         --model Qwen/Qwen3-8B --port 8100
 
     # Then from collect_target_probs.py:
-    python -m hybrid_spec_decoding.analysis.collect_target_probs \
+    python3 -m simulation.pipeline.collect_target_probs \
         --union-trie-data union_trie_data.jsonl \
         --verify-server-url http://localhost:8100 \
         --output union_trie_data_with_pt.jsonl
@@ -32,7 +32,7 @@ import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from hybrid_spec_decoding.analysis.collect_target_probs import (
+from simulation.pipeline.collect_target_probs import (
     _build_mask_tensor,
     _trim_past_kv,
     build_position_ids,

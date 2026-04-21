@@ -23,7 +23,7 @@ for SH in A B C D; do
     D) B=$BUDGETS_D ;;
   esac
   (
-    python3 -m hybrid_spec_decoding.analysis.run_tree_oracle_sim \
+    python3 -m simulation.evaluation.run_tree_oracle_sim \
       --union-trie-data "$D/union_trie_data_with_dm.jsonl" \
       --budgets "$B" \
       --p-t-key p_t \

@@ -5,10 +5,10 @@ Patches SGLang source files on disk so that all spawned subprocesses
 (scheduler, tp workers) also recognize the SUFFIX algorithm.
 
 Usage:
-    python -m hybrid_spec_decoding.sglang_integration.install_hook [sglang args...]
+    python3 -m simulation.oracle.install_hook [sglang args...]
 
 Example:
-    python -m hybrid_spec_decoding.sglang_integration.install_hook \\
+    python3 -m simulation.oracle.install_hook \\
         --model-path zai-org/GLM-4.7-Flash \\
         --tp-size 4 \\
         --speculative-algorithm SUFFIX \\
@@ -226,7 +226,7 @@ def _inject_oracle_into_worker(worker_path: Path, worker_name: str) -> None:
         f"        # Oracle vanilla patch: log draft tokens per step ({worker_name})\n"
         "        import os as _os\n"
         "        if _os.environ.get('SGLANG_ORACLE_VANILLA', '0') == '1':\n"
-        "            from hybrid_spec_decoding.sglang_integration.oracle_patch import patch_eagle_worker_full\n"
+        "            from simulation.oracle.oracle_patch import patch_eagle_worker_full\n"
         "            patch_eagle_worker_full(self)\n"
     )
     text = text.replace(sentinel, patch_code)

@@ -43,7 +43,7 @@ fi
 
 # Stage 4: Collect Union Trie (with new suffix params)
 echo "=== Stage 4 ==="
-python3 -m hybrid_spec_decoding.analysis.collect_union_trie \
+python3 -m simulation.pipeline.collect_union_trie \
   --agent-results "$OUTPUT_DIR/agent_results_eagle3.json" \
   --output "$OUTPUT_DIR/union_trie_data.jsonl" \
   $DATASET_FLAG
@@ -88,7 +88,7 @@ print(f'Merged draft_model into {merged} records, missing in {missing}', file=sy
 
 # Stage 6: Oracle sim
 echo "=== Stage 6 ==="
-python3 -m hybrid_spec_decoding.analysis.run_tree_oracle_sim \
+python3 -m simulation.evaluation.run_tree_oracle_sim \
   --union-trie-data "$OUTPUT_DIR/union_trie_data_with_dm.jsonl" \
   --budgets 1,2,4,8,16,32,64,128,256,512 \
   --p-t-key p_t \

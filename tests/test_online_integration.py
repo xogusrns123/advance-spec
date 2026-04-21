@@ -189,7 +189,7 @@ class TestInstallSuffixAlgorithm:
     def test_install_patches_files(self):
         pytest.importorskip("sglang")
 
-        from hybrid_spec_decoding.sglang_integration.install_hook import (
+        from simulation.oracle.install_hook import (
             install_suffix_algorithm,
         )
 

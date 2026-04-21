@@ -6,7 +6,7 @@ median step latencies for vanilla, EAGLE3, and suffix decoding.
 
 Usage:
     # Start server first, then run calibration:
-    python3 -m hybrid_spec_decoding.analysis.calibrate_latency \
+    python3 -m simulation.pipeline.calibrate_latency \
         --url http://localhost:30000/v1 \
         --model zai-org/GLM-4.7-Flash \
         --warmup 5 \

@@ -94,7 +94,7 @@ if [ -f "$OUTPUT_DIR/latency_config.json" ]; then
   LATENCY_FLAG="--latency-config $OUTPUT_DIR/latency_config.json"
 fi
 
-python3 -m hybrid_spec_decoding.analysis.run_tree_oracle_sim \
+python3 -m simulation.evaluation.run_tree_oracle_sim \
   --union-trie-data "$MERGED_PT" \
   --budgets 1,2,4,8,16 \
   --p-t-key p_t \

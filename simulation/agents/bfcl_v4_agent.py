@@ -10,7 +10,7 @@ Key differences from bfcl_agent.py (v3 multi-turn):
   - WebSearchAPI patched with DuckDuckGo (free, no SerpAPI key)
 
 Usage:
-    python3 -m hybrid_spec_decoding.analysis.bfcl_v4_agent \
+    python3 -m simulation.agents.bfcl_v4_agent \
         --url http://localhost:30000/v1 \
         --model zai-org/GLM-4.7-Flash \
         --input-file data/bfcl_agent/dataset.jsonl \
@@ -71,13 +71,13 @@ except ImportError:
 
 from bfcl_eval.constants.category_mapping import AGENTIC_CATEGORY
 
-from ..sglang_integration.oracle_patch import (
+from simulation.oracle.oracle_patch import (
     clear_oracle_log,
     get_oracle_log_position,
     read_oracle_log,
     is_oracle_enabled,
 )
-from .tools.bfcl import patch_websearch_in_globals, cleanup_globals
+from simulation.agents.tools.bfcl import patch_websearch_in_globals, cleanup_globals
 
 
 def _strip_thinking(text: str) -> str:
@@ -489,7 +489,7 @@ def run_benchmark(
         "questions": questions,
     }
 
-    from .save_results import save_agent_results
+    from simulation.pipeline.save_results import save_agent_results
     save_agent_results(output, output_file)
 
     print(f"\nResults saved to {output_file}")

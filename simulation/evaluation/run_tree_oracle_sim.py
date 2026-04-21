@@ -10,7 +10,7 @@ proposers (EAGLE3, Suffix, Draft Model):
 Input: union_trie_data.jsonl (from collect_union_trie + collect_target_probs)
 
 Usage:
-    python -m hybrid_spec_decoding.analysis.run_tree_oracle_sim \
+    python3 -m simulation.evaluation.run_tree_oracle_sim \
         --union-trie-data results/.../union_trie_data_with_pt.jsonl \
         --budgets 1,2,4,8,16,32,64 \
         --output results/.../tree_oracle_sim.json \
@@ -28,7 +28,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from hybrid_spec_decoding.analysis.tree_knapsack import (
+from simulation.evaluation.tree_knapsack import (
     greedy_tree_walk,
     tree_knapsack_dp,
     tree_knapsack_dp_all_budgets,
@@ -711,7 +711,7 @@ def _union_trie_step(rec: dict, budget: int,
         pids = trie["parents"]
     else:
         # Rebuild union trie on the fly from per_proposer subset
-        from hybrid_spec_decoding.analysis.collect_union_trie import (
+        from simulation.pipeline.collect_union_trie import (
             build_union_trie,
         )
         per_prop = rec.get("per_proposer", {})
@@ -1257,7 +1257,7 @@ def main():
 
     # If p_t_oracle not present, compute it
     if records and args.p_t_key == "p_t_oracle" and "p_t_oracle" not in records[0]:
-        from hybrid_spec_decoding.analysis.collect_target_probs import (
+        from simulation.pipeline.collect_target_probs import (
             enrich_with_ground_truth_p_t,
         )
         enrich_with_ground_truth_p_t(records)

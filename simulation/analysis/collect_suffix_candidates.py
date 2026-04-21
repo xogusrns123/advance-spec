@@ -5,7 +5,7 @@ Runs SuffixDecoding standalone on each prompt's context + generated tokens,
 recording what candidates it would produce at each position.
 
 Usage:
-    python -m hybrid_spec_decoding.analysis.collect_suffix_candidates \
+    python -m simulation.analysis.collect_suffix_candidates \
         --eagle3-results results/eagle3_drafts \
         --output-dir results/suffix_candidates
 """
@@ -17,7 +17,7 @@ import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from ..suffix_decoding.speculator import SuffixSpeculator
+from hybrid_spec_decoding.suffix_decoding.speculator import SuffixSpeculator
 
 
 @dataclass

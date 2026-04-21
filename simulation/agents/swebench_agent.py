@@ -13,7 +13,7 @@ Repository management:
   - git clean -fd after completion
 
 Usage:
-    python3 -m hybrid_spec_decoding.analysis.swebench_agent \
+    python3 -m simulation.agents.swebench_agent \
         --url http://localhost:30000/v1 \
         --model Qwen/Qwen3-8B \
         --input-file data/swebench/dataset.jsonl \
@@ -39,13 +39,13 @@ from langchain_core.messages import (
 from langchain_openai import ChatOpenAI
 from tqdm import tqdm
 
-from ..sglang_integration.oracle_patch import (
+from simulation.oracle.oracle_patch import (
     clear_oracle_log,
     get_oracle_log_position,
     read_oracle_log,
     is_oracle_enabled,
 )
-from .tools.swebench import create_swebench_tools, create_sweagent_tools
+from simulation.agents.tools.swebench import create_swebench_tools, create_sweagent_tools
 
 
 # ---------------------------------------------------------------------------
@@ -539,7 +539,7 @@ def run_benchmark(
         "questions": questions,
     }
 
-    from .save_results import save_agent_results
+    from simulation.pipeline.save_results import save_agent_results
     save_agent_results(output, output_file)
 
     print(f"\nResults saved to {output_file}")

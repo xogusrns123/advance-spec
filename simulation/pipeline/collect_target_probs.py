@@ -5,13 +5,13 @@ p_t(v|parent(v)) for each node via HuggingFace model forward pass
 with tree attention.
 
 Usage:
-    python -m hybrid_spec_decoding.analysis.collect_target_probs \
+    python3 -m simulation.pipeline.collect_target_probs \
         --union-trie-data results/.../union_trie_data.jsonl \
         --output results/.../union_trie_data_with_pt.jsonl \
         --model zai-org/GLM-4.7-Flash
 
     # Oracle-only mode (no GPU needed):
-    python -m hybrid_spec_decoding.analysis.collect_target_probs \
+    python3 -m simulation.pipeline.collect_target_probs \
         --union-trie-data results/.../union_trie_data.jsonl \
         --output results/.../union_trie_data_with_pt.jsonl \
         --oracle-only

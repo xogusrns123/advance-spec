@@ -8,7 +8,7 @@ Generates plots for:
 4. Top-5 overlap distribution
 
 Usage:
-    python -m hybrid_spec_decoding.analysis.plot_results \
+    python -m simulation.analysis.plot_results \
         --complementarity-file results/complementarity/complementarity.json \
         --agreement-file results/agreement/agreement.json \
         --output-dir results/plots

@@ -129,7 +129,7 @@ class HybridSpeculator:
     ) -> str:
         """Generate the SGLang server launch command for suffix decoding."""
         return (
-            f"python3 -m hybrid_spec_decoding.sglang_integration.install_hook -- "
+            f"python3 -m simulation.oracle.install_hook -- "
             f"--model-path {target_model} "
             f"--tp-size {tp_size} "
             f"--speculative-algorithm SUFFIX "

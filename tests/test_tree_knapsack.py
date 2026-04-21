@@ -7,7 +7,7 @@ from itertools import combinations
 
 import pytest
 
-from hybrid_spec_decoding.analysis.tree_knapsack import (
+from simulation.evaluation.tree_knapsack import (
     greedy_tree_walk,
     tree_knapsack_dp,
 )

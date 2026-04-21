@@ -11,7 +11,7 @@ Measures the 4-case framework:
 Also measures per-depth acceptance rate P_accept(d) and suffix match rate P_match(d).
 
 Usage:
-    python -m hybrid_spec_decoding.analysis.compute_complementarity \
+    python -m simulation.analysis.compute_complementarity \
         --eagle3-results results/eagle3_drafts \
         --suffix-results results/suffix_candidates \
         --output-dir results/complementarity
@@ -25,7 +25,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..suffix_decoding.speculator import SuffixSpeculator
+from hybrid_spec_decoding.suffix_decoding.speculator import SuffixSpeculator
 
 
 @dataclass

@@ -4,7 +4,7 @@ Reads oracle_vanilla_entries and builds a per-request token sequence
 that Round 2 (MTP) can follow exactly.
 
 Usage:
-    python3 -m hybrid_spec_decoding.analysis.extract_trajectory \
+    python3 -m simulation.pipeline.extract_trajectory \
         --agent-results results/glm4_flash/oracle_vanilla/agent_results.json \
         --output /tmp/oracle_trajectory.json
 """

@@ -134,7 +134,7 @@ def main():
 
     # Install oracle patch
     subprocess.run([sys.executable, "-m",
-                    "hybrid_spec_decoding.sglang_integration.install_hook"],
+                    "simulation.oracle.install_hook"],
                    check=True)
 
     # --- Step 1: Vanilla (no speculation) ---

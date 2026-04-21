@@ -26,7 +26,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import List
 
-from hybrid_spec_decoding.analysis.collect_union_trie import build_union_trie
+from simulation.pipeline.collect_union_trie import build_union_trie
 
 
 def _rebuild_union_trie(rec: dict) -> None:

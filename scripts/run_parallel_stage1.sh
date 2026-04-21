@@ -11,7 +11,7 @@
 #   bash scripts/run_parallel_stage1.sh \
 #       data/bfcl_agent/dataset.jsonl results/test \
 #       Qwen/Qwen3-8B Tengyunw/qwen3_8b_eagle3 \
-#       hybrid_spec_decoding.analysis.bfcl_v4_agent 4 \
+#       simulation.agents.bfcl_v4_agent 4 \
 #       --max-iterations 5
 set -euo pipefail
 
@@ -45,7 +45,7 @@ export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 export TORCHINDUCTOR_COMPILE_THREADS=1
 unset SGLANG_ORACLE_REPLAY SGLANG_ORACLE_VERIFY_TRIES
 
-python3 -m hybrid_spec_decoding.sglang_integration.install_hook
+python3 -m simulation.oracle.install_hook
 
 PIDS=()
 for SHARD_IDX in $(seq 0 $((NUM_GPUS - 1))); do

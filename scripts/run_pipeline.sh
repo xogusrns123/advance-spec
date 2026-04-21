@@ -53,28 +53,28 @@ esac
 # --- Benchmark config ---
 case $BENCHMARK in
   bfcl_v3)
-    AGENT_MODULE="hybrid_spec_decoding.analysis.bfcl_agent"
+    AGENT_MODULE="simulation.agents.bfcl_agent"
     INPUT_FILE="data/bfcl_multi_turn/dataset.jsonl"
     DATASET_FLAG="--model $MODEL"
     MAX_ITER_FLAG="--max-iterations 5"
     TEMP_FLAG="--temperature 0.0"
     ;;
   bfcl_v4)
-    AGENT_MODULE="hybrid_spec_decoding.analysis.bfcl_v4_agent"
+    AGENT_MODULE="simulation.agents.bfcl_v4_agent"
     INPUT_FILE="data/bfcl_agent/dataset.jsonl"
     DATASET_FLAG="--model $MODEL"
     MAX_ITER_FLAG="--max-iterations 5"
     TEMP_FLAG=""
     ;;
   specbench)
-    AGENT_MODULE="hybrid_spec_decoding.analysis.specbench_agent"
+    AGENT_MODULE="simulation.agents.specbench_agent"
     INPUT_FILE="data/specbench/dataset.jsonl"
     DATASET_FLAG="--dataset $INPUT_FILE --model $MODEL"
     MAX_ITER_FLAG=""
     TEMP_FLAG="--temperature 0.0"
     ;;
   swebench)
-    AGENT_MODULE="hybrid_spec_decoding.analysis.swebench_agent"
+    AGENT_MODULE="simulation.agents.swebench_agent"
     INPUT_FILE="data/swebench/dataset.jsonl"
     DATASET_FLAG="--model $MODEL"
     MAX_ITER_FLAG="--max-iterations 30 --repos-dir data/swebench/repos"
@@ -184,7 +184,7 @@ bash scripts/run_parallel_stage1.sh \
 echo ""
 echo "=== Stage 2: Extract Trajectory ==="
 
-python3 -m hybrid_spec_decoding.analysis.extract_trajectory \
+python3 -m simulation.pipeline.extract_trajectory \
   --agent-results "$OUTPUT_DIR/agent_results_eagle3.json" \
   --output "$OUTPUT_DIR/trajectory.json"
 
@@ -206,7 +206,7 @@ if [ "$BENCHMARK" != "specbench" ]; then
     echo "=== Stage 3: MTP Oracle Replay ==="
 
     export SGLANG_ORACLE_REPLAY="$OUTPUT_DIR/replay_trajectory.json"
-    python3 -m hybrid_spec_decoding.sglang_integration.install_hook
+    python3 -m simulation.oracle.install_hook
 
     python3 -m sglang.launch_server \
       --model-path "$MODEL" \
@@ -246,7 +246,7 @@ fi
 echo ""
 echo "=== Stage 4: Collect Union Trie ==="
 
-python3 -m hybrid_spec_decoding.analysis.collect_union_trie \
+python3 -m simulation.pipeline.collect_union_trie \
   --agent-results "$OUTPUT_DIR/agent_results_eagle3.json" \
   $MTP_FLAG \
   --output "$OUTPUT_DIR/union_trie_data.jsonl" \
@@ -308,7 +308,7 @@ if [ -n "$ENABLE_EU" ]; then
   EU_FLAG="--enable-eu"
 fi
 
-python3 -m hybrid_spec_decoding.analysis.run_tree_oracle_sim \
+python3 -m simulation.evaluation.run_tree_oracle_sim \
   --union-trie-data "$SIM_INPUT" \
   --budgets 1,2,4,8,16,32,64,128,256,512 \
   --p-t-key p_t \

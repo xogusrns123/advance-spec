@@ -7,7 +7,7 @@ collects the assistant response, and logs oracle draft entries.
 Output format is compatible with _extract_online() in run_oracle_sim.py.
 
 Usage:
-    python3 -m hybrid_spec_decoding.analysis.specbench_agent \
+    python3 -m simulation.agents.specbench_agent \
         --url http://localhost:30000/v1 \
         --model Qwen/Qwen3-8B \
         --input-file data/specbench/dataset.jsonl \
@@ -15,7 +15,7 @@ Usage:
         --num-requests 80
 
     # MTP replay (Round 2):
-    python3 -m hybrid_spec_decoding.analysis.specbench_agent \
+    python3 -m simulation.agents.specbench_agent \
         --url http://localhost:30000/v1 \
         --model Qwen/Qwen3-8B \
         --input-file data/specbench/dataset.jsonl \
@@ -33,7 +33,7 @@ from pathlib import Path
 from openai import OpenAI
 from tqdm import tqdm
 
-from ..sglang_integration.oracle_patch import (
+from simulation.oracle.oracle_patch import (
     clear_oracle_log,
     get_oracle_log_position,
     read_oracle_log,
@@ -290,7 +290,7 @@ def run_benchmark(
         "questions": questions,
     }
 
-    from .save_results import save_agent_results
+    from simulation.pipeline.save_results import save_agent_results
     save_agent_results(output, output_file)
 
     print(f"\nResults saved to {output_file}")

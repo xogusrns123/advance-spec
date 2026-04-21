@@ -6,7 +6,7 @@ decode_execute for accurate workload simulation. Collects per-step
 EAGLE3 draft tokens from oracle log.
 
 Usage:
-    python3 -m hybrid_spec_decoding.analysis.bfcl_agent \
+    python3 -m simulation.agents.bfcl_agent \
         --url http://localhost:30000/v1 \
         --model zai-org/GLM-4.7-Flash \
         --input-file data/bfcl_multi_turn/dataset.jsonl \
@@ -44,13 +44,13 @@ MULTI_TURN_FUNC_DOC_PATH = (
     Path(bfcl_eval.__file__).parent / "data" / "multi_turn_func_doc"
 )
 
-from ..sglang_integration.oracle_patch import (
+from simulation.oracle.oracle_patch import (
     clear_oracle_log,
     get_oracle_log_position,
     read_oracle_log,
     is_oracle_enabled,
 )
-from .tools.bfcl import patch_websearch_class, patch_websearch_in_globals, cleanup_globals
+from simulation.agents.tools.bfcl import patch_websearch_class, patch_websearch_in_globals, cleanup_globals
 
 # Patch WebSearchAPI class BEFORE any instances are created
 patch_websearch_class()
@@ -519,7 +519,7 @@ def run_benchmark(
         "questions": results,
     }
 
-    from .save_results import save_agent_results
+    from simulation.pipeline.save_results import save_agent_results
     save_agent_results(output, output_path)
 
     print(f"\nResults saved to {output_file}")

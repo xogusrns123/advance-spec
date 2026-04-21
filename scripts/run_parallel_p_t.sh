@@ -47,7 +47,7 @@ for GPU_ID in $(seq 0 $((NUM_GPUS - 1))); do
   SHARD_OUTPUT="${OUTPUT%.jsonl}_shard${GPU_ID}.jsonl"
   echo "Starting shard $GPU_ID/$NUM_GPUS on GPU $GPU_ID → $SHARD_OUTPUT"
 
-  CUDA_VISIBLE_DEVICES=$GPU_ID python3 -m hybrid_spec_decoding.analysis.collect_target_probs \
+  CUDA_VISIBLE_DEVICES=$GPU_ID python3 -m simulation.pipeline.collect_target_probs \
     --union-trie-data "$INPUT" \
     --output "$SHARD_OUTPUT" \
     --model "$MODEL" \

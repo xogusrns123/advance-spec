@@ -8,7 +8,7 @@ Low agreement -> uncertain -> widen branching for coverage.
 This analysis informs the Agreement-Guided Tree Construction strategy.
 
 Usage:
-    python -m hybrid_spec_decoding.analysis.compute_agreement \
+    python -m simulation.analysis.compute_agreement \
         --eagle3-results results/eagle3_drafts \
         --suffix-results results/suffix_candidates \
         --output-dir results/agreement

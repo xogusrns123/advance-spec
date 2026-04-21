@@ -27,7 +27,7 @@ from pathlib import Path
 
 from openai import OpenAI
 
-from hybrid_spec_decoding.sglang_integration.oracle_patch import (
+from simulation.oracle.oracle_patch import (
     get_oracle_log_position,
     read_oracle_log,
 )

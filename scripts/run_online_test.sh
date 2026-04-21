@@ -23,7 +23,7 @@ echo ""
 echo "=== Step 2: Launch SGLang server with SUFFIX algorithm ==="
 echo "Starting server in background..."
 cd /workspace
-python3 -m hybrid_spec_decoding.sglang_integration.install_hook -- \
+python3 -m simulation.oracle.install_hook -- \
     --model-path zai-org/GLM-4.7-Flash \
     --tp-size 4 \
     --speculative-algorithm SUFFIX \

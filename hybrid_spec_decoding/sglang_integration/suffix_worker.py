@@ -81,7 +81,7 @@ class SuffixWorker:
         )
 
         # Oracle verify patch: replace speculation with pre-built union tries
-        from hybrid_spec_decoding.sglang_integration.oracle_verify_patch import (
+        from simulation.oracle.oracle_verify_patch import (
             is_verify_tries_enabled,
             patch_suffix_worker_for_verify,
         )
