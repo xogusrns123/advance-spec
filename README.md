@@ -116,9 +116,13 @@ simulation/                     --- Oracle simulation pipeline ---
     replay_oracle.py            Stage 3c worker (MTP replay) + verify-tries replay
     prepare_bfcl_data.py        Prepare BFCLv3 / BFCLv4 dataset.jsonl
     prepare_specbench_data.py   Prepare SpecBench dataset.jsonl
-    measure_*.py                Latency measurement tools (TPOT, verify, decomposed)
-    sweep_eagle3_latency.py     EAGLE3 (topk, steps, budget) latency sweep
-    bench_eagle3_configs.py     EAGLE3 benchmark across configs
+    measure_eagle3_cost.py      EAGLE3 target/draft cost — real-speculative mode
+                                across (workload, budget, steps), topk fixed
+    measure_draft_model_cost.py Small draft LM per-token latency (Qwen3-0.6B default)
+    measure_suffix_cost.py      SuffixDecodingCache.speculate() CPU call time
+    _workload_prompts.py        Shared prompt loader (SpecBench/BFCLv4/SWE-Bench)
+    measure_{latency,step_latency,verify_latency}.py  Legacy thin HTTP timers
+    bench_eagle3_configs.py     EAGLE3 benchmark across configs (real workload)
 
   notebooks/
     analyze_eagle3_bench.ipynb  EAGLE3 latency / acceptance analysis
@@ -589,26 +593,81 @@ bash simulation/scripts/rerun_stage6_sharded.sh \
     simulation/results/qwen3_8b/bfcl_v4
 ```
 
-### Latency Configuration
+### Latency Measurement (pre-pipeline)
 
-Stage 6에서 real-cost speedup을 계산하려면 `latency_config.json` 이 필요. `simulation/results/<preset>/latency_config.json` 에 있으면 자동 복사됨. 없으면 직접 측정:
+파이프라인 실행 전에 **real-mode speculative decoding** 상태에서 target / draft / suffix 비용을 각각 실측하는 3개 독립 스크립트. Oracle-vanilla (`accept_length=0` 강제) 기반의 구 측정 로직은 전면 교체됨 — 모든 신규 스크립트는 실제 accept 분포와 KV cache 성장 패턴을 그대로 반영.
+
+#### 측정 데이터
+
+Workload 는 `data/{specbench,bfcl_agent,swebench}/dataset.jsonl` 에서 **첫 user 메시지 기준 2개 prompt** 만 사용 (1 = warmup 버림, 1 = measured). SWE-Bench 데이터가 없으면 자동 skip.
+
+#### 1. EAGLE3 step cost — `measure_eagle3_cost.py`
 
 ```bash
-# Decomposed target_forward / eagle3_draft / draft_lm TPOT
-python3 simulation/scripts/measure_decomposed_latency.py \
+python3 simulation/scripts/measure_eagle3_cost.py \
     --model Qwen/Qwen3-8B \
     --draft-model Tengyunw/qwen3_8b_eagle3 \
-    --tp-size 1 --budgets 1,2,4,8,16,32,64,128,256 \
-    --draft-lm Qwen/Qwen3-0.6B \
-    --output simulation/results/qwen3_8b/latency_config.json
-
-# 또는 SGLang 직접 측정
-python3 simulation/scripts/measure_sglang_verify_latency.py \
-    --model Qwen/Qwen3-8B \
-    --draft-model Tengyunw/qwen3_8b_eagle3 \
-    --tp-size 1 --budgets 1,2,4,8,16 \
-    --output simulation/results/qwen3_8b/latency_config.json
+    --workloads specbench,bfcl_v4,swebench \
+    --budgets 4,16,32,64,128,256,512 \
+    --steps 2,4,6,8 \
+    --topk 16 \
+    --output simulation/results/qwen3_8b/eagle3_cost.json
 ```
+
+- `(budget, steps)` pair 당 SGLang 서버 1회 재기동 (`len(budgets) × len(steps) = 28` 회), 같은 서버에서 3 workload × 2 prompt 를 연속 처리해 server on/off 최소화.
+- 내부적으로 `SGLANG_ORACLE_VANILLA=1 SGLANG_LATENCY_ONLY=1` 을 고정 export — oracle patch 의 timing instrumentation 만 활성화하고 accept-force 는 비활성. 서버는 **실제 speculative decoding** 으로 동작.
+- `topk` 는 16 고정 (큰 budget 수용용 branching 여유).
+- Resume 지원: 같은 `--output` 존재 시 `(workload, budget, steps)` 캐시된 엔트리 skip. `(budget, steps)` pair 전부 캐시되면 서버도 안 띄움.
+- 병렬: `--tp-size N` 지원 (단 Stage 1 의 per-GPU sharding 과 다름 — 1 서버).
+
+**출력 `eagle3_cost.json`** (핵심 필드):
+
+| 필드 | 의미 |
+|---|---|
+| `target_cost_ms` | median(`target_forward_ms + verify_overhead_ms`) — target 모델이 budget 트리를 검증하는 전체 시간 |
+| `draft_cost_ms` | median(`eagle3_draft_ms`) — EAGLE3 draft head 가 트리를 생성하는 시간 |
+| `step_ms` | median(`step_total_ms`) — decode step 전체 wall time (sanity) |
+| `accept_length_{mean,median,max}` | 실제 accept 분포 (real-mode 검증: 0 이 아니어야 함) |
+| `committed_tokens_mean` | `accept_length_mean + 1` (bonus 포함) |
+| `n_samples` | median 계산에 들어간 decode step 수 |
+| `overhead_ms` | `step_ms − target_cost_ms − draft_cost_ms` 잔차 |
+
+추가로 `<output_dir>/timing_logs/b{B}_s{S}.jsonl` 에 per-step raw JSONL 이 보존돼 사후 분해 분석 가능 (`eagle3_draft_ms`, `target_forward_ms`, `verify_total_ms`, `verify_overhead_ms`, `post_verify_ms`, `accept_lengths[]`, `committed_tokens[]`).
+
+#### 2. Draft model per-token cost — `measure_draft_model_cost.py`
+
+```bash
+python3 simulation/scripts/measure_draft_model_cost.py \
+    --model Qwen/Qwen3-0.6B \
+    --workloads specbench,bfcl_v4,swebench \
+    --num-draft-tokens 1,3,5 \
+    --output simulation/results/qwen3_8b/draft_model_cost.json
+```
+
+- Draft LM (기본 Qwen3-0.6B) vanilla SGLang 서버 **1회** 기동. 오라클 패치 없음.
+- 각 workload 에서 warmup call 후, `num_draft_tokens ∈ {1,3,5}` 각각 `max_tokens=N` 으로 `/v1/chat/completions` 호출, wall time 측정.
+- N 개 증가에 따라 `per_token_ms = total_ms / n_actual_tokens` 감소 (fixed overhead 분산) → linear fit 하면 `per_token_ms(∞) ≈ asymptotic TPOT`.
+
+**출력 `draft_model_cost.json`** per entry: `workload`, `num_draft_tokens`, `n_actual_tokens`, `total_ms`, `per_token_ms`.
+
+#### 3. Suffix decoding cost — `measure_suffix_cost.py`
+
+```bash
+python3 simulation/scripts/measure_suffix_cost.py \
+    --workloads specbench,bfcl_v4,swebench \
+    --model Qwen/Qwen3-8B \
+    --output simulation/results/qwen3_8b/suffix_cost.json
+```
+
+- GPU 불필요 — CPU only, `arctic_inference.SuffixDecodingCache.speculate(use_tree_spec=True)` 1회 호출 wall time.
+- warmup prompt 로 cache 를 warm 한 뒤 measure prompt 로 1회 timed call (JIT 영향 배제용 1회 warmup speculate 선행).
+- 1초 이내 완료.
+
+**출력 `suffix_cost.json`** per entry: `workload`, `prompt_len`, `draft_size`, `speculate_ms`.
+
+#### 파이프라인 연동 (out of scope)
+
+세 스크립트 결과를 Stage 6 의 `--latency-config` JSON (`{vanilla_step_ms, target_forward_ms:{B:ms}, eagle3_draft_ms:{B:ms}, draft_lm_tpot_ms}`) 로 자동 변환하는 단계는 **별도 후속 작업**. Stage 6 는 `--latency-config` 를 optional 로 수용하므로, 파이프라인 자체는 이 단계 없이도 (stub latency로) 동작.
 
 ### 대안: 88+ Method Flat Simulation
 
@@ -740,10 +799,11 @@ output.draft_latency_s      # wall-clock drafting time
 
 | 변수 | 설정 위치 | 역할 |
 |---|---|---|
-| `SGLANG_ORACLE_VANILLA=1` | Stage 1 | `oracle_patch.patch_eagle_worker_full` 활성화 → accept_length=0, draft logging |
+| `SGLANG_ORACLE_VANILLA=1` | Stage 1, latency 측정 | `oracle_patch.patch_eagle_worker_full` 훅 활성화 (timing instrumentation 기본) |
+| `SGLANG_LATENCY_ONLY=1` | `measure_eagle3_cost.py` | `SGLANG_ORACLE_VANILLA=1` 과 함께 쓰면 accept_length=0 강제 생략 → real speculative decoding + timing 만 수집 |
 | `SGLANG_ORACLE_REPLAY=<path>` | Stage 3c | NEXTN 서버가 trajectory.json 을 replay |
 | `SGLANG_ORACLE_VERIFY_TRIES=<path>` | 선택적 | Suffix worker가 pre-built union trie로 speculation 대체 |
-| `SGLANG_DRAFT_BUDGET=<N>` | Latency 측정 | `speculative_num_draft_tokens` runtime override |
+| `SGLANG_DRAFT_BUDGET=<N>` | (legacy) | `speculative_num_draft_tokens` runtime override — 현재 신규 측정 스크립트에서 미사용 |
 | `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1` | Docker | 긴 컨텍스트 허용 |
 | `TORCHINDUCTOR_COMPILE_THREADS=1` | 모든 SGLang 호출 | torch.compile fork bomb 방지 |
 
