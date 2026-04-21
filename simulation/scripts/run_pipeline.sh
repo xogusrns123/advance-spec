@@ -19,6 +19,13 @@
 #   EU_ORACLE=1             run Stage 5 (real target p_t) and enable the
 #                           EU oracle in Stage 6. Requires UNION_TRIE=1.
 #
+# Stage 1 EAGLE3 tree shape (override to sweep draft-tree configurations):
+#   STAGE1_TOPK=8           tree branching factor per level (default 8)
+#   STAGE1_STEPS=5          tree max depth (default 5)
+#   STAGE1_NUM_DRAFT_TOKENS=256  total draft budget (default 256)
+#   OUTPUT_DIR_SUFFIX=<str> appended to OUTPUT_DIR when sweeping so each
+#                           run (e.g. steps=2/4/6/8) writes to a distinct dir.
+#
 # Request range (for parallel execution across machines):
 #   REQ_START=0  REQ_END=50  bash simulation/scripts/run_pipeline.sh bfcl_v4 glm4_flash  # Machine A
 #   REQ_START=50 REQ_END=100 bash simulation/scripts/run_pipeline.sh bfcl_v4 glm4_flash  # Machine B
@@ -124,6 +131,17 @@ esac
 
 MODEL_SHORT=$(echo $MODEL_PRESET | tr '[:upper:]' '[:lower:]')
 OUTPUT_DIR="simulation/results/${MODEL_SHORT}/${BENCHMARK}"
+
+# Stage 1 EAGLE3 tree shape (passed through to run_parallel_stage1.sh).
+# Sweep steps={2,4,6,8} by running this script multiple times with
+# STAGE1_STEPS=<N> and distinct OUTPUT_DIR_SUFFIX to avoid clobbering.
+export STAGE1_TOPK=${STAGE1_TOPK:-8}
+export STAGE1_STEPS=${STAGE1_STEPS:-5}
+export STAGE1_NUM_DRAFT_TOKENS=${STAGE1_NUM_DRAFT_TOKENS:-256}
+OUTPUT_DIR_SUFFIX=${OUTPUT_DIR_SUFFIX:-}
+if [ -n "$OUTPUT_DIR_SUFFIX" ]; then
+  OUTPUT_DIR="${OUTPUT_DIR}_${OUTPUT_DIR_SUFFIX}"
+fi
 
 # --- Request range: slice input dataset for parallel execution ---
 IS_PARTIAL=""

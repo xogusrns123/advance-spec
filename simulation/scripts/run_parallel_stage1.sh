@@ -19,6 +19,12 @@ INPUT=${1:?}; OUTPUT_DIR=${2:?}; MODEL=${3:?}; DRAFT_MODEL=${4:?}; AGENT_MODULE=
 NUM_GPUS=${6:-4}; shift 6 || shift $#
 EXTRA_ARGS="$*"
 
+# EAGLE3 speculation tree shape — override via env to sweep steps/topk/budget
+# without editing this script. Defaults reproduce the legacy setting.
+STAGE1_TOPK=${STAGE1_TOPK:-8}
+STAGE1_STEPS=${STAGE1_STEPS:-5}
+STAGE1_NUM_DRAFT_TOKENS=${STAGE1_NUM_DRAFT_TOKENS:-256}
+
 # GPU_IDS: comma-separated list of GPU indices (e.g. "0,2,3" to skip GPU 1)
 # If not set, uses 0..NUM_GPUS-1
 if [ -n "${GPU_IDS:-}" ]; then
@@ -68,7 +74,9 @@ import sys; sys.stdout.flush()
     CUDA_VISIBLE_DEVICES=$GPU_ID python3 -m sglang.launch_server \
       --model-path "$MODEL" --tp-size 1 \
       --speculative-algorithm EAGLE3 --speculative-draft-model-path "$DRAFT_MODEL" \
-      --speculative-num-steps 5 --speculative-eagle-topk 8 --speculative-num-draft-tokens 256 \
+      --speculative-num-steps $STAGE1_STEPS \
+      --speculative-eagle-topk $STAGE1_TOPK \
+      --speculative-num-draft-tokens $STAGE1_NUM_DRAFT_TOKENS \
       --mem-fraction-static 0.85 --disable-cuda-graph --watchdog-timeout 600 \
       --host 0.0.0.0 --port $PORT > "$SHARD_DIR/server.log" 2>&1 &
     SRV_PID=$!

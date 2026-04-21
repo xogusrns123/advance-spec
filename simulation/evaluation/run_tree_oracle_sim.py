@@ -299,7 +299,14 @@ def simulate_decoding(
 
     # Determine if this method has draft cost
     is_hybrid = method.startswith("hybrid_e3:") or method.startswith("hybrid_dm:")
-    no_draft = method in ("single:suffix", "extension", "extension_dmsfx")  # no draft cost
+    # Methods whose cost is fully captured by real_step_cost_ms (ratio-based
+    # draft time accounting should be zero for them). Includes the new
+    # extension_*_by_score variants.
+    no_draft = (
+        method in ("single:suffix", "extension", "extension_dmsfx")
+        or method.startswith("extension_by_score:")
+        or method.startswith("extension_dmsfx_by_score:")
+    )
 
     ratios = draft_ratios or []
     # Ratio-based time accumulation
@@ -374,6 +381,17 @@ def simulate_decoding(
             elif method == "extension_dmsfx":
                 accepted = _extension_step(rec, budget, suffix_cache,
                                            cache_req_id, base_proposer="draft_model")
+            elif method.startswith("extension_by_score:"):
+                threshold = float(method.split(":", 1)[1])
+                accepted = _extension_step(rec, budget, suffix_cache,
+                                           cache_req_id, base_proposer="eagle3",
+                                           score_threshold=threshold)
+            elif method.startswith("extension_dmsfx_by_score:"):
+                threshold = float(method.split(":", 1)[1])
+                accepted = _extension_step(rec, budget, suffix_cache,
+                                           cache_req_id,
+                                           base_proposer="draft_model",
+                                           score_threshold=threshold)
             elif method == "eu":
                 accepted = _eu_step(rec, budget, p_t_key)
             elif method.startswith("eu_pair:"):
@@ -736,7 +754,8 @@ def _union_trie_step(rec: dict, budget: int,
 
 
 def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str,
-                    base_proposer: str = "eagle3") -> int:
+                    base_proposer: str = "eagle3",
+                    score_threshold: Optional[float] = None) -> int:
     """Extension: base proposer's tree (truncated to budget) + suffix extension
     at every node.
 
@@ -745,6 +764,9 @@ def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str,
     (base + suffix extensions) tree.
 
     base_proposer: "eagle3" (default) or "draft_model".
+    score_threshold: if set, only attach the extension when the suffix
+        draft's ``.score`` is ≥ threshold (mirrors the hybrid score gating
+        semantics; used by ``extension_by_score:t`` methods).
     """
     gt = rec.get("ground_truth_future", [])
     if not gt:
@@ -804,6 +826,10 @@ def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str,
             continue
 
         if not draft.token_ids:
+            continue
+        if (score_threshold is not None
+                and getattr(draft, "score", 0.0) < score_threshold):
+            # extension_by_score: skip low-confidence matches
             continue
 
         # Attach suffix chain to this node
@@ -949,6 +975,10 @@ def compute_latency_speedup(
         target_forward_ms: {B: ms} — pure target verify cost for B tokens
         eagle3_draft_ms: {B: ms} — EAGLE3 draft generation cost
         draft_lm_tpot_ms: draft model per-token cost
+        suffix_speculate_ms: per-call cost of SuffixDecodingCache.speculate()
+
+    Missing budgets in the per-B tables are linearly interpolated using the
+    nearest measured bracket (and clamped at the extremes).
 
     Backward compatible: derives from legacy verify_latencies_ms if needed.
     """
@@ -959,8 +989,8 @@ def compute_latency_speedup(
     # target_forward_ms[B]: pure target model verify cost for B tokens
     # eagle3_draft_ms[B]: EAGLE3 draft generation cost for B tokens
     # Backward compat: derive from verify_latencies_ms if new keys absent
-    target_fwd = latency_config.get("target_forward_ms", {})
-    eagle3_draft = latency_config.get("eagle3_draft_ms", {})
+    target_fwd = dict(latency_config.get("target_forward_ms", {}))
+    eagle3_draft = dict(latency_config.get("eagle3_draft_ms", {}))
     legacy_verify = latency_config.get("verify_latencies_ms",
                                        latency_config.get("eagle3_step_ms", {}))
 
@@ -971,24 +1001,52 @@ def compute_latency_speedup(
             eagle3_draft[b_str] = max(float(step) - vanilla_ms, 0.0)
 
     # Per-proposer draft costs (non-EAGLE3)
-    draft_lm_tpot = latency_config.get("draft_lm_tpot_ms", 0.0)
+    draft_lm_tpot = float(latency_config.get("draft_lm_tpot_ms", 0.0) or 0.0)
+    suffix_speculate_ms = float(
+        latency_config.get("suffix_speculate_ms", 0.0) or 0.0)
+
+    def _interp(table: dict, B: int, fallback: float) -> float:
+        """Linear interp on measured budgets; clamp at extremes."""
+        if not table:
+            return fallback
+        key = str(B)
+        if key in table:
+            return float(table[key])
+        keys = sorted(int(k) for k in table.keys())
+        if B <= keys[0]:
+            return float(table[str(keys[0])])
+        if B >= keys[-1]:
+            return float(table[str(keys[-1])])
+        lo = max(k for k in keys if k <= B)
+        hi = min(k for k in keys if k >= B)
+        if lo == hi:
+            return float(table[str(lo)])
+        frac = (B - lo) / (hi - lo)
+        return float(table[str(lo)]) + frac * (float(table[str(hi)])
+                                                - float(table[str(lo)]))
 
     def _target_forward(B: int) -> float:
         """Pure target model forward cost for verifying B tokens."""
-        return float(target_fwd.get(str(B), vanilla_ms))
+        return _interp(target_fwd, B, vanilla_ms)
 
     def _eagle3_draft(B: int) -> float:
         """EAGLE3 draft generation cost for budget B."""
-        return float(eagle3_draft.get(str(B), 0.0))
+        return _interp(eagle3_draft, B, 0.0)
 
-    def _proposer_draft_cost(name: str, B: int) -> float:
-        """Draft cost for a single proposer at budget B."""
+    def _proposer_draft_cost(name: str, B: int,
+                             suffix_matches: int = 1) -> float:
+        """Draft cost for a single proposer at budget B.
+
+        ``suffix_matches`` is only meaningful for suffix-family costs: how
+        many ``speculate()`` calls a method makes per step. Defaults to 1
+        (single / hybrid-suffix path); ``extension`` passes ~B.
+        """
         if name == "eagle3":
             return _eagle3_draft(B)
         elif name == "draft_model":
-            return B * draft_lm_tpot  # generates B tokens autoregressively
+            return B * draft_lm_tpot  # autoregressive, N tokens = N forwards
         elif name == "suffix":
-            return 0.0  # CPU lookup, free
+            return suffix_matches * suffix_speculate_ms
         elif name == "mtp":
             return 0.0  # uses target model MTP heads, cost in target_forward
         return 0.0
@@ -996,7 +1054,11 @@ def compute_latency_speedup(
     def _step_cost(active_proposers: List[str], B: int) -> float:
         """Step cost = target_forward(B) + max(draft costs of GPU proposers).
 
-        Proposers draft in parallel → cost = max, not sum.
+        Proposers draft in parallel → cost = max, not sum. Suffix runs on
+        CPU in parallel with the target GPU forward, so ``max()`` rather
+        than sum is still correct even with non-zero suffix cost (CPU vs GPU
+        overlap — suffix rarely dominates max unless extension explodes the
+        match count).
         """
         t_fwd = _target_forward(B)
         draft_costs = [_proposer_draft_cost(p, B) for p in active_proposers]
@@ -1005,12 +1067,18 @@ def compute_latency_speedup(
 
     DRAFT_RATIOS = [0.05, 0.10, 0.20, 0.30, 0.50]
 
-    def _real_cost(active_proposers, B):
+    def _real_cost(active_proposers, B, *, suffix_matches: int = 1):
         """Step cost in ms using measured latencies.
-        target_forward + max(draft costs of non-suffix active proposers)."""
+
+        target_forward + max(parallel draft costs). Suffix is kept in the
+        max() now that it has a real per-match cost — it still usually
+        costs far less than eagle3/draft_model so rarely dominates, but
+        accounting for it here makes extension / extension_by_score
+        comparisons fair.
+        """
         tf = _target_forward(B)
-        drafts = [_proposer_draft_cost(p, B) for p in active_proposers
-                  if p != "suffix"]
+        drafts = [_proposer_draft_cost(p, B, suffix_matches=suffix_matches)
+                  for p in active_proposers]
         return tf + (max(drafts) if drafts else 0.0)
 
     def _store_sim(entry, prefix, sim):
@@ -1102,25 +1170,28 @@ def compute_latency_speedup(
                   "real_step_cost_ms": _real_cost([pname], B)},
                  pname)
 
-        # Hybrid (suffix score threshold): suffix if score >= t, else fallback
+        # Hybrid (suffix score threshold): suffix if score >= t, else fallback.
+        # When suffix wins, step cost = target_forward + 1 suffix match.
         thresholds = [1.0, 3.0, 5.0]
 
         if "suffix" in proposers and "eagle3" in proposers:
             e3_cost = _real_cost(["eagle3"], B)
+            suffix_only_cost = _target_forward(B) + suffix_speculate_ms
             for t in thresholds:
                 _run(f"hybrid_e3:{t}",
                      {**common, "method": f"hybrid_e3:{t}",
                       "real_step_cost_ms": e3_cost,
-                      "real_step_cost_suffix_ms": _target_forward(B)},
+                      "real_step_cost_suffix_ms": suffix_only_cost},
                      f"hybrid_e3_t{t:.1f}")
 
         if "suffix" in proposers and "draft_model" in proposers:
             dm_cost = _real_cost(["draft_model"], B)
+            suffix_only_cost = _target_forward(B) + suffix_speculate_ms
             for t in thresholds:
                 _run(f"hybrid_dm:{t}",
                      {**common, "method": f"hybrid_dm:{t}",
                       "real_step_cost_ms": dm_cost,
-                      "real_step_cost_suffix_ms": _target_forward(B)},
+                      "real_step_cost_suffix_ms": suffix_only_cost},
                      f"hybrid_dm_t{t:.1f}")
 
         # C1 for suffix+eagle3 pair
@@ -1131,7 +1202,9 @@ def compute_latency_speedup(
                   "real_step_cost_ms": _real_cost(["eagle3", "suffix"], B)},
                  "c1_e3sfx")
 
-        # Extension: base tree + suffix extension at every node
+        # Extension: base tree + suffix extension at every node.
+        # Cost model: target_forward + max(eagle3_draft, B × suffix_speculate_ms).
+        # The B multiplier approximates "one suffix match per base-tree node".
         from hybrid_spec_decoding.suffix_decoding.suffix_tree import (
             SuffixDecodingCache,
         )
@@ -1139,22 +1212,39 @@ def compute_latency_speedup(
             if not hasattr(compute_latency_speedup, '_ext_cache'):
                 compute_latency_speedup._ext_cache = SuffixDecodingCache(
                     max_tree_depth=64, max_cached_requests=100000)
+            ext_cost = _real_cost(["eagle3", "suffix"], B, suffix_matches=B)
             _run("extension",
                  {**common, "method": "extension",
                   "suffix_cache": compute_latency_speedup._ext_cache,
-                  "real_step_cost_ms": _real_cost(["eagle3"], B)},
+                  "real_step_cost_ms": ext_cost},
                  "extension")
+            # Extension by score: like extension but skip suffix match when
+            # the previous match's score < threshold (amortized fewer matches).
+            for t in thresholds:
+                _run(f"extension_by_score:{t}",
+                     {**common, "method": f"extension_by_score:{t}",
+                      "suffix_cache": compute_latency_speedup._ext_cache,
+                      "real_step_cost_ms": ext_cost},
+                     f"extension_by_score_t{t:.1f}")
 
         # Extension with draft_model base + suffix extensions
         if "suffix" in proposers and "draft_model" in proposers:
             if not hasattr(compute_latency_speedup, '_ext_cache_dm'):
                 compute_latency_speedup._ext_cache_dm = SuffixDecodingCache(
                     max_tree_depth=64, max_cached_requests=100000)
+            ext_dm_cost = _real_cost(["draft_model", "suffix"], B,
+                                     suffix_matches=B)
             _run("extension_dmsfx",
                  {**common, "method": "extension_dmsfx",
                   "suffix_cache": compute_latency_speedup._ext_cache_dm,
-                  "real_step_cost_ms": _real_cost(["draft_model"], B)},
+                  "real_step_cost_ms": ext_dm_cost},
                  "extension_dmsfx")
+            for t in thresholds:
+                _run(f"extension_dmsfx_by_score:{t}",
+                     {**common, "method": f"extension_dmsfx_by_score:{t}",
+                      "suffix_cache": compute_latency_speedup._ext_cache_dm,
+                      "real_step_cost_ms": ext_dm_cost},
+                     f"extension_dmsfx_by_score_t{t:.1f}")
 
         results[B] = entry
         b_dt = time.time() - b_t0
