@@ -329,7 +329,7 @@ def main() -> None:
         ]
     else:
         try:
-            from ..analysis.collect_eagle3_drafts import load_dataset
+            from simulation.analysis.collect_eagle3_drafts import load_dataset
             prompts = load_dataset(config.dataset, config.max_samples)
         except Exception:
             prompts = [

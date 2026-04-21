@@ -8,10 +8,10 @@ Generates plots for:
 4. Top-5 overlap distribution
 
 Usage:
-    python -m hybrid_spec_decoding.analysis.plot_results \
+    python -m simulation.analysis.plot_results \
         --complementarity-file results/complementarity/complementarity.json \
         --agreement-file results/agreement/agreement.json \
-        --output-dir results/plots
+        --output-dir simulation/results/plots
 """
 
 from __future__ import annotations
@@ -177,7 +177,7 @@ def main():
     parser = argparse.ArgumentParser(description="Plot analysis results")
     parser.add_argument("--complementarity-file", default=None)
     parser.add_argument("--agreement-file", default=None)
-    parser.add_argument("--output-dir", default="results/plots")
+    parser.add_argument("--output-dir", default="simulation/results/plots")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)

@@ -1,6 +1,6 @@
 # Hybrid Speculative Decoding Research Codebase
 
-Modular speculative decoding research framework built on SGLang. Four pluggable proposers, full step-level tracing, two hybrid baselines, and reproducible benchmark infrastructure.
+Modular speculative decoding research framework built on SGLang. Four pluggable proposers, full step-level tracing, two hybrid baselines, and a reproducible **oracle simulation pipeline** for upper-bound analysis.
 
 ## Background
 
@@ -37,70 +37,229 @@ When EAGLE-3 and SuffixDecoding agree on a token, reduce branching and extend de
 ## Project Structure
 
 ```
-hybrid_spec_decoding/
-  proposers/                    --- Four pluggable proposers ---
+hybrid_spec_decoding/           --- Core runtime libraries ---
+  proposers/                    Four pluggable draft proposers
     base.py                     BaseProposer ABC + ProposerOutput (shared DraftTree)
     mtp_proposer.py             Multi-Token Prediction heads (top-k per head, BFS tree)
     draft_model_proposer.py     Small draft model (autoregressive top-k branching)
     eagle3_proposer.py          EAGLE-3 via SGLang server + offline replay
     suffix_proposer.py          SuffixDecoding via Arctic Inference C++ trees
 
-  tracing/                      --- Step-level instrumentation ---
-    tracer.py                   DecodingTracer: per-step tree structure, logprobs,
-                                accepted path, draft/verify/total latency. JSON+CSV export.
-
-  tree_fusion/                  --- Shared tree data structure & fusion algorithms ---
-    tree_utils.py               TreeNode, DraftTree, attention mask & position ID computation
-    pruning.py                  EAGLE-3 probability-based pruning + token budget enforcement
+  tree_fusion/                  Shared tree data structure & fusion algorithms
+    tree_utils.py               TreeNode, DraftTree, attention mask, position IDs
+    pruning.py                  EAGLE-3 probability-based pruning + budget enforcement
     rasd_merge.py               Parallel merge via longest prefix matching
-    sequential_extension.py     Extend EAGLE-3 nodes with SuffixDecoding + combined mode
+    sequential_extension.py     Extend EAGLE-3 nodes with SuffixDecoding
 
   suffix_decoding/
     suffix_tree.py              Arctic Inference C++ SuffixDecodingCache wrapper
     speculator.py               Dual tree (global + per-request) candidate generation
 
-  sglang_integration/
-    patched_eagle_worker.py     Wraps SGLang's EagleWorker with fusion hooks
+  sglang_integration/           SGLang runtime integration
     hybrid_speculator.py        ExperimentConfig + HybridSpeculator orchestration
+    suffix_worker.py            SuffixDecoding SGLang worker (--speculative-algorithm SUFFIX)
+
+  tracing/
+    tracer.py                   DecodingTracer: per-step tree, logprobs, latencies
 
   benchmarks/
-    run_benchmark.py            Unified benchmark: speedup, throughput, MAT, TPOT, breakdown
+    run_benchmark.py            Unified benchmark: speedup, throughput, MAT, TPOT
     run_hybrid.py               Two hybrid baselines: suffix+EAGLE-3, RASD fusion
     run_baseline.py             Autoregressive / EAGLE-3 only baselines
     run_fusion.py               5-condition comparison (a-e)
-    configs/                    Per-task YAML configs (HumanEval, MT-Bench, DocQA, AgenticSQL)
+    configs/                    Per-task YAML configs (HumanEval, MT-Bench, DocQA, ...)
 
-  analysis/
-    collect_eagle3_drafts.py    Collect per-step draft tokens from SGLang EAGLE-3 server
-    collect_suffix_candidates.py  Run SuffixDecoding standalone on the same inputs
-    compute_complementarity.py  Measure Case 1-4 ratios + per-depth P_accept / P_match
-    compute_agreement.py        Agreement score + correlation with actual correctness
-    plot_results.py             Visualization (case distribution, depth curves, etc.)
+simulation/                     --- Oracle simulation pipeline ---
+  agents/                       Stage 1 per-benchmark agent runners
+    bfcl_agent.py               BFCLv3 multi-turn
+    bfcl_v4_agent.py            BFCLv4 agentic (WebSearch + Memory)
+    specbench_agent.py          SpecBench / MT-Bench
+    swebench_agent.py           SWE-bench (LangChain tool-calling)
+    tools/                      Tool implementations (BFCL WebSearch, SWE-bench repos)
 
-tests/
-  test_tree.py                  DraftTree construction, flatten, attention mask, positions
-  test_proposers.py             All 4 proposers, budget enforcement, shared output format
+  oracle/                       SGLang patching + runtime hooks
+    install_hook.py             Install SUFFIX algorithm + oracle patches into SGLang
+    oracle_patch.py             Oracle vanilla: accept_length=0, log drafts
+    oracle_verify_patch.py      Verification-tries replay + latency instrumentation
+
+  pipeline/                     Oracle pipeline data collection
+    extract_trajectory.py       Stage 2: extract token sequences (for MTP replay)
+    collect_suffix_drafts.py    Stage 3a: per-step suffix drafts
+    collect_draft_model.py      Stage 3b: per-step draft-LM proposals
+    collect_union_trie.py       Stage 4: merge all proposers into union trie
+    collect_target_probs.py     Stage 5: compute p_t via tree attention
+    verify_server.py            Lightweight tree verification server for p_t
+    calibrate_latency.py        Measure per-token latencies via SGLang server
+    save_results.py             Helper for unified results JSON
+
+  evaluation/                   Stage 6 simulation
+    run_tree_oracle_sim.py      Tree-budget oracle simulation (DP knapsack + skip-ahead)
+    run_oracle_sim.py           Legacy 88+ method flat-chain simulation
+    tree_knapsack.py            DP tree knapsack solver
+
+  analysis/                     Offline Phase-1 analysis
+    collect_eagle3_drafts.py    Collect per-step drafts from SGLang EAGLE-3 server
+    collect_suffix_candidates.py Run SuffixDecoding standalone on the same inputs
+    compute_complementarity.py  Case 1-4 ratios + per-depth P_accept / P_match
+    compute_agreement.py        Agreement score + correlation with correctness
+    plot_results.py             Visualization (case distribution, depth curves, ...)
+
+  scripts/                      Shell drivers + utility scripts
+    run_pipeline.sh             Canonical end-to-end oracle pipeline (Stages 1-6)
+    run_parallel_stage1.sh      Stage 1: multi-GPU EAGLE3 oracle vanilla
+    run_parallel_draft_model.sh Stage 3b: multi-GPU SGLang draft-model proposals
+    run_parallel_p_t.sh         Stage 5: multi-GPU target-model p_t collection
+    merge_shards.sh             Merge REQ_START/REQ_END partial runs
+    rerun_from_stage4.sh        Re-run Stages 3a + 4 + 6 reusing 3b/3c outputs
+    rerun_stage6_sharded.sh     Re-run Stage 6 only, sharding budgets
+    run_online_test.sh          SGLang + SUFFIX integration test
+    replay_oracle.py            Stage 3c worker (MTP replay) + verify-tries replay
+    prepare_bfcl_data.py        Prepare BFCLv3 / BFCLv4 dataset.jsonl
+    prepare_specbench_data.py   Prepare SpecBench dataset.jsonl
+    measure_*.py                Latency measurement tools (TPOT, verify, decomposed)
+    sweep_eagle3_latency.py     EAGLE3 (topk, steps, budget) latency sweep
+    bench_eagle3_configs.py     EAGLE3 benchmark across configs
+
+  notebooks/
+    analyze_eagle3_bench.ipynb  EAGLE3 latency / acceptance analysis
+    analyze_oracle_sim.ipynb    Oracle simulation cross-workload views
+    compare_methods.ipynb       Per-workload method comparison bar charts
+
+  tests/
+    test_tree_knapsack.py       DP solver correctness
+    test_online_integration.py  SGLang server + oracle patches integration
+
+tests/                          --- Core library tests ---
+  test_tree.py                  DraftTree construction, flatten, attention mask
+  test_proposers.py             All 4 proposers, budget enforcement
   test_tracing.py               StepTrace, DecodingTracer, JSON/CSV export
-  test_benchmarks.py            ExperimentConfig, verify, summary, output formats
-  test_hybrid_baselines.py      Tree merging, RASD pruning, both fusion baselines
+  test_benchmarks.py            ExperimentConfig, verify, summary
+  test_hybrid_baselines.py      Tree merging, RASD pruning
 
-scripts/
-  run_all.sh                    Tests + benchmarks + hybrid baselines (no GPU needed)
-  run_tests.sh                  pytest suite
+scripts/                        --- Top-level convenience ---
+  run_all.sh                    Tests + benchmarks + hybrid baselines
+  run_tests.sh                  pytest suite (core + simulation)
   run_benchmark_offline.sh      MTP + DraftModel offline benchmark
   run_hybrid_baselines.sh       Both hybrid baselines with dummy data
 ```
 
 ## Setup
 
+### Prerequisites
+
+- NVIDIA GPU (RTX 4090 x4 권장, CUDA 12.2+)
+- Docker + Docker Compose + NVIDIA Container Toolkit
+- HuggingFace 토큰 ([생성](https://huggingface.co/settings/tokens))
+
+### Docker 환경 구성 (권장)
+
 ```bash
-# Install uv (if not installed)
+# 1. HF 토큰 설정
+echo "HF_TOKEN=hf_your_token_here" > .env
+
+# 2. 빌드 & 컨테이너 시작
+docker compose up -d --build
+
+# 3. 컨테이너 진입
+docker compose exec workspace bash
+```
+
+모델 가중치는 `hf-cache` Docker 볼륨에 캐시되어 컨테이너 재생성 시에도 재다운로드 불필요.
+
+### SGLang 서버 실행
+
+컨테이너 안에서 실행:
+
+```bash
+# Vanilla (speculative decoding 없음)
+python3 -m sglang.launch_server \
+    --model-path zai-org/GLM-4.7-Flash \
+    --tp-size 4 \
+    --mem-fraction-static 0.8 \
+    --disable-cuda-graph \
+    --host 0.0.0.0 --port 30000
+
+# MTP (모델 내장 Multi-Token Prediction)
+python3 -m sglang.launch_server \
+    --model-path zai-org/GLM-4.7-Flash \
+    --tp-size 4 \
+    --speculative-algorithm NEXTN \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 4 \
+    --speculative-num-draft-tokens 16 \
+    --mem-fraction-static 0.8 \
+    --disable-cuda-graph \
+    --host 0.0.0.0 --port 30000
+
+# EAGLE3 (외부 드래프트 모델)
+python3 -m sglang.launch_server \
+    --model-path zai-org/GLM-4.7-Flash \
+    --tp-size 4 \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path thoughtworks/GLM-4.7-Flash-Eagle3 \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 4 \
+    --speculative-num-draft-tokens 16 \
+    --mem-fraction-static 0.8 \
+    --disable-cuda-graph \
+    --host 0.0.0.0 --port 30000
+
+# Qwen3-8B + EAGLE3 (단일 GPU)
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3-8B \
+    --tp-size 1 \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path Tengyunw/qwen3_8b_eagle3 \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 4 \
+    --speculative-num-draft-tokens 16 \
+    --mem-fraction-static 0.85 \
+    --disable-cuda-graph \
+    --host 0.0.0.0 --port 30000
+
+# SUFFIX (model-free) — simulation.oracle.install_hook 로 SGLang 패치 후 사용
+python3 -m simulation.oracle.install_hook -- \
+    --model-path zai-org/GLM-4.7-Flash \
+    --tp-size 4 \
+    --speculative-algorithm SUFFIX \
+    --speculative-num-draft-tokens 16 \
+    --mem-fraction-static 0.8 \
+    --disable-cuda-graph \
+    --host 0.0.0.0 --port 30000
+```
+
+### API 요청 테스트
+
+```bash
+curl http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "zai-org/GLM-4.7-Flash",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "max_tokens": 128,
+    "temperature": 0
+  }'
+```
+
+### MoE 커널 튜닝 (선택)
+
+RTX 4090에 최적화된 MoE 커널 설정 생성:
+
+```bash
+git clone https://github.com/sgl-project/sglang.git /tmp/sglang-repo
+cd /tmp/sglang-repo/benchmark/kernels/fused_moe_triton
+python tuning_fused_moe_triton.py \
+    --model zai-org/GLM-4.7-Flash \
+    --tp-size 4 \
+    --tune
+cp *.json /opt/venv/lib/python3.11/site-packages/sglang/srt/layers/moe/fused_moe_triton/configs/triton_3_5_1/
+```
+
+### 로컬 환경 (Docker 없이)
+
+```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Create venv and install all dependencies (including SGLang)
 uv venv && uv pip install -e ".[dev]"
-
-# Activate
 source .venv/bin/activate
 ```
 
@@ -111,14 +270,14 @@ source .venv/bin/activate
 bash scripts/run_all.sh
 
 # Or individually:
-bash scripts/run_tests.sh                       # 60 unit tests
+bash scripts/run_tests.sh                       # core + simulation unit tests
 bash scripts/run_benchmark_offline.sh            # MTP + DraftModel benchmark
 bash scripts/run_hybrid_baselines.sh             # Both hybrid baselines
 ```
 
-## Usage
+## Core Usage (SGLang runtime)
 
-### Unified Benchmark (all proposers)
+### Unified Benchmark
 
 ```bash
 # Offline benchmark with dummy prompts (no server needed)
@@ -157,62 +316,346 @@ Per-step trace fields:
 
 Trace outputs are saved as `*_trace.json` and `*_trace.csv` alongside benchmark results.
 
-### Phase 1: Analysis (run first to decide go/no-go)
+## Oracle Simulation Pipeline
+
+서버 없이 heterogeneous speculative decoding의 이론적 상한을 측정하는 offline 시뮬레이션 파이프라인. 6-stage + 3-substage 구조, 4 benchmark × 2 model preset × 3 실행 모드.
+
+### 한 줄 실행
 
 ```bash
-# 1. Start SGLang server with EAGLE-3
-python3 -m sglang.launch_server \
-  --model meta-llama/Llama-3.1-8B-Instruct \
-  --speculative-algorithm EAGLE3 \
-  --speculative-draft-model-path yuhuili/EAGLE3-LLaMA3.1-Instruct-8B \
-  --speculative-num-steps 5 \
-  --speculative-eagle-topk 8 \
-  --speculative-num-draft-tokens 64
-
-# 2. Collect EAGLE-3 draft tokens
-python -m hybrid_spec_decoding.analysis.collect_eagle3_drafts \
-  --server-url http://localhost:30000 \
-  --dataset humaneval \
-  --output-dir results/eagle3_drafts
-
-# 3. Collect SuffixDecoding candidates for the same inputs
-python -m hybrid_spec_decoding.analysis.collect_suffix_candidates \
-  --eagle3-results results/eagle3_drafts \
-  --output-dir results/suffix_candidates
-
-# 4. Compute case distribution (Case 1-4 ratios)
-python -m hybrid_spec_decoding.analysis.compute_complementarity \
-  --eagle3-results results/eagle3_drafts \
-  --suffix-results results/suffix_candidates \
-  --check-sequential \
-  --output-dir results/complementarity
-
-# 5. Compute agreement scores
-python -m hybrid_spec_decoding.analysis.compute_agreement \
-  --eagle3-results results/eagle3_drafts \
-  --suffix-results results/suffix_candidates \
-  --output-dir results/agreement
-
-# 6. Generate plots
-python -m hybrid_spec_decoding.analysis.plot_results \
-  --complementarity-file results/complementarity/complementarity.json \
-  --agreement-file results/agreement/agreement.json \
-  --output-dir results/plots
+bash simulation/scripts/run_pipeline.sh <benchmark> <model_preset> [num_requests]
 ```
 
-### Phase 2: Tree Fusion Experiments
+- `benchmark`: `bfcl_v3` / `bfcl_v4` / `specbench` / `swebench`
+- `model_preset`: `glm4_flash` (GLM-4.7-Flash, TP=4) / `qwen3_8b` (Qwen3-8B, TP=1)
+
+### Execution Toggles
+
+| 환경변수 | 기본값 | 역할 |
+|---|---|---|
+| `UNION_TRIE` | `0` | `1` → Stage 4 (union trie 생성) 실행 + Stage 6의 `union_trie_*` 메소드 활성화 |
+| `EU_ORACLE` | `0` | `1` → Stage 5 (p_t 수집) 실행 + Stage 6의 EU oracle 활성화. `UNION_TRIE=1` 필수 |
+| `REQ_START` / `REQ_END` | (unset) | 입력 dataset을 `[start:end)` 범위로 slice — 머신별 shard 분산 |
+| `NUM_GPUS` | auto | 사용 GPU 수 (미설정시 `nvidia-smi -L` 자동 감지) |
+| `GPU_IDS` | (unset) | 사용할 GPU 인덱스 (e.g. `"0,2,3"`) — 설정 시 `NUM_GPUS`를 목록 길이로 override |
+| `PORT` | `30000` | Stage 3c (MTP SGLang 서버) baseport |
+
+조합별 동작:
+
+| `UNION_TRIE` | `EU_ORACLE` | Stage 4 | Stage 5 | Stage 6 input | Stage 6 methods |
+|---|---|---|---|---|---|
+| **0 (기본)** | **0 (기본)** | skip | skip | artifacts 즉석 조립 | choose_one / single / hybrid / extension / c1_e3sfx |
+| 1 | 0 | run | skip | `union_trie_data.jsonl` | 위 + `union_trie_*` |
+| 1 | 1 | run | run | `union_trie_data_with_pt.jsonl` | 전체 (EU 포함) |
+| 0 | 1 | — | — | — | ❌ 진입 시 에러 |
+
+### Pipeline 개요
+
+```
+dataset.jsonl
+    │
+    ▼
+┌──────────────────────────────────────────────────────────────┐
+│ Stage 1: EAGLE3 Oracle Vanilla                  (multi-GPU)  │
+│   SGLANG_ORACLE_VANILLA=1 → accept_length=0 강제             │
+│   agent_results_eagle3.json                                  │
+└──────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────────────────────────────────┐
+│ Stage 2: Extract Trajectory                                  │
+│   trajectory.json (Stage 3c의 replay 입력)                   │
+└──────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────────────────────────────────┐
+│ Stage 3: Draft Token Collection                              │
+│   3a  Suffix Decoding             (공통, CPU)                │
+│       arctic_inference.SuffixDecodingCache + sequential      │
+│       → suffix_drafts.jsonl                                  │
+│   3b  Draft Model                 (Qwen3 전용, GPU)          │
+│       SGLang (Qwen3-0.6B) autoregressive + prefix caching    │
+│       → draft_model_drafts.jsonl                             │
+│   3c  MTP Oracle Replay           (GLM 전용, GPU)            │
+│       SGLang NEXTN + SGLANG_ORACLE_REPLAY=trajectory         │
+│       → agent_results_mtp.json                               │
+└──────────────────────────────────────────────────────────────┘
+    │
+    ▼  (UNION_TRIE=1일 때만)
+┌──────────────────────────────────────────────────────────────┐
+│ Stage 4: Collect Union Trie                                  │
+│   3a/3b/3c 결과를 per-step union trie로 병합                 │
+│   → union_trie_data.jsonl                                    │
+└──────────────────────────────────────────────────────────────┘
+    │
+    ▼  (EU_ORACLE=1일 때만)
+┌──────────────────────────────────────────────────────────────┐
+│ Stage 5: Collect Target Model p_t                            │
+│   Tree attention으로 각 trie node의 target probability       │
+│   → union_trie_data_with_pt.jsonl                            │
+└──────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────────────────────────────────┐
+│ Stage 6: Oracle Simulation                                   │
+│   budget sweep + latency-aware speedup                       │
+│   methods: choose_one, single:*, hybrid_e3/dm, extension,    │
+│            [union_trie_*], [eu]                              │
+│   → tree_oracle_sim.json                                     │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Preset별 실행 매트릭스
+
+| Preset | TP | DRAFT_LM | Stage 3 구성 |
+|---|---|---|---|
+| `qwen3_8b` | 1 | `Qwen/Qwen3-0.6B` | 3a + 3b (MTP head 없음) |
+| `glm4_flash` | 4 | — | 3a + 3c (MTP head 존재) |
+
+### Artifact Flow
+
+```
+input_slice.jsonl ──▶ Stage 1 ──▶ agent_results_eagle3.json
+                                      │
+                                      ├─▶ Stage 2  ──▶ trajectory.json
+                                      ├─▶ Stage 3a ──▶ suffix_drafts.jsonl        ┐
+                                      ├─▶ Stage 3b ──▶ draft_model_drafts.jsonl   │ Qwen3
+                                      └─▶ Stage 3c ──▶ agent_results_mtp.json     ┘ GLM
+                                                           │
+                                                           ▼  (UNION_TRIE=1)
+                                                     Stage 4 ──▶ union_trie_data.jsonl
+                                                                       │
+                                                                       ▼  (EU_ORACLE=1)
+                                                                 Stage 5 ──▶ union_trie_data_with_pt.jsonl
+                                                                                     │
+                                                                                     ▼
+                                                                               Stage 6 ──▶ tree_oracle_sim.json
+```
+
+### Stage 상세
+
+#### Stage 1: EAGLE3 Oracle Vanilla
+
+각 decoding step의 draft tree를 전체 기록. `oracle_patch.patch_eagle_worker_full`이 `verify_tree_greedy_func`을 패치하여 accept_length=0 강제 → 매 step 1 token씩 진행하면서 tree 구조와 verification logits 기반 p_t를 로깅.
+
+Oracle entry 구조: `{req_id, tokens, eagle3 (flat drafts), eagle3_tree ({token_ids, parents}, BFS), eagle3_tree_p_t}`.
+
+#### Stage 2: Extract Trajectory
 
 ```bash
-# Run baselines
-python -m hybrid_spec_decoding.benchmarks.run_baseline \
-  --mode all \
-  --config hybrid_spec_decoding/benchmarks/configs/humaneval.yaml \
-  --output-dir results/baselines
+python3 -m simulation.pipeline.extract_trajectory \
+    --agent-results agent_results_eagle3.json \
+    --output trajectory.json
+```
 
-# Run all fusion conditions
-python -m hybrid_spec_decoding.benchmarks.run_fusion \
-  --config hybrid_spec_decoding/benchmarks/configs/humaneval.yaml \
-  --output-dir results/fusion
+Stage 3c의 NEXTN replay에 사용.
+
+#### Stage 3a: Suffix Decoding
+
+```bash
+python3 -m simulation.pipeline.collect_suffix_drafts \
+    --agent-results agent_results_eagle3.json \
+    --output suffix_drafts.jsonl \
+    --model Qwen/Qwen3-8B
+```
+
+- `arctic_inference.SuffixDecodingCache`로 각 step context에서 speculate
+- 요청 순차 iteration, cache 누적 (sequential determinism 유지)
+- Output schema:
+  ```json
+  {"request_id": "...", "call_idx": 0, "step_idx": 5,
+   "token_ids": [...], "parents": [...], "score": 0.9}
+  ```
+
+#### Stage 3b: Draft Model (`DRAFT_LM` 지정 시)
+
+```bash
+bash simulation/scripts/run_parallel_draft_model.sh \
+    agent_results_eagle3.json draft_model_drafts.jsonl \
+    Qwen/Qwen3-0.6B 4 16 \
+    --target-model Qwen/Qwen3-8B
+```
+
+- N GPU에 SGLang (draft LM) 병렬 기동, prefix caching 활용
+- 각 step context → autoregressive 생성 → flat chain draft
+- request 단위 bin-packing으로 shard 분산
+
+#### Stage 3c: MTP Oracle Replay (MTP-capable 모델만)
+
+```bash
+# run_pipeline.sh 가 다음을 순서대로 처리:
+# 1) replay_trajectory.json 생성 (dry-run)
+# 2) SGLang NEXTN 서버 기동 + SGLANG_ORACLE_REPLAY 설정
+# 3) replay_oracle.py 로 MTP draft 수집
+```
+
+Output: `agent_results_mtp.json` (포맷은 Stage 1과 동일).
+
+#### Stage 4: Collect Union Trie (UNION_TRIE=1)
+
+```bash
+python3 -m simulation.pipeline.collect_union_trie \
+    --agent-results agent_results_eagle3.json \
+    --suffix-drafts suffix_drafts.jsonl \
+    --draft-model-drafts draft_model_drafts.jsonl \
+    --mtp-agent-results agent_results_mtp.json \
+    --output union_trie_data.jsonl \
+    --model Qwen/Qwen3-8B
+```
+
+- 3a/3b/3c 결과를 `(request_id, call_idx, step_idx)` 키로 O(1) lookup해서 merge
+- `build_union_trie()`: 각 proposer의 root-to-leaf path를 trie에 삽입, BFS flatten
+- BFS 보장: `parent[i] < i` (budget truncation 안전)
+- `context_token_ids`, `ground_truth_future` 포함 (Stage 5/6 입력)
+
+#### Stage 5: Collect Target p_t (EU_ORACLE=1)
+
+```bash
+bash simulation/scripts/run_parallel_p_t.sh \
+    union_trie_data.jsonl union_trie_data_with_pt.jsonl \
+    Qwen/Qwen3-8B 4
+```
+
+- Tree attention: trie node는 context + trie 내 ancestor에만 attend
+- `p_t(v) = softmax(logits[parent(v)])[v.token_id]`
+- KV cache 재사용: 동일 `(request_id, call_idx)` 내 incremental forward
+
+#### Stage 6: Oracle Simulation
+
+**UNION_TRIE=1, EU_ORACLE=1 (전체):**
+```bash
+python3 -m simulation.evaluation.run_tree_oracle_sim \
+    --union-trie-data union_trie_data_with_pt.jsonl \
+    --budgets 1,2,4,8,16,32,64,128,256,512 \
+    --p-t-key p_t \
+    --enable-eu \
+    --latency-config latency_config.json \
+    --output tree_oracle_sim.json --print-summary
+```
+
+**UNION_TRIE=0 (Stage 4/5 skip, 즉석 조립):**
+```bash
+python3 -m simulation.evaluation.run_tree_oracle_sim \
+    --agent-results agent_results_eagle3.json \
+    --suffix-drafts suffix_drafts.jsonl \
+    --draft-model-drafts draft_model_drafts.jsonl \
+    --budgets 1,2,4,8,16,32,64,128,256,512 \
+    --p-t-key p_t_oracle \
+    --no-union-trie \
+    --latency-config latency_config.json \
+    --output tree_oracle_sim.json --print-summary
+```
+
+**Oracle 전략**:
+- **Choose-One (`c1`)** — 각 step에서 최고 acceptance를 주는 proposer 선택
+- **Single (`single:<name>`)** — 특정 proposer 하나만 사용 (baseline)
+- **Hybrid (`hybrid_e3:t`, `hybrid_dm:t`)** — suffix score ≥ threshold이면 suffix, 아니면 fallback (eagle3 또는 draft_model)
+- **Extension (`extension`, `extension_dmsfx`)** — base tree의 모든 node에서 suffix decoding으로 확장
+- **C1 subset (`c1_e3sfx`)** — eagle3+suffix 서브셋 choose-one
+- **Union Trie (`union_trie_e3sfx`, `union_trie_all`)** — budget B 내 BFS truncation + greedy walk *(UNION_TRIE=1)*
+- **Expected-Utility (`eu`, `eu_e3sfx`)** — DP tree knapsack으로 budget 내 최적 subtree *(EU_ORACLE=1)*
+
+**Latency-aware simulation**:
+- 각 step에서 tree 선택 → `greedy_tree_walk`로 acceptance 측정
+- step cost = target_forward(B) + max(draft costs); suffix = 0 (CPU)
+- `speedup = (total_tokens × vanilla_ms) / total_time_ms`
+
+### 머신간 분산 실행
+
+```bash
+# Machine A
+REQ_START=0 REQ_END=50  bash simulation/scripts/run_pipeline.sh bfcl_v4 glm4_flash
+
+# Machine B
+REQ_START=50 REQ_END=100 bash simulation/scripts/run_pipeline.sh bfcl_v4 glm4_flash
+
+# Merge + Stage 6 재실행
+bash simulation/scripts/merge_shards.sh simulation/results/glm4_flash/bfcl_v4
+```
+
+### 부분 재실행
+
+Suffix 파라미터 튜닝 시 (Stage 3b/3c 결과 재사용):
+
+```bash
+bash simulation/scripts/rerun_from_stage4.sh \
+    simulation/results/qwen3_8b/bfcl_v4 qwen3_8b
+```
+
+Stage 6만 budget shard 병렬:
+
+```bash
+bash simulation/scripts/rerun_stage6_sharded.sh \
+    simulation/results/qwen3_8b/bfcl_v4
+```
+
+### Latency Configuration
+
+Stage 6에서 real-cost speedup을 계산하려면 `latency_config.json` 이 필요. `simulation/results/<preset>/latency_config.json` 에 있으면 자동 복사됨. 없으면 직접 측정:
+
+```bash
+# Decomposed target_forward / eagle3_draft / draft_lm TPOT
+python3 simulation/scripts/measure_decomposed_latency.py \
+    --model Qwen/Qwen3-8B \
+    --draft-model Tengyunw/qwen3_8b_eagle3 \
+    --tp-size 1 --budgets 1,2,4,8,16,32,64,128,256 \
+    --draft-lm Qwen/Qwen3-0.6B \
+    --output simulation/results/qwen3_8b/latency_config.json
+
+# 또는 SGLang 직접 측정
+python3 simulation/scripts/measure_sglang_verify_latency.py \
+    --model Qwen/Qwen3-8B \
+    --draft-model Tengyunw/qwen3_8b_eagle3 \
+    --tp-size 1 --budgets 1,2,4,8,16 \
+    --output simulation/results/qwen3_8b/latency_config.json
+```
+
+### 대안: 88+ Method Flat Simulation
+
+Chain 기반 방법론 비교 (레거시 `run_oracle_sim.py`):
+
+```bash
+python3 -m simulation.evaluation.run_oracle_sim \
+    --agent-results agent_results_eagle3.json \
+    --output oracle_sim.json \
+    --model Qwen/Qwen3-8B --print-summary
+```
+
+88+ 방법: standalone (EAGLE3/Suffix/DraftModel × depth), hybrid (threshold), sequential extension (⊕), tree extension (⊗), hybrid+extension 조합.
+
+### Phase 1: 독립 분석 (선택)
+
+Oracle 파이프라인과 별개로, suffix와 EAGLE3의 상호보완성을 직접 분석:
+
+```bash
+# EAGLE3 drafts 수집
+python -m simulation.analysis.collect_eagle3_drafts \
+    --server-url http://localhost:30000 --dataset humaneval \
+    --output-dir results/eagle3_drafts
+
+# Suffix candidates 동일 입력에서 수집
+python -m simulation.analysis.collect_suffix_candidates \
+    --eagle3-results results/eagle3_drafts \
+    --output-dir results/suffix_candidates
+
+# Case 1-4 비율 + P_accept / P_match
+python -m simulation.analysis.compute_complementarity \
+    --eagle3-results results/eagle3_drafts \
+    --suffix-results results/suffix_candidates \
+    --check-sequential \
+    --output-dir results/complementarity
+
+# Agreement score
+python -m simulation.analysis.compute_agreement \
+    --eagle3-results results/eagle3_drafts \
+    --suffix-results results/suffix_candidates \
+    --output-dir results/agreement
+
+# Plots
+python -m simulation.analysis.plot_results \
+    --complementarity-file results/complementarity/complementarity.json \
+    --agreement-file results/agreement/agreement.json \
+    --output-dir results/plots
 ```
 
 ## Experiment Conditions
@@ -267,9 +710,58 @@ output.draft_latency_s      # wall-clock drafting time
 
 ## Settings
 
+### GLM-4.7-Flash (31B MoE)
+
+- Target model: `zai-org/GLM-4.7-Flash` (31B MoE, 30B-A3B)
+- EAGLE-3 draft: `thoughtworks/GLM-4.7-Flash-Eagle3` (277MB)
+- GPU: RTX 4090 x4 (tp-size 4)
+- Speculative config: num_steps=3, topk=4, num_draft_tokens=16
+- Stage 3 구성: 3a (Suffix) + 3c (MTP)
+
+### Qwen3-8B (8B Dense)
+
+- Target model: `Qwen/Qwen3-8B`
+- EAGLE-3 draft: `Tengyunw/qwen3_8b_eagle3`
+- Small draft LM: `Qwen/Qwen3-0.6B`
+- GPU: RTX 4090 x1 (tp-size 1)
+- Speculative config: num_steps=3, topk=4, num_draft_tokens=16
+- Stage 3 구성: 3a (Suffix) + 3b (Draft Model)
+
+### Common
+
 - Batch size 1, greedy decoding (temperature=0)
-- Model: `meta-llama/Llama-3.1-8B-Instruct`
-- EAGLE-3 checkpoint: `yuhuili/EAGLE3-LLaMA3.1-Instruct-8B`
 - Max tree budget: 64 tokens (shared across all proposers/baselines)
-- GPU: A100 80G+ recommended
+- CUDA 12.2
 - Lossless: tree verification uses standard rejection sampling, output distribution is identical to the target model
+
+## SGLang Environment Variables
+
+파이프라인 스크립트가 자동으로 export하는 SGLang 환경변수 (디버깅 참고용):
+
+| 변수 | 설정 위치 | 역할 |
+|---|---|---|
+| `SGLANG_ORACLE_VANILLA=1` | Stage 1 | `oracle_patch.patch_eagle_worker_full` 활성화 → accept_length=0, draft logging |
+| `SGLANG_ORACLE_REPLAY=<path>` | Stage 3c | NEXTN 서버가 trajectory.json 을 replay |
+| `SGLANG_ORACLE_VERIFY_TRIES=<path>` | 선택적 | Suffix worker가 pre-built union trie로 speculation 대체 |
+| `SGLANG_DRAFT_BUDGET=<N>` | Latency 측정 | `speculative_num_draft_tokens` runtime override |
+| `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1` | Docker | 긴 컨텍스트 허용 |
+| `TORCHINDUCTOR_COMPILE_THREADS=1` | 모든 SGLang 호출 | torch.compile fork bomb 방지 |
+
+## Docker Architecture
+
+```
+docker-compose.yml
+├── workspace (container: sglang-bench)
+│   ├── /workspace        ← 호스트 소스코드 마운트 (실시간 반영)
+│   ├── /opt/venv         ← Python venv (이미지 내, 마운트 영향 없음)
+│   └── /root/.cache/hf   ← 모델 캐시 (Docker volume, 영속)
+└── volumes
+    └── hf-cache          ← HuggingFace 모델 가중치 캐시
+```
+
+### 알려진 이슈
+
+- **CUDA Graph OOM**: RTX 4090에서 `--disable-cuda-graph` 필요. `--cuda-graph-max-bs 8`로 대체 가능
+- **SGLang + GLM4MoeLite**: `enable_a2a_moe` AttributeError 발생 — Dockerfile에서 자동 패치됨
+- **EAGLE3 context_length 불일치**: `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1` 환경변수 필요 — docker-compose.yml에 포함됨
+- **EAGLE3 3D sweep**: `budget > topk + (steps-1)·topk² + 1` 조합은 SGLang의 `organize_draft_results` 에서 크래시 — sweep 스크립트에서 사전 필터링 권장

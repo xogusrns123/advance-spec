@@ -1,0 +1,32 @@
+name: advance-spec
+
+services:
+  workspace:
+    container_name: sglang-bench
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+      - SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+    volumes:
+      - .:/workspace
+      - hf-cache:/root/.cache/huggingface
+    ipc: host
+    pid: host
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    stdin_open: true
+    tty: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  hf-cache:

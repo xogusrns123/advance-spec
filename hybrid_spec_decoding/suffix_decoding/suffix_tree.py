@@ -124,10 +124,10 @@ class SuffixDecodingCache:
         native_draft = self._cache.speculate(
             req_id,
             context[-self.max_tree_depth:],
-            max_spec_tokens=max_spec_tokens or self.max_spec_tokens,
-            max_spec_factor=max_spec_factor or self.max_spec_factor,
-            max_spec_offset=max_spec_offset or self.max_spec_offset,
-            min_token_prob=min_token_prob or self.min_token_prob,
+            max_spec_tokens=max_spec_tokens if max_spec_tokens is not None else self.max_spec_tokens,
+            max_spec_factor=max_spec_factor if max_spec_factor is not None else self.max_spec_factor,
+            max_spec_offset=max_spec_offset if max_spec_offset is not None else self.max_spec_offset,
+            min_token_prob=min_token_prob if min_token_prob is not None else self.min_token_prob,
             use_tree_spec=use_tree_spec if use_tree_spec is not None else self.use_tree_spec,
         )
         return SuffixDraft.from_native(native_draft)
