@@ -7,7 +7,7 @@ result to a JSONL file for downstream oracle simulation.
 Usage:
     python3 -m simulation.pipeline.collect_union_trie \
         --agent-results results/.../agent_results.json \
-        --output results/.../union_trie_data.jsonl \
+        --output simulation/results/.../union_trie_data.jsonl \
         --model zai-org/GLM-4.7-Flash
 """
 

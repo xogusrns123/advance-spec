@@ -3,7 +3,7 @@
 # Draft model data doesn't depend on suffix, so we reuse it from the old
 # union_trie_data_with_dm.jsonl (backup) instead of re-collecting on GPU.
 #
-# Usage: bash scripts/rerun_from_stage4.sh <output_dir> <model_preset>
+# Usage: bash simulation/simulation/scripts/rerun_from_stage4.sh <output_dir> <model_preset>
 set -euo pipefail
 
 OUTPUT_DIR=${1:?}
@@ -37,8 +37,8 @@ rm -f "$OUTPUT_DIR/union_trie_data.jsonl"
 rm -f "$OUTPUT_DIR/tree_oracle_sim.json"
 
 # Ensure latency_config
-if [ ! -f "$OUTPUT_DIR/latency_config.json" ] && [ -f "results/${MODEL_PRESET}/latency_config.json" ]; then
-  cp "results/${MODEL_PRESET}/latency_config.json" "$OUTPUT_DIR/latency_config.json"
+if [ ! -f "$OUTPUT_DIR/latency_config.json" ] && [ -f "simulation/results/${MODEL_PRESET}/latency_config.json" ]; then
+  cp "simulation/results/${MODEL_PRESET}/latency_config.json" "$OUTPUT_DIR/latency_config.json"
 fi
 
 # Stage 4: Collect Union Trie (with new suffix params)

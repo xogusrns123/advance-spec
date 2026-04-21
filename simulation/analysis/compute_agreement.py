@@ -11,7 +11,7 @@ Usage:
     python -m simulation.analysis.compute_agreement \
         --eagle3-results results/eagle3_drafts \
         --suffix-results results/suffix_candidates \
-        --output-dir results/agreement
+        --output-dir simulation/results/agreement
 """
 
 from __future__ import annotations
@@ -167,7 +167,7 @@ def main():
     )
     parser.add_argument("--eagle3-results", required=True)
     parser.add_argument("--suffix-results", required=True)
-    parser.add_argument("--output-dir", default="results/agreement")
+    parser.add_argument("--output-dir", default="simulation/results/agreement")
     args = parser.parse_args()
 
     eagle3_dir = Path(args.eagle3_results)

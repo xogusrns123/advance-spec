@@ -17,7 +17,7 @@ Usage:
         --tp-size 1 \
         --budgets 1,2,4,8,16,32,64,128,256 \
         --draft-lm Qwen/Qwen3-0.6B \
-        --output results/qwen3_8b/latency_config.json
+        --output simulation/results/qwen3_8b/latency_config.json
 """
 
 from __future__ import annotations

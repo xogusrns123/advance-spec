@@ -13,14 +13,14 @@ Usage:
   # GLM-4.7-Flash with SGLang-collected oracle data
   python3 -m simulation.evaluation.run_oracle_sim \
     --agent-results results/glm4_flash/oracle_vanilla/agent_results.json \
-    --output results/glm4_flash/oracle_vanilla/oracle_sim.json \
+    --output simulation/results/glm4_flash/oracle_vanilla/oracle_sim.json \
     --model zai-org/GLM-4.7-Flash \
     --print-summary
 
   # With BFCL dataset for prompt reconstruction
   python3 -m simulation.evaluation.run_oracle_sim \
     --agent-results results/glm4_flash/oracle_vanilla/agent_results.json \
-    --output results/glm4_flash/oracle_vanilla/oracle_sim.json \
+    --output simulation/results/glm4_flash/oracle_vanilla/oracle_sim.json \
     --model zai-org/GLM-4.7-Flash \
     --dataset data/bfcl_multi_turn/dataset.jsonl \
     --print-summary
@@ -28,7 +28,7 @@ Usage:
   # Override step latencies (measured on RTX 4090)
   python3 -m simulation.evaluation.run_oracle_sim \
     --agent-results results/glm4_flash/oracle_vanilla/agent_results.json \
-    --output results/glm4_flash/oracle_vanilla/oracle_sim.json \
+    --output simulation/results/glm4_flash/oracle_vanilla/oracle_sim.json \
     --step-latencies eagle3=0.015,suffix=0.012,vanilla=0.011 \
     --print-summary
 """

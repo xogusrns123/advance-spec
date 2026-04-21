@@ -2,7 +2,7 @@
 # Run Stage 6 (oracle sim) by sharding the budget list into parallel processes.
 # Merges partial outputs into a single tree_oracle_sim.json.
 #
-# Usage: bash scripts/rerun_stage6_sharded.sh <output_dir>
+# Usage: bash simulation/simulation/scripts/rerun_stage6_sharded.sh <output_dir>
 set -euo pipefail
 D=${1:?Usage: $0 <output_dir>}
 

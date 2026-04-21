@@ -3,5 +3,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-echo "=== Running tests ==="
+echo "=== Running core tests ==="
 python -m pytest tests/ -v --tb=short "$@"
+
+echo ""
+echo "=== Running simulation tests ==="
+python -m pytest simulation/tests/ -v --tb=short "$@"

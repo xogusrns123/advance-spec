@@ -8,9 +8,9 @@ downstream p_t collection covers all proposers.
 Can run on multiple GPUs in parallel (one model per GPU).
 
 Usage:
-    python3 scripts/collect_draft_model.py \
+    python3 simulation/scripts/collect_draft_model.py \
         --union-trie-data results/.../union_trie_data.jsonl \
-        --output results/.../union_trie_data_with_dm.jsonl \
+        --output simulation/results/.../union_trie_data_with_dm.jsonl \
         --model Qwen/Qwen3-0.6B \
         --max-draft-tokens 16
 """

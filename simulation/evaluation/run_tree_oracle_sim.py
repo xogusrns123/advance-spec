@@ -13,7 +13,7 @@ Usage:
     python3 -m simulation.evaluation.run_tree_oracle_sim \
         --union-trie-data results/.../union_trie_data_with_pt.jsonl \
         --budgets 1,2,4,8,16,32,64 \
-        --output results/.../tree_oracle_sim.json \
+        --output simulation/results/.../tree_oracle_sim.json \
         --print-summary
 """
 

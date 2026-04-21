@@ -5,15 +5,15 @@ to the SGLang server via /v1/chat/completions. No agent or rid matching needed.
 
 Usage:
     # Stage 3: MTP replay
-    python3 scripts/replay_oracle.py \
+    python3 simulation/scripts/replay_oracle.py \
         --agent-results results/.../agent_results_eagle3.json \
-        --output results/.../agent_results_mtp.json \
+        --output simulation/results/.../agent_results_mtp.json \
         --server-url http://localhost:30000
 
     # Stage 5: verify-tries p_t (server started with SGLANG_ORACLE_VERIFY_TRIES)
-    python3 scripts/replay_oracle.py \
+    python3 simulation/scripts/replay_oracle.py \
         --agent-results results/.../agent_results_eagle3.json \
-        --output results/.../agent_results_verify.json \
+        --output simulation/results/.../agent_results_verify.json \
         --server-url http://localhost:30000
 """
 

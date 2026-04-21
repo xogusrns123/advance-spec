@@ -2,7 +2,7 @@
 # End-to-end test: SGLang with --speculative-algorithm SUFFIX
 #
 # Run inside the Docker container (sglang-bench):
-#   cd /workspace && bash scripts/run_online_test.sh
+#   cd /workspace && bash simulation/scripts/run_online_test.sh
 #
 # Prerequisites:
 #   - GPU available (4x RTX 4090)

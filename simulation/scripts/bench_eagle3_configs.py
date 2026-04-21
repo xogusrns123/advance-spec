@@ -10,7 +10,7 @@ Usage:
         --model Qwen/Qwen3-8B \
         --draft-model Tengyunw/qwen3_8b_eagle3 \
         --dataset data/specbench/dataset.jsonl \
-        --output results/qwen3_8b/eagle3_bench.json
+        --output simulation/results/qwen3_8b/eagle3_bench.json
 
     # Custom configs:
     python3 scripts/bench_eagle3_configs.py \
@@ -18,7 +18,7 @@ Usage:
         --draft-model Tengyunw/qwen3_8b_eagle3 \
         --dataset data/specbench/dataset.jsonl \
         --configs "chain:1,4,16,64;tree:4-3:4,16,64;tree:8-3:8,32,64" \
-        --output results/qwen3_8b/eagle3_bench.json
+        --output simulation/results/qwen3_8b/eagle3_bench.json
 
 Config format:
     chain:B1,B2,...           → topk=1, steps=B, budget=B (chain of length B)

@@ -10,7 +10,7 @@ import requests
 
 def main():
     server_url = "http://localhost:8100/verify_tree"
-    data_path = "results/qwen3_8b/pipeline_test/union_trie_data_server_pt.jsonl"
+    data_path = "simulation/results/qwen3_8b/pipeline_test/union_trie_data_server_pt.jsonl"
 
     # Load records, pick one with moderate context length
     records = []

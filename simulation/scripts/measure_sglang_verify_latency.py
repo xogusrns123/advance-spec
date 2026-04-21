@@ -14,7 +14,7 @@ Usage:
         --draft-model thoughtworks/GLM-4.7-Flash-Eagle3 \
         --tp-size 4 \
         --budgets 1,2,4,8,16 \
-        --output results/glm4_flash/full_pipeline_test/latency_config_sglang.json
+        --output simulation/results/glm4_flash/full_pipeline_test/latency_config_sglang.json
 
     # Qwen3-8B, single GPU:
     python3 scripts/measure_sglang_verify_latency.py \
@@ -22,7 +22,7 @@ Usage:
         --draft-model Tengyunw/qwen3_8b_eagle3 \
         --tp-size 1 \
         --budgets 1,2,4,8,16 \
-        --output results/qwen3_8b/latency_config_sglang.json
+        --output simulation/results/qwen3_8b/latency_config_sglang.json
 """
 
 from __future__ import annotations

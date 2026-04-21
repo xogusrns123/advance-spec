@@ -7,13 +7,13 @@ with tree attention.
 Usage:
     python3 -m simulation.pipeline.collect_target_probs \
         --union-trie-data results/.../union_trie_data.jsonl \
-        --output results/.../union_trie_data_with_pt.jsonl \
+        --output simulation/results/.../union_trie_data_with_pt.jsonl \
         --model zai-org/GLM-4.7-Flash
 
     # Oracle-only mode (no GPU needed):
     python3 -m simulation.pipeline.collect_target_probs \
         --union-trie-data results/.../union_trie_data.jsonl \
-        --output results/.../union_trie_data_with_pt.jsonl \
+        --output simulation/results/.../union_trie_data_with_pt.jsonl \
         --oracle-only
 """
 

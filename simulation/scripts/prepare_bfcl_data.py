@@ -14,9 +14,9 @@ Prerequisites:
     pip install bfcl-eval
 
 Usage:
-    python3 scripts/prepare_bfcl_data.py                    # both
-    python3 scripts/prepare_bfcl_data.py --benchmark v3     # multi_turn only
-    python3 scripts/prepare_bfcl_data.py --benchmark v4     # agent only
+    python3 simulation/scripts/prepare_bfcl_data.py                    # both
+    python3 simulation/scripts/prepare_bfcl_data.py --benchmark v3     # multi_turn only
+    python3 simulation/scripts/prepare_bfcl_data.py --benchmark v4     # agent only
 """
 
 from __future__ import annotations

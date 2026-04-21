@@ -2,18 +2,18 @@
 # Merge partial pipeline results and run Stage 6 (oracle simulation).
 #
 # Usage:
-#   bash scripts/merge_shards.sh results/glm4_flash/bfcl_v4
+#   bash simulation/scripts/merge_shards.sh simulation/results/glm4_flash/bfcl_v4
 #
 # Expects partial-run directories like:
-#   results/glm4_flash/bfcl_v4_req0-50/
-#   results/glm4_flash/bfcl_v4_req50-100/
+#   simulation/results/glm4_flash/bfcl_v4_req0-50/
+#   simulation/results/glm4_flash/bfcl_v4_req50-100/
 #
 # Produces merged output in:
-#   results/glm4_flash/bfcl_v4/
+#   simulation/results/glm4_flash/bfcl_v4/
 
 set -euo pipefail
 
-OUTPUT_DIR=${1:?Usage: $0 <output_dir>  (e.g. results/glm4_flash/bfcl_v4)}
+OUTPUT_DIR=${1:?Usage: $0 <output_dir>  (e.g. simulation/results/glm4_flash/bfcl_v4)}
 
 # Find partial-run directories
 SHARD_DIRS=$(ls -d "${OUTPUT_DIR}"_req*/ 2>/dev/null | sort)

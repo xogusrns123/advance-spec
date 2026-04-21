@@ -14,14 +14,14 @@ Usage:
         --topks 1,2,4,8 \
         --steps 1,2,3,4,5 \
         --budgets 4,8,16,32,64,128,256 \
-        --output results/qwen3_8b/eagle3_sweep.json
+        --output simulation/results/qwen3_8b/eagle3_sweep.json
 
     # Quick test:
     python3 scripts/sweep_eagle3_latency.py \
         --model Qwen/Qwen3-8B \
         --draft-model Tengyunw/qwen3_8b_eagle3 \
         --topks 4,8 --steps 3,5 --budgets 16,64 \
-        --output results/qwen3_8b/eagle3_sweep_quick.json
+        --output simulation/results/qwen3_8b/eagle3_sweep_quick.json
 """
 
 from __future__ import annotations

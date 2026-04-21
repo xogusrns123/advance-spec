@@ -3,12 +3,12 @@
 # Each GPU runs its own SGLang server on a different port.
 #
 # Usage:
-#   bash scripts/run_parallel_stage1.sh \
+#   bash simulation/simulation/scripts/run_parallel_stage1.sh \
 #       <input.jsonl> <output_dir> <model> <draft_model> \
 #       <agent_module> [num_gpus=4] [extra_agent_args...]
 #
 # Example:
-#   bash scripts/run_parallel_stage1.sh \
+#   bash simulation/simulation/scripts/run_parallel_stage1.sh \
 #       data/bfcl_agent/dataset.jsonl results/test \
 #       Qwen/Qwen3-8B Tengyunw/qwen3_8b_eagle3 \
 #       simulation.agents.bfcl_v4_agent 4 \

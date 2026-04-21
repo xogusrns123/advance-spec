@@ -11,7 +11,7 @@ Usage:
         --model zai-org/GLM-4.7-Flash \
         --warmup 5 \
         --measure 20 \
-        --output results/latency_config.json
+        --output simulation/results/latency_config.json
 """
 
 from __future__ import annotations
@@ -111,7 +111,7 @@ def main():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--measure", type=int, default=20)
     parser.add_argument("--max-tokens", type=int, default=256)
-    parser.add_argument("--output", default="results/latency_config.json")
+    parser.add_argument("--output", default="simulation/results/latency_config.json")
     parser.add_argument("--label", default="default",
                         help="Label for this measurement (e.g., 'vanilla', 'eagle3')")
     args = parser.parse_args()

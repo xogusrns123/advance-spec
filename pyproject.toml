@@ -30,5 +30,8 @@ packages = ["hybrid_spec_decoding", "simulation"]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.pytest.ini_options]
+testpaths = ["tests", "simulation/tests"]
+
 [tool.ruff]
 line-length = 100

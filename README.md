@@ -100,7 +100,7 @@ tests/
 
 scripts/
   run_pipeline.sh               Canonical end-to-end oracle pipeline (Stages 1-6)
-                                Usage: bash scripts/run_pipeline.sh <bench> <preset> [n]
+                                Usage: bash simulation/scripts/run_pipeline.sh <bench> <preset> [n]
                                 Env:   REQ_START/REQ_END (shard slices), GPU_IDS,
                                        NUM_GPUS, SKIP_PT, ENABLE_EU, PORT
   run_parallel_stage1.sh        Stage 1: multi-GPU EAGLE3 oracle vanilla (shard by GPU)
@@ -445,7 +445,7 @@ Budget별 tree verification의 실측 latency:
 python3 -m simulation.pipeline.verify_server --model Qwen/Qwen3-8B --port 8100
 
 # Latency 벤치마크 (budget 1-15, 50 trials)
-python3 scripts/measure_verify_latency.py http://localhost:8100 union_trie_data.jsonl
+python3 simulation/scripts/measure_verify_latency.py http://localhost:8100 union_trie_data.jsonl
 ```
 
 출력: `latency_config.json` (`vanilla_step_ms`, `verify_latencies_ms` per budget)

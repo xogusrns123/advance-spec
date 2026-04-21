@@ -7,7 +7,7 @@ import requests
 
 def main():
     server_url = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8100"
-    data_path = sys.argv[2] if len(sys.argv) > 2 else "results/qwen3_8b/pipeline_test/union_trie_data.jsonl"
+    data_path = sys.argv[2] if len(sys.argv) > 2 else "simulation/results/qwen3_8b/pipeline_test/union_trie_data.jsonl"
 
     # Pick a record with ~200 token context
     with open(data_path) as f:
@@ -48,7 +48,7 @@ def main():
         "vanilla_step_ms": vanilla,
         "verify_latencies_ms": {int(k): v for k, v in latencies.items()},
     }
-    out_path = "results/qwen3_8b/pipeline_test/latency_config.json"
+    out_path = "simulation/results/qwen3_8b/pipeline_test/latency_config.json"
     with open(out_path, "w") as f:
         json.dump(output, f, indent=2)
     print(f"\nSaved to {out_path}")

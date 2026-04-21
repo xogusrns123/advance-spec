@@ -7,7 +7,7 @@ recording what candidates it would produce at each position.
 Usage:
     python -m simulation.analysis.collect_suffix_candidates \
         --eagle3-results results/eagle3_drafts \
-        --output-dir results/suffix_candidates
+        --output-dir simulation/results/suffix_candidates
 """
 
 from __future__ import annotations
@@ -122,7 +122,7 @@ def main():
     )
     parser.add_argument("--eagle3-results", required=True,
                         help="Directory with EAGLE-3 collection results")
-    parser.add_argument("--output-dir", default="results/suffix_candidates")
+    parser.add_argument("--output-dir", default="simulation/results/suffix_candidates")
     parser.add_argument("--suffix-match-len", type=int, default=16)
     parser.add_argument("--incremental", action="store_true",
                         help="Build global tree incrementally (simulates online)")

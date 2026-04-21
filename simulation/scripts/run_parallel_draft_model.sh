@@ -3,7 +3,7 @@
 # Each GPU runs its own SGLang server with the draft model + prefix caching.
 #
 # Usage:
-#   bash scripts/run_parallel_draft_model.sh \
+#   bash simulation/simulation/scripts/run_parallel_draft_model.sh \
 #       results/.../union_trie_data.jsonl \
 #       results/.../union_trie_data_with_dm.jsonl \
 #       Qwen/Qwen3-0.6B \
@@ -79,7 +79,7 @@ for SHARD_IDX in $(seq 0 $((NUM_GPUS - 1))); do
   PORT=$((BASE_PORT + SHARD_IDX))
   SHARD_OUTPUT="${OUTPUT%.jsonl}_shard${SHARD_IDX}.jsonl"
 
-  python3 scripts/collect_draft_model.py \
+  python3 simulation/scripts/collect_draft_model.py \
     --union-trie-data "$INPUT" \
     --output "$SHARD_OUTPUT" \
     --model "$MODEL" \

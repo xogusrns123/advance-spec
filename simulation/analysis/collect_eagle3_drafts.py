@@ -8,7 +8,7 @@ Usage:
     python -m simulation.analysis.collect_eagle3_drafts \
         --server-url http://localhost:30000 \
         --dataset humaneval \
-        --output-dir results/eagle3_drafts
+        --output-dir simulation/results/eagle3_drafts
 """
 
 from __future__ import annotations
@@ -215,7 +215,7 @@ def main():
                         choices=["humaneval", "mt_bench", "docqa", "agentic_sql"])
     parser.add_argument("--max-samples", type=int, default=100)
     parser.add_argument("--max-tokens", type=int, default=512)
-    parser.add_argument("--output-dir", default="results/eagle3_drafts")
+    parser.add_argument("--output-dir", default="simulation/results/eagle3_drafts")
     parser.add_argument("--draft-log-dir", default=None,
                         help="Directory with per-request draft logs from patched SGLang")
     args = parser.parse_args()

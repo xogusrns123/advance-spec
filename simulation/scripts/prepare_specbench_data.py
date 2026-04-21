@@ -4,8 +4,8 @@ Downloads MT-Bench prompts from HuggingFace and converts to the
 SpecBench JSONL format expected by specbench_agent.py.
 
 Usage:
-    python3 scripts/prepare_specbench_data.py
-    python3 scripts/prepare_specbench_data.py --output-dir data/specbench
+    python3 simulation/scripts/prepare_specbench_data.py
+    python3 simulation/scripts/prepare_specbench_data.py --output-dir data/specbench
 """
 
 from __future__ import annotations

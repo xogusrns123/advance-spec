@@ -10,7 +10,7 @@
 # Request range (for parallel execution across machines):
 #   REQ_START=0  REQ_END=50  bash scripts/run_pipeline.sh bfcl_v4 glm4_flash  # Machine A
 #   REQ_START=50 REQ_END=100 bash scripts/run_pipeline.sh bfcl_v4 glm4_flash  # Machine B
-#   # Then merge: scripts/merge_shards.sh results/glm4_flash/bfcl_v4
+#   # Then merge: simulation/scripts/merge_shards.sh simulation/results/glm4_flash/bfcl_v4
 #
 # Examples:
 #   bash scripts/run_pipeline.sh bfcl_v3 glm4_flash 10   # first 10 requests
@@ -87,7 +87,7 @@ case $BENCHMARK in
 esac
 
 MODEL_SHORT=$(echo $MODEL_PRESET | tr '[:upper:]' '[:lower:]')
-OUTPUT_DIR="results/${MODEL_SHORT}/${BENCHMARK}"
+OUTPUT_DIR="simulation/results/${MODEL_SHORT}/${BENCHMARK}"
 
 # --- Request range: slice input dataset for parallel execution ---
 IS_PARTIAL=""
@@ -101,9 +101,9 @@ mkdir -p "$OUTPUT_DIR"
 if [ ! -f "$INPUT_FILE" ]; then
   echo "ERROR: Input file not found: $INPUT_FILE"
   echo "Run the appropriate prepare script first:"
-  echo "  bfcl_v3:   python3 scripts/prepare_bfcl_data.py --benchmark v3"
-  echo "  bfcl_v4:   python3 scripts/prepare_bfcl_data.py --benchmark v4"
-  echo "  specbench: python3 scripts/prepare_specbench_data.py"
+  echo "  bfcl_v3:   python3 simulation/scripts/prepare_bfcl_data.py --benchmark v3"
+  echo "  bfcl_v4:   python3 simulation/scripts/prepare_bfcl_data.py --benchmark v4"
+  echo "  specbench: python3 simulation/scripts/prepare_specbench_data.py"
   echo "  swebench:  Collect trajectories to data/swebench/trajectories.jsonl"
   exit 1
 fi
@@ -173,7 +173,7 @@ echo ""
 echo "=== Stage 1: EAGLE3 Oracle Vanilla ==="
 
 NUM_GPUS=${NUM_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}
-bash scripts/run_parallel_stage1.sh \
+bash simulation/simulation/scripts/run_parallel_stage1.sh \
   "$INPUT_FILE" "$OUTPUT_DIR" "$MODEL" "$DRAFT_MODEL" \
   "$AGENT_MODULE" "$NUM_GPUS" \
   $TEMP_FLAG $NUM_REQ_FLAG $MAX_ITER_FLAG
@@ -194,7 +194,7 @@ python3 -m simulation.pipeline.extract_trajectory \
 MTP_FLAG=""
 if [ "$BENCHMARK" != "specbench" ]; then
   # Check if model supports MTP by trying to build trajectory for replay
-  python3 scripts/replay_oracle.py \
+  python3 simulation/scripts/replay_oracle.py \
     --agent-results "$OUTPUT_DIR/agent_results_eagle3.json" \
     --output /dev/null \
     --trajectory-output "$OUTPUT_DIR/replay_trajectory.json" 2>/dev/null
@@ -224,7 +224,7 @@ if [ "$BENCHMARK" != "specbench" ]; then
 
     wait_for_server || exit 1
 
-    python3 scripts/replay_oracle.py \
+    python3 simulation/scripts/replay_oracle.py \
       --agent-results "$OUTPUT_DIR/agent_results_eagle3.json" \
       --output "$OUTPUT_DIR/agent_results_mtp.json" \
       --server-url "http://localhost:$PORT" \
@@ -262,7 +262,7 @@ if [ -n "$DRAFT_LM" ]; then
   echo ""
   echo "=== Stage 4b: Draft Model ($DRAFT_LM) ==="
   NUM_GPUS=${NUM_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}
-  bash scripts/run_parallel_draft_model.sh \
+  bash simulation/simulation/scripts/run_parallel_draft_model.sh \
     "$OUTPUT_DIR/union_trie_data.jsonl" \
     "$OUTPUT_DIR/union_trie_data_with_dm.jsonl" \
     "$DRAFT_LM" \
@@ -281,7 +281,7 @@ else
   echo ""
   echo "=== Stage 5: Collect p_t ==="
   NUM_GPUS=${NUM_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}
-  bash scripts/run_parallel_p_t.sh \
+  bash simulation/simulation/scripts/run_parallel_p_t.sh \
     "$PT_INPUT" \
     "$OUTPUT_DIR/union_trie_data_with_pt.jsonl" \
     "$MODEL" \
@@ -296,8 +296,8 @@ echo ""
 echo "=== Stage 6: Oracle Simulation ==="
 
 LATENCY_FLAG=""
-if [ ! -f "$OUTPUT_DIR/latency_config.json" ] && [ -f "results/${MODEL_SHORT}/latency_config.json" ]; then
-  cp "results/${MODEL_SHORT}/latency_config.json" "$OUTPUT_DIR/latency_config.json"
+if [ ! -f "$OUTPUT_DIR/latency_config.json" ] && [ -f "simulation/results/${MODEL_SHORT}/latency_config.json" ]; then
+  cp "simulation/results/${MODEL_SHORT}/latency_config.json" "$OUTPUT_DIR/latency_config.json"
 fi
 if [ -f "$OUTPUT_DIR/latency_config.json" ]; then
   LATENCY_FLAG="--latency-config $OUTPUT_DIR/latency_config.json"
