@@ -29,19 +29,36 @@ echo ""
 
 mkdir -p "$OUTPUT_DIR"
 
-# --- Merge union_trie_data_with_pt.jsonl ---
-MERGED_PT="$OUTPUT_DIR/union_trie_data_with_pt.jsonl"
-echo "Merging union_trie_data_with_pt.jsonl..."
-> "$MERGED_PT"
-for d in $SHARD_DIRS; do
-  f="$d/union_trie_data_with_pt.jsonl"
-  if [ -f "$f" ]; then
-    cat "$f" >> "$MERGED_PT"
-  else
-    echo "  WARN: $f not found, skipping"
+merge_jsonl() {
+  local name=$1
+  local out="$OUTPUT_DIR/$name"
+  echo "Merging $name..."
+  > "$out"
+  local found=0
+  for d in $SHARD_DIRS; do
+    local f="$d/$name"
+    if [ -f "$f" ]; then
+      cat "$f" >> "$out"
+      found=$((found + 1))
+    fi
+  done
+  if [ "$found" -eq 0 ]; then
+    rm -f "$out"
+    echo "  SKIP: no shard had $name"
+    return 1
   fi
-done
-echo "  $(wc -l < "$MERGED_PT") total records"
+  echo "  $(wc -l < "$out") total records from $found shards"
+  return 0
+}
+
+# --- Merge Stage 3a/3b per-step draft artifacts ---
+merge_jsonl suffix_drafts.jsonl || true
+merge_jsonl draft_model_drafts.jsonl || true
+
+# --- Merge Stage 4/5 outputs ---
+merge_jsonl union_trie_data.jsonl || true
+MERGED_PT="$OUTPUT_DIR/union_trie_data_with_pt.jsonl"
+merge_jsonl union_trie_data_with_pt.jsonl || true
 
 # --- Merge agent_results_eagle3.json (questions arrays) ---
 echo "Merging agent_results_eagle3.json..."

@@ -782,12 +782,24 @@ def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str,
         path.reverse()
         paths[i] = path
 
-    # For every node, extend with suffix
+    # For every node, extend with suffix. Parameters match Stage 3a
+    # (collect_suffix_drafts) so both use ArcticInference's official
+    # tree-mode simulator with identical knobs:
+    #   use_tree_spec=True  → real branching tree, not linear chain
+    #   max_spec_tokens=64  → explicit cap (avoids arctic_inference bug
+    #                         where self.max_depth is missing when None)
+    #   max_spec_factor=4.0 + min_token_prob=0.0 → aggressive exploration
     for node_idx in range(n):
         ext_context = np.array(base_context + paths[node_idx], dtype=np.int32)
 
         try:
-            draft = suffix_cache.speculate(cache_req_id, ext_context)
+            draft = suffix_cache.speculate(
+                cache_req_id, ext_context,
+                max_spec_tokens=64,
+                max_spec_factor=4.0,
+                min_token_prob=0.0,
+                use_tree_spec=True,
+            )
         except Exception:
             continue
 
@@ -916,6 +928,7 @@ def compute_latency_speedup(
     latency_config: dict,
     p_t_key: str = "p_t",
     enable_eu: bool = False,
+    enable_union_trie: bool = True,
 ) -> dict:
     """Run step-by-step simulation for each budget with measured latencies.
 
@@ -925,6 +938,11 @@ def compute_latency_speedup(
     ----------
     enable_eu : bool
         Enable EU Oracle (tree knapsack DP). Slow for large trees. Default off.
+    enable_union_trie : bool
+        Enable ``union_trie_*`` methods. When False (``UNION_TRIE=0`` path),
+        both the union-trie methods and EU methods are skipped — EU relies
+        on the precomputed ``union_trie``/``source_map`` fields which are
+        absent in that mode. Default True.
 
     Latency config should contain decomposed costs:
         vanilla_step_ms: target TPOT with no speculation
@@ -1010,6 +1028,11 @@ def compute_latency_speedup(
         if "speedup_real_always" in sim:
             entry[f"{prefix}_always_speedup_real"] = sim["speedup_real_always"]
 
+    if enable_eu and not enable_union_trie:
+        print("WARN: enable_eu=True requires enable_union_trie=True; "
+              "EU methods disabled.", file=sys.stderr)
+        enable_eu = False
+
     if enable_eu:
         print(f"Precomputing EU Oracle DP for {len(records)} records...",
               file=sys.stderr)
@@ -1056,16 +1079,17 @@ def compute_latency_speedup(
                       draft_ratios=DRAFT_RATIOS)
 
         # Union trie
-        _run("union_trie_e3sfx", {**common,
-             "method": "union_trie:eagle3,suffix",
-             "real_step_cost_ms": _real_cost(["eagle3", "suffix"], B)},
-             "union_trie_e3sfx")
+        if enable_union_trie:
+            _run("union_trie_e3sfx", {**common,
+                 "method": "union_trie:eagle3,suffix",
+                 "real_step_cost_ms": _real_cost(["eagle3", "suffix"], B)},
+                 "union_trie_e3sfx")
 
-        if "draft_model" in proposers:
-            _run("union_trie_all", {**common,
-                 "method": "union_trie:eagle3,suffix,draft_model",
-                 "real_step_cost_ms": _real_cost(["eagle3", "suffix", "draft_model"], B)},
-                 "union_trie_all")
+            if "draft_model" in proposers:
+                _run("union_trie_all", {**common,
+                     "method": "union_trie:eagle3,suffix,draft_model",
+                     "real_step_cost_ms": _real_cost(["eagle3", "suffix", "draft_model"], B)},
+                     "union_trie_all")
 
         # Choose-One Oracle (all proposers, full tree)
         _run("c1", {**common, "method": "choose_one",
@@ -1220,43 +1244,103 @@ def main():
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--union-trie-data", required=True,
-                        help="Input JSONL with union trie data + p_t")
+    # Input: either precomputed --union-trie-data, or raw Stage 1/3
+    # artifacts (assembled on the fly). Validated below.
+    parser.add_argument("--union-trie-data", default=None,
+                        help="Input JSONL with union trie data + p_t "
+                             "(produced by Stage 4)")
+    parser.add_argument("--agent-results", default=None,
+                        help="Alternative to --union-trie-data: Stage 1 "
+                             "EAGLE3 results JSON. Records are assembled "
+                             "on-the-fly from Stage 1/3 artifacts.")
+    parser.add_argument("--suffix-drafts", default=None,
+                        help="Stage 3a per-step suffix JSONL "
+                             "(used with --agent-results)")
+    parser.add_argument("--draft-model-drafts", default=None,
+                        help="Stage 3b per-step draft-model JSONL "
+                             "(used with --agent-results)")
+    parser.add_argument("--mtp-agent-results", default=None,
+                        help="Stage 3c MTP agent_results JSON "
+                             "(used with --agent-results)")
+    parser.add_argument("--dataset", default=None,
+                        help="dataset.jsonl for BFCL/SpecBench prompt "
+                             "reconstruction (used with --agent-results)")
+    parser.add_argument("--responses", default=None,
+                        help="agent_results_responses.json "
+                             "(used with --agent-results, BFCL only)")
+    parser.add_argument("--model", default=None,
+                        help="Target model name for tokenizer "
+                             "(used with --agent-results)")
+    parser.add_argument("--exclude", default=None,
+                        help="Exclude-ids file (used with --agent-results)")
     parser.add_argument("--output", default=None,
                         help="Output JSON for simulation results")
     parser.add_argument("--budgets", default="1,2,4,8,16,32,64",
                         help="Comma-separated budget values for sweep")
     parser.add_argument("--p-t-key", default="p_t_oracle",
                         help="Key for p_t values in records (default: p_t_oracle)")
-    parser.add_argument("--latency-config", required=True,
-                        help="Path to latency_config.json (from measure_verify_latency.py). "
-                             "Required: use measure_sglang_verify_latency.py to generate it.")
+    parser.add_argument("--latency-config", default=None,
+                        help="Path to latency_config.json (from measure_decomposed_latency.py). "
+                             "When omitted, MAT / accept-rate stats are still "
+                             "reported but latency-aware speedup numbers are skipped.")
     parser.add_argument("--draft-latencies", default=None,
                         help="Per-proposer draft cost in ms, e.g. "
                              "'eagle3=3.3,mtp=2.0,suffix=0.3'. "
                              "Multi-proposer methods use max() (parallel).")
     parser.add_argument("--print-summary", action="store_true")
     parser.add_argument("--enable-eu", action="store_true",
-                        help="Enable EU Oracle (slow tree knapsack DP)")
+                        help="Enable EU Oracle (slow tree knapsack DP). "
+                             "Ignored when --no-union-trie is set.")
+    parser.add_argument("--no-union-trie", action="store_true",
+                        help="Skip union_trie_* methods (and EU, which "
+                             "depends on the union trie). Use when Stage 4 "
+                             "was skipped (UNION_TRIE=0).")
     args = parser.parse_args()
 
     if not args.output and not args.print_summary:
         parser.error("At least one of --output or --print-summary required")
+    if not args.union_trie_data and not args.agent_results:
+        parser.error("Provide --union-trie-data or --agent-results")
+    if args.union_trie_data and args.agent_results:
+        parser.error("--union-trie-data and --agent-results are mutually exclusive")
 
     budgets = [int(b) for b in args.budgets.split(",")]
+    enable_union_trie = not args.no_union_trie
 
-    # Load records
-    print(f"Loading: {args.union_trie_data}", file=sys.stderr)
-    records = []
-    with open(args.union_trie_data) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                records.append(json.loads(line))
-    print(f"Loaded {len(records)} step records", file=sys.stderr)
+    # Load records — either directly from Stage 4 JSONL or assemble on the fly
+    if args.union_trie_data:
+        print(f"Loading: {args.union_trie_data}", file=sys.stderr)
+        records = []
+        with open(args.union_trie_data) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+        print(f"Loaded {len(records)} step records", file=sys.stderr)
+        input_source = args.union_trie_data
+    else:
+        from simulation.pipeline.collect_union_trie import (
+            assemble_records_from_artifacts,
+        )
+        records = assemble_records_from_artifacts(
+            agent_results_path=args.agent_results,
+            suffix_drafts_path=args.suffix_drafts,
+            draft_model_drafts_path=args.draft_model_drafts,
+            mtp_agent_results_path=args.mtp_agent_results,
+            exclude_path=args.exclude,
+            model=args.model,
+            dataset_path=args.dataset,
+            responses_path=args.responses,
+            include_union_trie=enable_union_trie,
+        )
+        input_source = args.agent_results
 
-    # If p_t_oracle not present, compute it
-    if records and args.p_t_key == "p_t_oracle" and "p_t_oracle" not in records[0]:
+    # If p_t_oracle requested but missing, compute it from ground truth.
+    # The enrichment uses the union_trie field, so it's only relevant when
+    # union-trie methods / EU are enabled.
+    if (records and args.p_t_key == "p_t_oracle"
+            and "p_t_oracle" not in records[0]
+            and enable_union_trie):
         from simulation.pipeline.collect_target_probs import (
             enrich_with_ground_truth_p_t,
         )
@@ -1273,30 +1357,60 @@ def main():
     choose_one_budget = evaluate_choose_one_at_budget(records, budgets)
     print(f"Choose-One at budget: {time.time() - t0:.2f}s", file=sys.stderr)
 
-    # Latency-aware simulation (all costs from latency_config)
-    with open(args.latency_config) as f:
-        latency_config = json.load(f)
+    # Latency-aware simulation. compute_latency_speedup always runs so
+    # MAT / accept-rate / method rankings are reported for every method
+    # (c1, single:*, hybrid:*, extension, and when enabled union_trie_* /
+    # eu). When --latency-config is missing, we feed a stub config
+    # (vanilla_step_ms=1.0 with empty per-budget tables); the speedup
+    # numbers become meaningless but MAT is unaffected.
+    have_latency = bool(args.latency_config)
+    if have_latency:
+        with open(args.latency_config) as f:
+            latency_config = json.load(f)
+    else:
+        print("NOTE: --latency-config not provided; MAT is still reported "
+              "but speedup numbers will be stub values (not measured).",
+              file=sys.stderr)
+        latency_config = {
+            "vanilla_step_ms": 1.0,
+            "target_forward_ms": {},
+            "eagle3_draft_ms": {},
+            "draft_lm_tpot_ms": 0.0,
+        }
+
     latency_results = compute_latency_speedup(
         records, budgets, latency_config, p_t_key=args.p_t_key,
-        enable_eu=args.enable_eu)
+        enable_eu=args.enable_eu, enable_union_trie=enable_union_trie)
 
     if args.print_summary:
         print_summary(choose_one, {}, choose_one_budget,
                       budgets, args.p_t_key)
-        try:
-            print_latency_summary(latency_results, budgets,
-                                  latency_config["vanilla_step_ms"])
-        except Exception as e:
-            print(f"Warning: print_latency_summary failed: {e}",
-                  file=sys.stderr)
+        if have_latency:
+            try:
+                print_latency_summary(latency_results, budgets,
+                                      latency_config["vanilla_step_ms"])
+            except Exception as e:
+                print(f"Warning: print_latency_summary failed: {e}",
+                      file=sys.stderr)
+        else:
+            # Without latency data, still show per-method MAT rankings
+            try:
+                print_latency_summary(latency_results, budgets,
+                                      latency_config["vanilla_step_ms"])
+                print("(WARNING: speedup columns above use stub latency; "
+                      "only MAT is meaningful)", file=sys.stderr)
+            except Exception as e:
+                print(f"Warning: MAT summary failed: {e}", file=sys.stderr)
 
     if args.output:
         output = {
             "metadata": {
-                "union_trie_data": args.union_trie_data,
+                "input_source": input_source,
                 "n_steps": len(records),
                 "budgets": budgets,
                 "p_t_key": args.p_t_key,
+                "enable_eu": args.enable_eu and enable_union_trie,
+                "enable_union_trie": enable_union_trie,
             },
             "choose_one": {
                 "aggregate": choose_one["aggregate"],
@@ -1322,6 +1436,7 @@ def main():
             "vanilla_step_ms": latency_config["vanilla_step_ms"],
             "proposers": proposers,
             "pairs": pairs,
+            "has_latency_config": have_latency,
             "budget_sweep": [
                 {
                     "budget": B,
@@ -1336,6 +1451,10 @@ def main():
                 for B in budgets if B in latency_results
             ],
         }
+        if not have_latency:
+            output["latency"]["note"] = (
+                "latency_config not provided; MAT values are accurate but "
+                "speedup_* columns use stub latencies (not meaningful)")
 
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)

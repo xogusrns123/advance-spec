@@ -1,20 +1,27 @@
 #!/usr/bin/env bash
-# Run collect_draft_model on multiple GPUs in parallel using SGLang servers.
-# Each GPU runs its own SGLang server with the draft model + prefix caching.
+# Run Stage 3b (collect_draft_model) on multiple GPUs in parallel using
+# SGLang servers. Each GPU runs its own SGLang server with the draft
+# model + prefix caching.
 #
 # Usage:
-#   bash simulation/simulation/scripts/run_parallel_draft_model.sh \
-#       results/.../union_trie_data.jsonl \
-#       results/.../union_trie_data_with_dm.jsonl \
-#       Qwen/Qwen3-0.6B \
-#       [num_gpus=4] [max_draft_tokens=16]
+#   bash simulation/scripts/run_parallel_draft_model.sh \
+#       <agent_results_eagle3.json> \
+#       <draft_model_drafts.jsonl> \
+#       <draft_model> \
+#       [num_gpus=4] [max_draft_tokens=16] [extra_args...]
+#
+# Any trailing arguments are forwarded to every shard's
+# `python3 -m simulation.pipeline.collect_draft_model` invocation
+# (e.g. --target-model, --dataset, --responses, --exclude).
 set -euo pipefail
 
-INPUT=${1:?Usage: $0 <input.jsonl> <output.jsonl> <model> [num_gpus] [max_tokens]}
+INPUT=${1:?Usage: $0 <agent_results.json> <output.jsonl> <draft_model> [num_gpus] [max_tokens] [extra_args...]}
 OUTPUT=${2:?}
 MODEL=${3:?}
 NUM_GPUS=${4:-4}
 MAX_TOKENS=${5:-16}
+shift 5 || shift $#
+EXTRA_ARGS="$*"
 
 # GPU_IDS: comma-separated (e.g. "0,2,3"). If not set, uses 0..NUM_GPUS-1
 if [ -n "${GPU_IDS:-}" ]; then
@@ -25,18 +32,16 @@ else
   for i in $(seq 0 $((NUM_GPUS - 1))); do GPU_LIST+=($i); done
 fi
 
-# Cap to actual request count
+# Cap to actual request count (agent_results.json holds one entry per question)
 N_REQS=$(python3 -c "
 import json
-rids = set()
 with open('$INPUT') as f:
-    for line in f:
-        if line.strip():
-            rids.add(json.loads(line).get('request_id',''))
-print(len(rids))
+    data = json.load(f)
+print(len(data.get('questions', [])))
 ")
 if [ "$N_REQS" -lt "$NUM_GPUS" ]; then
   NUM_GPUS=$N_REQS
+  GPU_LIST=("${GPU_LIST[@]:0:$NUM_GPUS}")
 fi
 
 echo "======================================"
@@ -45,6 +50,7 @@ echo "  Input: $INPUT"
 echo "  Draft model: $MODEL"
 echo "  Max tokens: $MAX_TOKENS"
 echo "  GPUs: $NUM_GPUS (requests: $N_REQS)"
+[ -n "$EXTRA_ARGS" ] && echo "  Extra args: $EXTRA_ARGS"
 echo "======================================"
 
 # Start SGLang servers (one per GPU)
@@ -79,13 +85,14 @@ for SHARD_IDX in $(seq 0 $((NUM_GPUS - 1))); do
   PORT=$((BASE_PORT + SHARD_IDX))
   SHARD_OUTPUT="${OUTPUT%.jsonl}_shard${SHARD_IDX}.jsonl"
 
-  python3 simulation/scripts/collect_draft_model.py \
-    --union-trie-data "$INPUT" \
+  python3 -m simulation.pipeline.collect_draft_model \
+    --agent-results "$INPUT" \
     --output "$SHARD_OUTPUT" \
     --model "$MODEL" \
     --max-draft-tokens "$MAX_TOKENS" \
     --server-url "http://localhost:$PORT" \
-    --shard "$SHARD_IDX/$NUM_GPUS" &
+    --shard "$SHARD_IDX/$NUM_GPUS" \
+    $EXTRA_ARGS &
   PIDS+=($!)
 done
 

@@ -53,12 +53,12 @@ done
 
 echo ""
 echo "=== Step 3: Run unit tests (no GPU) ==="
-python3 -m pytest /workspace/tests/test_online_integration.py \
+python3 -m pytest /workspace/simulation/tests/test_online_integration.py \
     -v --tb=short -k "not e2e"
 
 echo ""
 echo "=== Step 4: Run E2E tests ==="
-python3 -m pytest /workspace/tests/test_online_integration.py \
+python3 -m pytest /workspace/simulation/tests/test_online_integration.py \
     -v --tb=short -m "e2e"
 
 echo ""

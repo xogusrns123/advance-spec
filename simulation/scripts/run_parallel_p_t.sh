@@ -5,7 +5,7 @@
 # Per-request checkpointing prevents RAM OOM.
 #
 # Usage:
-#   bash simulation/simulation/scripts/run_parallel_p_t.sh \
+#   bash simulation/scripts/run_parallel_p_t.sh \
 #       results/.../union_trie_data.jsonl \
 #       results/.../union_trie_data_with_pt.jsonl \
 #       Qwen/Qwen3-8B \

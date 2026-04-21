@@ -2,9 +2,20 @@
 # Run Stage 6 (oracle sim) by sharding the budget list into parallel processes.
 # Merges partial outputs into a single tree_oracle_sim.json.
 #
-# Usage: bash simulation/simulation/scripts/rerun_stage6_sharded.sh <output_dir>
+# Usage: bash simulation/scripts/rerun_stage6_sharded.sh <output_dir>
 set -euo pipefail
 D=${1:?Usage: $0 <output_dir>}
+
+# Pick the freshest available union-trie artifact
+if [ -f "$D/union_trie_data_with_pt.jsonl" ]; then
+  UNION_TRIE="$D/union_trie_data_with_pt.jsonl"
+elif [ -f "$D/union_trie_data.jsonl" ]; then
+  UNION_TRIE="$D/union_trie_data.jsonl"
+else
+  echo "ERROR: no union_trie_data*.jsonl found in $D"
+  exit 1
+fi
+echo "Using union trie: $UNION_TRIE"
 
 # Budget shards: small group together, large each get own shard
 BUDGETS_A="1,2,4,8,16,32,64"
@@ -24,7 +35,7 @@ for SH in A B C D; do
   esac
   (
     python3 -m simulation.evaluation.run_tree_oracle_sim \
-      --union-trie-data "$D/union_trie_data_with_dm.jsonl" \
+      --union-trie-data "$UNION_TRIE" \
       --budgets "$B" \
       --p-t-key p_t \
       --output "$D/tree_oracle_sim_part_${SH}.json" \

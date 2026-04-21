@@ -30,7 +30,7 @@ from pathlib import Path
 import requests
 import yaml
 
-from ..analysis.collect_eagle3_drafts import load_dataset
+from simulation.analysis.collect_eagle3_drafts import load_dataset
 
 
 @dataclass

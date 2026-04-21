@@ -3,7 +3,7 @@
 Sends requests and extracts per-token timing from the response.
 
 Usage:
-    python scripts/measure_step_latency.py --url http://localhost:30000/v1 --model Qwen/Qwen3-8B
+    python simulation/scripts/measure_step_latency.py --url http://localhost:30000/v1 --model Qwen/Qwen3-8B
 """
 
 import argparse

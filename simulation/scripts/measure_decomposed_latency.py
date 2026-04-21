@@ -11,7 +11,7 @@ Produces latency_config.json with:
     draft_lm_tpot_ms: draft model per-token cost
 
 Usage:
-    python3 scripts/measure_decomposed_latency.py \
+    python3 simulation/scripts/measure_decomposed_latency.py \
         --model Qwen/Qwen3-8B \
         --draft-model Tengyunw/qwen3_8b_eagle3 \
         --tp-size 1 \

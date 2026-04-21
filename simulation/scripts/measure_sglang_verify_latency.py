@@ -9,7 +9,7 @@ override speculative_num_draft_tokens at runtime.
 
 Usage:
     # Inside container, all 4 GPUs:
-    python3 scripts/measure_sglang_verify_latency.py \
+    python3 simulation/scripts/measure_sglang_verify_latency.py \
         --model zai-org/GLM-4.7-Flash \
         --draft-model thoughtworks/GLM-4.7-Flash-Eagle3 \
         --tp-size 4 \
@@ -17,7 +17,7 @@ Usage:
         --output simulation/results/glm4_flash/full_pipeline_test/latency_config_sglang.json
 
     # Qwen3-8B, single GPU:
-    python3 scripts/measure_sglang_verify_latency.py \
+    python3 simulation/scripts/measure_sglang_verify_latency.py \
         --model Qwen/Qwen3-8B \
         --draft-model Tengyunw/qwen3_8b_eagle3 \
         --tp-size 1 \

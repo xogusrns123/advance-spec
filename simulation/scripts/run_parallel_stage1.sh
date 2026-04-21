@@ -3,12 +3,12 @@
 # Each GPU runs its own SGLang server on a different port.
 #
 # Usage:
-#   bash simulation/simulation/scripts/run_parallel_stage1.sh \
+#   bash simulation/scripts/run_parallel_stage1.sh \
 #       <input.jsonl> <output_dir> <model> <draft_model> \
 #       <agent_module> [num_gpus=4] [extra_agent_args...]
 #
 # Example:
-#   bash simulation/simulation/scripts/run_parallel_stage1.sh \
+#   bash simulation/scripts/run_parallel_stage1.sh \
 #       data/bfcl_agent/dataset.jsonl results/test \
 #       Qwen/Qwen3-8B Tengyunw/qwen3_8b_eagle3 \
 #       simulation.agents.bfcl_v4_agent 4 \
@@ -95,7 +95,9 @@ FAILED=0
 for PID in "${PIDS[@]}"; do
   if ! wait $PID; then FAILED=$((FAILED + 1)); fi
 done
-if [ $FAILED -gt 0 ]; then echo "WARNING: $FAILED shards failed"; fi
+if [ $FAILED -gt 0 ]; then
+  echo "WARNING: $FAILED shards failed — server logs preserved under $OUTPUT_DIR/_stage1_shard*/"
+fi
 
 # Merge results
 echo "Merging..."
@@ -134,9 +136,14 @@ with open(f'{output_dir}/agent_results_eagle3.json', 'w') as f:
 print(f'Merged: {len(merged_questions)} requests, {total_tokens} tokens, {total_oracle} oracle')
 "
 
-# Cleanup shard dirs
-for SHARD_IDX in $(seq 0 $((NUM_GPUS - 1))); do
-  rm -rf "$OUTPUT_DIR/_stage1_shard${SHARD_IDX}"
-done
-
-echo "Stage 1 parallel done"
+# Cleanup shard dirs only if all shards succeeded (preserve server.log / agent.log
+# on failure so the user can diagnose).
+if [ "$FAILED" -eq 0 ]; then
+  for SHARD_IDX in $(seq 0 $((NUM_GPUS - 1))); do
+    rm -rf "$OUTPUT_DIR/_stage1_shard${SHARD_IDX}"
+  done
+  echo "Stage 1 parallel done"
+else
+  echo "Stage 1 parallel done ($FAILED failures — shard dirs kept for inspection)"
+  exit 1
+fi

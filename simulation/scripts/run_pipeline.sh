@@ -2,20 +2,34 @@
 # Unified oracle simulation pipeline for all benchmarks.
 #
 # Usage:
-#   bash scripts/run_pipeline.sh <benchmark> <model_preset> [num_requests]
+#   bash simulation/scripts/run_pipeline.sh <benchmark> <model_preset> [num_requests]
 #
 # Benchmarks: bfcl_v3, bfcl_v4, specbench, swebench
 # Model presets: glm4_flash, qwen3_8b
 #
+# Execution toggles:
+#   UNION_TRIE=0 (default)  skip Stages 4 and 5 entirely. Stage 6 assembles
+#                           per-proposer records on the fly and skips both
+#                           union_trie_* and EU_oracle methods.
+#   UNION_TRIE=1            build union trie (Stage 4) and run union_trie_*
+#                           methods in Stage 6.
+#   EU_ORACLE=0 (default)   skip Stage 5 (p_t collection) and disable the
+#                           EU oracle in Stage 6. Uses p_t_oracle derived
+#                           from ground truth if any method needs p_t.
+#   EU_ORACLE=1             run Stage 5 (real target p_t) and enable the
+#                           EU oracle in Stage 6. Requires UNION_TRIE=1.
+#
 # Request range (for parallel execution across machines):
-#   REQ_START=0  REQ_END=50  bash scripts/run_pipeline.sh bfcl_v4 glm4_flash  # Machine A
-#   REQ_START=50 REQ_END=100 bash scripts/run_pipeline.sh bfcl_v4 glm4_flash  # Machine B
+#   REQ_START=0  REQ_END=50  bash simulation/scripts/run_pipeline.sh bfcl_v4 glm4_flash  # Machine A
+#   REQ_START=50 REQ_END=100 bash simulation/scripts/run_pipeline.sh bfcl_v4 glm4_flash  # Machine B
 #   # Then merge: simulation/scripts/merge_shards.sh simulation/results/glm4_flash/bfcl_v4
 #
 # Examples:
-#   bash scripts/run_pipeline.sh bfcl_v3 glm4_flash 10   # first 10 requests
-#   bash scripts/run_pipeline.sh bfcl_v4 glm4_flash 5    # first 5 requests
-#   REQ_START=5 REQ_END=10 bash scripts/run_pipeline.sh bfcl_v4 glm4_flash  # requests 5-9
+#   bash simulation/scripts/run_pipeline.sh bfcl_v3 glm4_flash 10   # first 10 requests
+#   bash simulation/scripts/run_pipeline.sh bfcl_v4 glm4_flash 5    # first 5 requests
+#   REQ_START=5 REQ_END=10 bash simulation/scripts/run_pipeline.sh bfcl_v4 glm4_flash  # requests 5-9
+#   UNION_TRIE=1 bash simulation/scripts/run_pipeline.sh bfcl_v4 qwen3_8b  # enable Stage 4
+#   UNION_TRIE=1 EU_ORACLE=1 bash simulation/scripts/run_pipeline.sh bfcl_v4 qwen3_8b  # full
 set -euo pipefail
 
 BENCHMARK=${1:?Usage: $0 <benchmark> <model_preset> [num_requests]}
@@ -25,10 +39,18 @@ PORT=${PORT:-30000}
 REQ_START=${REQ_START:-}
 REQ_END=${REQ_END:-}
 NUM_WORKERS=${NUM_WORKERS:-1}
-SKIP_PT=${SKIP_PT:-}
-ENABLE_EU=${ENABLE_EU:-}
+EU_ORACLE=${EU_ORACLE:-0}
+UNION_TRIE=${UNION_TRIE:-0}
+
+# EU_ORACLE=1 requires UNION_TRIE=1 (EU relies on the union trie).
+if [ "$EU_ORACLE" = "1" ] && [ "$UNION_TRIE" = "0" ]; then
+  echo "ERROR: EU_ORACLE=1 requires UNION_TRIE=1; EU oracle depends on the union trie."
+  exit 1
+fi
 
 # --- Model preset ---
+# TP_SIZE is only consumed by Stage 3c (MTP server, GLM only). Stage 1/5
+# shard one server per GPU with TP=1, so new presets default to TP_SIZE=1.
 case $MODEL_PRESET in
   glm4_flash)
     MODEL="zai-org/GLM-4.7-Flash"
@@ -44,8 +66,22 @@ case $MODEL_PRESET in
     TP_SIZE=1
     MEM_FRAC=0.85
     ;;
+  qwen3_14b)
+    MODEL="Qwen/Qwen3-14B"
+    DRAFT_MODEL="AngelSlim/Qwen3-14B_eagle3"
+    DRAFT_LM="Qwen/Qwen3-0.6B"
+    TP_SIZE=1
+    MEM_FRAC=0.85
+    ;;
+  qwen3_32b)
+    MODEL="Qwen/Qwen3-32B"
+    DRAFT_MODEL="Zhihu-ai/Zhi-Create-Qwen3-32B-Eagle3"
+    DRAFT_LM="Qwen/Qwen3-0.6B"
+    TP_SIZE=1
+    MEM_FRAC=0.85
+    ;;
   *)
-    echo "Unknown model preset: $MODEL_PRESET (use glm4_flash or qwen3_8b)"
+    echo "Unknown model preset: $MODEL_PRESET (use glm4_flash, qwen3_8b, qwen3_14b, or qwen3_32b)"
     exit 1
     ;;
 esac
@@ -173,7 +209,7 @@ echo ""
 echo "=== Stage 1: EAGLE3 Oracle Vanilla ==="
 
 NUM_GPUS=${NUM_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}
-bash simulation/simulation/scripts/run_parallel_stage1.sh \
+bash simulation/scripts/run_parallel_stage1.sh \
   "$INPUT_FILE" "$OUTPUT_DIR" "$MODEL" "$DRAFT_MODEL" \
   "$AGENT_MODULE" "$NUM_GPUS" \
   $TEMP_FLAG $NUM_REQ_FLAG $MAX_ITER_FLAG
@@ -189,21 +225,54 @@ python3 -m simulation.pipeline.extract_trajectory \
   --output "$OUTPUT_DIR/trajectory.json"
 
 # ============================================================
-# Stage 3: MTP Oracle Replay (skip if model has no MTP heads)
+# Stage 3: Draft Token Collection (3a: Suffix, 3b: Draft Model, 3c: MTP)
 # ============================================================
+# Stage 3b semantics: --model is the draft LM, so target-model flag is
+# carried separately. Mirror DATASET_FLAG structure (specbench includes
+# --dataset, others don't).
+DM_DATASET_FLAG="--target-model $MODEL"
+if [ "$BENCHMARK" = "specbench" ]; then
+  DM_DATASET_FLAG="--dataset $INPUT_FILE $DM_DATASET_FLAG"
+fi
+
+# ---- Stage 3a: Suffix decoding (common) ----
+echo ""
+echo "=== Stage 3a: Suffix Decoding ==="
+python3 -m simulation.pipeline.collect_suffix_drafts \
+  --agent-results "$OUTPUT_DIR/agent_results_eagle3.json" \
+  --output "$OUTPUT_DIR/suffix_drafts.jsonl" \
+  $DATASET_FLAG
+
+# ---- Stage 3b: Draft model (if DRAFT_LM is set) ----
+DRAFT_LM=${DRAFT_LM:-}
+DM_FLAG=""
+if [ -n "$DRAFT_LM" ]; then
+  echo ""
+  echo "=== Stage 3b: Draft Model ($DRAFT_LM) ==="
+  NUM_GPUS=${NUM_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}
+  bash simulation/scripts/run_parallel_draft_model.sh \
+    "$OUTPUT_DIR/agent_results_eagle3.json" \
+    "$OUTPUT_DIR/draft_model_drafts.jsonl" \
+    "$DRAFT_LM" \
+    "$NUM_GPUS" 16 \
+    $DM_DATASET_FLAG
+  DM_FLAG="--draft-model-drafts $OUTPUT_DIR/draft_model_drafts.jsonl"
+else
+  echo ""
+  echo "=== Stage 3b: SKIPPED (DRAFT_LM unset) ==="
+fi
+
+# ---- Stage 3c: MTP replay (glm4_flash only; skip specbench) ----
 MTP_FLAG=""
 if [ "$BENCHMARK" != "specbench" ]; then
-  # Check if model supports MTP by trying to build trajectory for replay
   python3 simulation/scripts/replay_oracle.py \
     --agent-results "$OUTPUT_DIR/agent_results_eagle3.json" \
     --output /dev/null \
     --trajectory-output "$OUTPUT_DIR/replay_trajectory.json" 2>/dev/null
 
-  # Only run MTP if model supports NEXTN/EAGLE algorithm
-  # (Qwen3-8B has no MTP heads, GLM-4.7-Flash does)
   if [ "$MODEL_PRESET" = "glm4_flash" ]; then
     echo ""
-    echo "=== Stage 3: MTP Oracle Replay ==="
+    echo "=== Stage 3c: MTP Oracle Replay ==="
 
     export SGLANG_ORACLE_REPLAY="$OUTPUT_DIR/replay_trajectory.json"
     python3 -m simulation.oracle.install_hook
@@ -236,57 +305,46 @@ if [ "$BENCHMARK" != "specbench" ]; then
     MTP_FLAG="--mtp-agent-results $OUTPUT_DIR/agent_results_mtp.json"
   else
     echo ""
-    echo "=== Stage 3: SKIPPED (model has no MTP heads) ==="
+    echo "=== Stage 3c: SKIPPED (model has no MTP heads) ==="
   fi
 fi
 
 # ============================================================
-# Stage 4: Collect Union Trie (EAGLE3 + Suffix [+ MTP])
+# Stage 4: Collect Union Trie (merge EAGLE3 + Suffix + [DM] + [MTP])
 # ============================================================
-echo ""
-echo "=== Stage 4: Collect Union Trie ==="
-
-python3 -m simulation.pipeline.collect_union_trie \
-  --agent-results "$OUTPUT_DIR/agent_results_eagle3.json" \
-  $MTP_FLAG \
-  --output "$OUTPUT_DIR/union_trie_data.jsonl" \
-  $DATASET_FLAG
-
-# ============================================================
-# Stage 4b: Collect Draft Model proposals (if DRAFT_LM is set)
-# ============================================================
-DRAFT_LM=${DRAFT_LM:-}
-PT_INPUT="$OUTPUT_DIR/union_trie_data.jsonl"
-
-if [ -n "$DRAFT_LM" ]; then
+if [ "$UNION_TRIE" = "0" ]; then
   echo ""
-  echo "=== Stage 4b: Draft Model ($DRAFT_LM) ==="
-  NUM_GPUS=${NUM_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}
-  bash simulation/simulation/scripts/run_parallel_draft_model.sh \
-    "$OUTPUT_DIR/union_trie_data.jsonl" \
-    "$OUTPUT_DIR/union_trie_data_with_dm.jsonl" \
-    "$DRAFT_LM" \
-    "$NUM_GPUS"
-  PT_INPUT="$OUTPUT_DIR/union_trie_data_with_dm.jsonl"
+  echo "=== Stage 4: SKIPPED (UNION_TRIE=0) ==="
+else
+  echo ""
+  echo "=== Stage 4: Collect Union Trie ==="
+  python3 -m simulation.pipeline.collect_union_trie \
+    --agent-results "$OUTPUT_DIR/agent_results_eagle3.json" \
+    --suffix-drafts "$OUTPUT_DIR/suffix_drafts.jsonl" \
+    $DM_FLAG \
+    $MTP_FLAG \
+    --output "$OUTPUT_DIR/union_trie_data.jsonl" \
+    $DATASET_FLAG
 fi
 
 # ============================================================
-# Stage 5: Collect Target Model p_t (skip with SKIP_PT=1)
+# Stage 5: Collect Target Model p_t (needs both UNION_TRIE=1 and EU_ORACLE=1)
 # ============================================================
-SIM_INPUT="$PT_INPUT"
-if [ -n "$SKIP_PT" ]; then
+if [ "$UNION_TRIE" = "0" ]; then
   echo ""
-  echo "=== Stage 5: SKIPPED (SKIP_PT=1) ==="
+  echo "=== Stage 5: SKIPPED (UNION_TRIE=0) ==="
+elif [ "$EU_ORACLE" = "0" ]; then
+  echo ""
+  echo "=== Stage 5: SKIPPED (EU_ORACLE=0) ==="
 else
   echo ""
   echo "=== Stage 5: Collect p_t ==="
   NUM_GPUS=${NUM_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}
-  bash simulation/simulation/scripts/run_parallel_p_t.sh \
-    "$PT_INPUT" \
+  bash simulation/scripts/run_parallel_p_t.sh \
+    "$OUTPUT_DIR/union_trie_data.jsonl" \
     "$OUTPUT_DIR/union_trie_data_with_pt.jsonl" \
     "$MODEL" \
     "$NUM_GPUS"
-  SIM_INPUT="$OUTPUT_DIR/union_trie_data_with_pt.jsonl"
 fi
 
 # ============================================================
@@ -303,17 +361,43 @@ if [ -f "$OUTPUT_DIR/latency_config.json" ]; then
   LATENCY_FLAG="--latency-config $OUTPUT_DIR/latency_config.json"
 fi
 
-EU_FLAG=""
-if [ -n "$ENABLE_EU" ]; then
-  EU_FLAG="--enable-eu"
+# Stage 6 input + method flags depend on UNION_TRIE / EU_ORACLE.
+#  UNION_TRIE=0               → assemble per-proposer on the fly from
+#                               Stage 1/3 artifacts, skip union_trie_* + EU
+#  UNION_TRIE=1, EU_ORACLE=0  → read union_trie_data.jsonl, skip EU
+#  UNION_TRIE=1, EU_ORACLE=1  → read union_trie_data_with_pt.jsonl, run EU
+if [ "$UNION_TRIE" = "0" ]; then
+  SIM_INPUT_FLAGS=(
+    --agent-results "$OUTPUT_DIR/agent_results_eagle3.json"
+    --suffix-drafts "$OUTPUT_DIR/suffix_drafts.jsonl"
+  )
+  if [ -n "$DRAFT_LM" ]; then
+    SIM_INPUT_FLAGS+=(--draft-model-drafts "$OUTPUT_DIR/draft_model_drafts.jsonl")
+  fi
+  if [ -n "$MTP_FLAG" ]; then
+    SIM_INPUT_FLAGS+=(--mtp-agent-results "$OUTPUT_DIR/agent_results_mtp.json")
+  fi
+  # Forward the same $DATASET_FLAG (--model + optional --dataset) for
+  # on-the-fly BFCL/SpecBench prompt reconstruction.
+  SIM_INPUT_FLAGS+=($DATASET_FLAG)
+  METHOD_FLAGS=(--no-union-trie)
+  PT_KEY="p_t_oracle"
+elif [ "$EU_ORACLE" = "0" ]; then
+  SIM_INPUT_FLAGS=(--union-trie-data "$OUTPUT_DIR/union_trie_data.jsonl")
+  METHOD_FLAGS=()
+  PT_KEY="p_t_oracle"
+else
+  SIM_INPUT_FLAGS=(--union-trie-data "$OUTPUT_DIR/union_trie_data_with_pt.jsonl")
+  METHOD_FLAGS=(--enable-eu)
+  PT_KEY="p_t"
 fi
 
 python3 -m simulation.evaluation.run_tree_oracle_sim \
-  --union-trie-data "$SIM_INPUT" \
+  "${SIM_INPUT_FLAGS[@]}" \
   --budgets 1,2,4,8,16,32,64,128,256,512 \
-  --p-t-key p_t \
+  --p-t-key "$PT_KEY" \
   --output "$OUTPUT_DIR/tree_oracle_sim.json" \
-  $EU_FLAG \
+  "${METHOD_FLAGS[@]}" \
   --print-summary \
   $LATENCY_FLAG
 

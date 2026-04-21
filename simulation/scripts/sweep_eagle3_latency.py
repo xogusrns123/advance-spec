@@ -7,7 +7,7 @@ timing instrumentation.
 Output: JSON with per-config measurements + summary table.
 
 Usage:
-    python3 scripts/sweep_eagle3_latency.py \
+    python3 simulation/scripts/sweep_eagle3_latency.py \
         --model Qwen/Qwen3-8B \
         --draft-model Tengyunw/qwen3_8b_eagle3 \
         --tp-size 1 \
@@ -17,7 +17,7 @@ Usage:
         --output simulation/results/qwen3_8b/eagle3_sweep.json
 
     # Quick test:
-    python3 scripts/sweep_eagle3_latency.py \
+    python3 simulation/scripts/sweep_eagle3_latency.py \
         --model Qwen/Qwen3-8B \
         --draft-model Tengyunw/qwen3_8b_eagle3 \
         --topks 4,8 --steps 3,5 --budgets 16,64 \

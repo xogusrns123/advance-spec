@@ -1,13 +1,22 @@
-"""Build per-step union tries from agent_results.json.
+"""Merge per-step draft trees from multiple proposers into a union trie (Stage 4).
 
-For each decoding step, merges draft trees from all proposers
-(EAGLE3, Suffix, Draft Model) into a union trie and writes the
-result to a JSONL file for downstream oracle simulation.
+Consumes:
+  * --agent-results     : Stage 1 EAGLE3 output (provides EAGLE3 trees + prompts)
+  * --suffix-drafts     : Stage 3a output (per-step suffix trees)
+  * --draft-model-drafts: Stage 3b output (per-step draft-model chains)  [optional]
+  * --mtp-agent-results : Stage 3c output (MTP round agent_results)      [optional]
+
+For every decoding step it emits one JSONL record with the merged union
+trie, per-proposer sub-trees, context_token_ids (needed by Stage 5), and
+the ground-truth future suffix.
 
 Usage:
-    python3 -m simulation.pipeline.collect_union_trie \
-        --agent-results results/.../agent_results.json \
-        --output simulation/results/.../union_trie_data.jsonl \
+    python3 -m simulation.pipeline.collect_union_trie \\
+        --agent-results results/.../agent_results_eagle3.json \\
+        --suffix-drafts results/.../suffix_drafts.jsonl \\
+        --draft-model-drafts results/.../draft_model_drafts.jsonl \\
+        --mtp-agent-results results/.../agent_results_mtp.json \\
+        --output simulation/results/.../union_trie_data.jsonl \\
         --model zai-org/GLM-4.7-Flash
 """
 
@@ -58,7 +67,7 @@ def _paths_from_flat_tree(
         children.setdefault(i, [])
         children.setdefault(parents[i], []).append(i)
 
-    paths: List[List[int]] = []
+    paths = []
 
     def _dfs(node: int, path: List[int]):
         ch = children.get(node, [])
@@ -146,44 +155,69 @@ def build_union_trie(
 
 
 # ---------------------------------------------------------------------------
+# Per-step draft loaders (Stage 3a / 3b outputs)
+# ---------------------------------------------------------------------------
+
+def load_per_step_drafts(path: str) -> Dict[Tuple[str, int, int], dict]:
+    """Load a JSONL of per-step drafts into a (rid, call_idx, step_idx) → record dict.
+
+    Each line is expected to have keys: request_id, call_idx, step_idx,
+    token_ids, parents (+ optional extras like score). Any extra fields are
+    preserved in the returned dict so callers can propagate them onward.
+    """
+    out: Dict[Tuple[str, int, int], dict] = {}
+    with open(path) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            key = (r["request_id"], int(r["call_idx"]), int(r["step_idx"]))
+            out[key] = r
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Main collection loop
 # ---------------------------------------------------------------------------
 
 def collect_union_tries(
     requests: List[dict],
-    suffix_cache,
-    max_spec_tokens: int = 256,
-    max_spec_factor: float = 4.0,
-    min_token_prob: float = 0.0,
+    suffix_by_key: Optional[Dict[Tuple[str, int, int], dict]] = None,
+    dm_by_key: Optional[Dict[Tuple[str, int, int], dict]] = None,
     mtp_requests: Optional[List[dict]] = None,
+    include_union_trie: bool = True,
 ) -> List[dict]:
     """Collect per-step union trie data for all requests.
 
     Parameters
     ----------
     requests : list[dict]
-        Primary requests (e.g. EAGLE3 round).
-    suffix_cache :
-        SuffixDecodingCache instance.
+        Primary requests (EAGLE3 round) from extract_requests.
+    suffix_by_key, dm_by_key : dict, optional
+        Per-step draft records keyed by (request_id, call_idx, step_idx).
     mtp_requests : list[dict], optional
-        MTP round requests (same bfcl_ids, same token sequences).
-        If provided, MTP drafts are included in the union trie.
+        MTP round requests (same bfcl_ids, same token sequences). If
+        provided, MTP drafts are included in the union trie.
+    include_union_trie : bool
+        When True (default), each record includes the merged ``union_trie``
+        and ``source_map`` fields. When False, those fields are omitted;
+        records still carry ``per_proposer`` / ``context_token_ids`` /
+        ``ground_truth_future``. Used by Stage 6 runs with ``UNION_TRIE=0``.
     """
-    # Index MTP requests by bfcl_id for fast lookup
+    suffix_by_key = suffix_by_key or {}
+    dm_by_key = dm_by_key or {}
+
     mtp_by_id: Dict[str, dict] = {}
     if mtp_requests:
         for mr in mtp_requests:
             mtp_by_id[mr["bfcl_id"]] = mr
 
     records = []
-    req_id = 0
 
     for ri, req in enumerate(requests):
         bfcl_id = req["bfcl_id"]
-        dm_drafts = req.get("draft_model_drafts")
         prompt_ids_list = req.get("per_call_prompt_ids")
         mtp_req = mtp_by_id.get(bfcl_id)
-        global_pos = 0
 
         for call_idx in range(len(req["per_call_tokens"])):
             tokens = req["per_call_tokens"][call_idx]
@@ -196,82 +230,62 @@ def collect_union_tries(
                 prompt = np.array(prompt_ids_list[call_idx], dtype=np.int32)
             else:
                 prompt = np.array([], dtype=np.int32)
-            suffix_cache.start_request(req_id, prompt)
-            decoded = []
+            decoded: List[int] = []
 
             for pos in range(N):
-                # All proposers now predict tokens[pos:] (aligned)
                 future = tokens[pos:]
                 if len(future) <= 1:  # only current token, nothing to verify
                     decoded.append(tokens[pos])
-                    suffix_cache.add_active_response(req_id, [tokens[pos]])
                     continue
 
                 proposer_trees: Dict[str, Tuple[List[int], List[int]]] = {}
 
-                # EAGLE3: use full tree if available, else flat chain
-                eagle3_p_t = None  # p_t from verification logits
+                # EAGLE3: prefer full tree, else flat chain
+                eagle3_p_t = None
                 e3_trees = req.get("per_call_eagle3_trees")
                 e3_p_ts = req.get("per_call_eagle3_tree_p_ts")
+                e3_attached = False
                 if e3_trees and call_idx < len(e3_trees):
                     call_trees = e3_trees[call_idx]
                     if pos < len(call_trees) and call_trees[pos] is not None:
                         et = call_trees[pos]
                         proposer_trees["eagle3"] = (et["token_ids"], et["parents"])
-                        # Get p_t if available
+                        e3_attached = True
                         if e3_p_ts and call_idx < len(e3_p_ts):
                             call_p_ts = e3_p_ts[call_idx]
                             if pos < len(call_p_ts) and call_p_ts[pos] is not None:
                                 eagle3_p_t = call_p_ts[pos]
-                    else:
-                        e_draft = eagle3s[pos] if pos < len(eagle3s) else []
-                        if e_draft:
-                            e_parents, e_tokens = _flat_to_tree(e_draft)
-                            proposer_trees["eagle3"] = (e_tokens, e_parents)
-                else:
+                if not e3_attached:
                     e_draft = eagle3s[pos] if pos < len(eagle3s) else []
                     if e_draft:
                         e_parents, e_tokens = _flat_to_tree(e_draft)
                         proposer_trees["eagle3"] = (e_tokens, e_parents)
 
-                # Suffix: speculate from context BEFORE tokens[pos]
-                # so that suffix predicts tokens[pos:] (same as EAGLE3)
-                response_so_far = list(decoded)
-                if len(prompt) > 0:
-                    suffix_context = np.concatenate(
-                        [prompt, np.array(response_so_far, dtype=np.int32)]) if response_so_far else prompt.copy()
-                else:
-                    suffix_context = np.array(response_so_far, dtype=np.int32)
-                suffix_draft = suffix_cache.speculate(
-                    req_id, suffix_context,
-                    max_spec_tokens=max_spec_tokens,
-                    max_spec_factor=max_spec_factor,
-                    min_token_prob=min_token_prob,
-                    use_tree_spec=True)
-
-                # Context for p_t collection: ends at tokens[pos-1]
-                # so that logits at context[-1] predict tokens[pos],
-                # matching what tree depth-1 nodes predict.
-                context_for_pt = list(decoded)  # = tokens[0:pos]
-                if len(prompt) > 0:
-                    context = np.concatenate(
-                        [prompt, np.array(context_for_pt, dtype=np.int32)]) if context_for_pt else prompt.copy()
-                else:
-                    context = np.array(context_for_pt, dtype=np.int32)
-                suffix_score = getattr(suffix_draft, "score", 0.0)
-                if suffix_draft.token_ids:
+                # Suffix: looked up from Stage 3a output
+                key = (bfcl_id, call_idx, pos)
+                suffix_rec = suffix_by_key.get(key)
+                suffix_score = 0.0
+                if suffix_rec and suffix_rec.get("token_ids"):
                     proposer_trees["suffix"] = (
-                        list(suffix_draft.token_ids),
-                        list(suffix_draft.parents),
+                        list(suffix_rec["token_ids"]),
+                        list(suffix_rec["parents"]),
+                    )
+                    suffix_score = float(suffix_rec.get("score", 0.0))
+
+                # Draft model: looked up from Stage 3b output
+                dm_rec = dm_by_key.get(key)
+                if dm_rec and dm_rec.get("token_ids"):
+                    proposer_trees["draft_model"] = (
+                        list(dm_rec["token_ids"]),
+                        list(dm_rec["parents"]),
                     )
 
-                # MTP: from Round 2 replay data
+                # MTP: from Stage 3c replay
                 if mtp_req:
                     mtp_eagle3s = mtp_req.get("per_call_eagle3s", [])
                     mtp_e3_trees = mtp_req.get("per_call_eagle3_trees")
                     if call_idx < len(mtp_eagle3s):
                         mtp_call_eagle3s = mtp_eagle3s[call_idx]
-                        # Prefer full tree if available
                         if (mtp_e3_trees and call_idx < len(mtp_e3_trees)
                                 and pos < len(mtp_e3_trees[call_idx])
                                 and mtp_e3_trees[call_idx][pos] is not None):
@@ -281,21 +295,21 @@ def collect_union_tries(
                             m_parents, m_tokens = _flat_to_tree(mtp_call_eagle3s[pos])
                             proposer_trees["mtp"] = (m_tokens, m_parents)
 
-                # Draft model (flat chain → tree)
-                dm_d = (dm_drafts[global_pos + pos]
-                        if dm_drafts and (global_pos + pos) < len(dm_drafts)
-                        else [])
-                if dm_d:
-                    dm_parents, dm_tokens = _flat_to_tree(dm_d)
-                    proposer_trees["draft_model"] = (dm_tokens, dm_parents)
-
                 if not proposer_trees:
                     decoded.append(tokens[pos])
-                    suffix_cache.add_active_response(req_id, [tokens[pos]])
                     continue
 
-                flat_tokens, flat_parents, source_map = build_union_trie(
-                    proposer_trees)
+                # Context for p_t collection: ends at tokens[pos-1] so that
+                # logits at context[-1] predict tokens[pos], matching what
+                # tree depth-1 nodes predict.
+                context_for_pt = list(decoded)  # = tokens[0:pos]
+                if len(prompt) > 0:
+                    context = (
+                        np.concatenate(
+                            [prompt, np.array(context_for_pt, dtype=np.int32)])
+                        if context_for_pt else prompt.copy())
+                else:
+                    context = np.array(context_for_pt, dtype=np.int32)
 
                 per_proposer = {}
                 for name, (tids, pids) in proposer_trees.items():
@@ -304,34 +318,31 @@ def collect_union_tries(
                         "parents": pids,
                         "size": len(tids),
                     }
-                    # Include p_t from verification logits if available
                     if name == "eagle3" and eagle3_p_t is not None:
                         entry["p_t"] = eagle3_p_t
                     if name == "suffix":
-                        entry["score"] = float(suffix_score)
+                        entry["score"] = suffix_score
                     per_proposer[name] = entry
 
-                records.append({
+                record = {
                     "request_id": bfcl_id,
                     "call_idx": call_idx,
                     "step_idx": pos,
-                    "union_trie": {
-                        "token_ids": flat_tokens,
-                        "parents": flat_parents,
-                    },
-                    "source_map": source_map,
                     "per_proposer": per_proposer,
-                    # ground_truth_future: tokens[pos:] — all proposers predict from here
                     "ground_truth_future": list(future),
                     "context_token_ids": context.tolist(),
-                })
+                }
+                if include_union_trie:
+                    flat_tokens, flat_parents, source_map = build_union_trie(
+                        proposer_trees)
+                    record["union_trie"] = {
+                        "token_ids": flat_tokens,
+                        "parents": flat_parents,
+                    }
+                    record["source_map"] = source_map
+                records.append(record)
 
                 decoded.append(tokens[pos])
-                suffix_cache.add_active_response(req_id, [tokens[pos]])
-
-            suffix_cache.stop_request(req_id)
-            global_pos += N
-            req_id += 1
 
         if (ri + 1) % 10 == 0:
             print(f"  Processed {ri + 1}/{len(requests)} requests, "
@@ -340,75 +351,63 @@ def collect_union_tries(
     return records
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--agent-results", required=True,
-                        help="Path to agent_results.json")
-    parser.add_argument("--output", required=True,
-                        help="Output JSONL path for union trie data")
-    parser.add_argument("--exclude", default=None)
-    parser.add_argument("--mtp-agent-results", default=None,
-                        help="Path to MTP round agent_results.json (Round 2 replay)")
-    parser.add_argument("--draft-model-drafts", default=None,
-                        help="Path to draft_model_drafts.json")
-    parser.add_argument("--model", default=None,
-                        help="Target model name for tokenizer")
-    parser.add_argument("--responses", default=None,
-                        help="Path to agent_results_responses.json")
-    parser.add_argument("--dataset", default=None,
-                        help="Path to dataset.jsonl")
-    parser.add_argument("--train-ratio", type=float, default=0.0,
-                        help="Fraction for cache warmup (default: 0)")
-    args = parser.parse_args()
+def assemble_records_from_artifacts(
+    agent_results_path: str,
+    suffix_drafts_path: Optional[str] = None,
+    draft_model_drafts_path: Optional[str] = None,
+    mtp_agent_results_path: Optional[str] = None,
+    exclude_path: Optional[str] = None,
+    model: Optional[str] = None,
+    dataset_path: Optional[str] = None,
+    responses_path: Optional[str] = None,
+    include_union_trie: bool = True,
+) -> List[dict]:
+    """End-to-end loader: read Stage 1/3 artifacts, return per-step records.
 
-    from arctic_inference.suffix_decoding import SuffixDecodingCache
+    Mirrors the side effects of ``main()`` (tokenizer load, BFCL/SpecBench
+    prompt reconstruction, per-step JSONL loading, MTP extraction) and
+    produces the same per-step record list that Stage 4 would write.
+    When ``include_union_trie`` is False, records omit the ``union_trie``
+    and ``source_map`` fields so callers who only need per-proposer data
+    (e.g. ``UNION_TRIE=0`` path in run_tree_oracle_sim) can bypass the
+    Stage 4 build entirely.
+    """
+    exclude_ids = load_exclude_ids(exclude_path) if exclude_path else set()
 
-    exclude_ids = load_exclude_ids(args.exclude) if args.exclude else set()
-
-    print(f"Loading: {args.agent_results}", file=sys.stderr)
-    with open(args.agent_results) as f:
+    print(f"Loading: {agent_results_path}", file=sys.stderr)
+    with open(agent_results_path) as f:
         data = json.load(f)
 
-    dm_by_id = {}
-    if args.draft_model_drafts:
-        with open(args.draft_model_drafts) as f:
-            dm_data = json.load(f)
-        dm_by_id = {r["bfcl_id"]: r["drafts"] for r in dm_data["requests"]}
-        print(f"Draft model drafts: {len(dm_by_id)} requests", file=sys.stderr)
-
     tokenizer = None
-    if args.model:
+    if model:
         from transformers import AutoTokenizer
-        print(f"Loading tokenizer: {args.model}", file=sys.stderr)
-        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        print(f"Loading tokenizer: {model}", file=sys.stderr)
+        tokenizer = AutoTokenizer.from_pretrained(model)
 
-    bfcl_dataset = None
-    resp_by_id = None
-    specbench_dataset = None
-    if args.dataset and args.responses:
+    bfcl_dataset: Optional[dict] = None
+    resp_by_id: Optional[dict] = None
+    specbench_dataset: Optional[dict] = None
+    if dataset_path and responses_path:
         try:
             PROJECT_ROOT = Path(__file__).resolve().parents[2]
             sys.path.insert(0, str(PROJECT_ROOT))
-            sys.path.insert(0, str(PROJECT_ROOT / "bench"))
-            from bench.bfcl_agent import preprocess_bfcl_requests
+            from simulation.agents.bfcl_agent import preprocess_bfcl_requests
             entries = []
-            with open(args.dataset) as f:
+            with open(dataset_path) as f:
                 for line in f:
                     entries.append(json.loads(line))
             preprocess_bfcl_requests(entries)
             bfcl_dataset = {e["bfcl_id"]: e for e in entries}
-            with open(args.responses) as f:
+            with open(responses_path) as f:
                 resp_data = json.load(f)
             resp_by_id = {r["bfcl_id"]: r for r in resp_data}
         except Exception as e:
             print(f"WARN: BFCL prompt reconstruction failed: {e}",
                   file=sys.stderr)
-    elif args.dataset:
+    elif dataset_path:
         try:
             specbench_dataset = {}
-            with open(args.dataset) as f:
+            with open(dataset_path) as f:
                 for line in f:
                     entry = json.loads(line)
                     specbench_dataset[entry["question_id"]] = entry
@@ -416,68 +415,83 @@ def main():
             print(f"WARN: SpecBench dataset load failed: {e}",
                   file=sys.stderr)
 
-    all_requests = extract_requests(data, exclude_ids, dm_by_id,
-                                    tokenizer, bfcl_dataset, resp_by_id,
-                                    specbench_dataset)
+    all_requests = extract_requests(
+        data, exclude_ids, None,
+        tokenizer, bfcl_dataset, resp_by_id, specbench_dataset)
     print(f"Requests: {len(all_requests)}", file=sys.stderr)
 
-    # Load MTP round data if provided
+    suffix_by_key: Dict[Tuple[str, int, int], dict] = {}
+    if suffix_drafts_path:
+        print(f"Loading suffix drafts: {suffix_drafts_path}", file=sys.stderr)
+        suffix_by_key = load_per_step_drafts(suffix_drafts_path)
+        print(f"  {len(suffix_by_key)} suffix drafts", file=sys.stderr)
+
+    dm_by_key: Dict[Tuple[str, int, int], dict] = {}
+    if draft_model_drafts_path:
+        print(f"Loading draft-model drafts: {draft_model_drafts_path}",
+              file=sys.stderr)
+        dm_by_key = load_per_step_drafts(draft_model_drafts_path)
+        print(f"  {len(dm_by_key)} draft-model drafts", file=sys.stderr)
+
     mtp_all_requests = None
-    if args.mtp_agent_results:
-        print(f"Loading MTP data: {args.mtp_agent_results}", file=sys.stderr)
-        with open(args.mtp_agent_results) as f:
+    if mtp_agent_results_path:
+        print(f"Loading MTP data: {mtp_agent_results_path}", file=sys.stderr)
+        with open(mtp_agent_results_path) as f:
             mtp_data = json.load(f)
         mtp_all_requests = extract_requests(mtp_data, exclude_ids)
         print(f"MTP requests: {len(mtp_all_requests)}", file=sys.stderr)
 
-    # Train/test split
-    if args.train_ratio > 0:
-        from collections import defaultdict
-        by_cat = defaultdict(list)
-        for req in all_requests:
-            by_cat[req["category"]].append(req)
-        train_requests, test_requests = [], []
-        for cat in sorted(by_cat):
-            reqs = by_cat[cat]
-            n_train = int(len(reqs) * args.train_ratio)
-            train_requests.extend(reqs[:n_train])
-            test_requests.extend(reqs[n_train:])
-    else:
-        train_requests = []
-        test_requests = all_requests
-
-    cache = SuffixDecodingCache(max_tree_depth=64, max_cached_requests=100000)
-    if train_requests:
-        print(f"Warming up suffix cache with {len(train_requests)} requests...",
-              file=sys.stderr)
-        warmup_id = 0
-        for req in train_requests:
-            for call_idx in range(len(req["per_call_tokens"])):
-                tokens = req["per_call_tokens"][call_idx]
-                if not tokens:
-                    continue
-                prompt_ids_list = req.get("per_call_prompt_ids")
-                if prompt_ids_list and call_idx < len(prompt_ids_list):
-                    prompt = np.array(prompt_ids_list[call_idx], dtype=np.int32)
-                else:
-                    prompt = np.array([], dtype=np.int32)
-                cache.start_request(warmup_id, prompt)
-                cache.add_active_response(warmup_id, tokens)
-                cache.stop_request(warmup_id)
-                warmup_id += 1
-
-    # Filter MTP requests to match test set
-    mtp_test = None
-    if mtp_all_requests:
-        test_ids = {r["bfcl_id"] for r in test_requests}
-        mtp_test = [r for r in mtp_all_requests if r["bfcl_id"] in test_ids]
-        print(f"MTP test requests: {len(mtp_test)}", file=sys.stderr)
-
     t0 = time.time()
-    print(f"Collecting union tries for {len(test_requests)} requests...",
+    mode = "union tries" if include_union_trie else "per-proposer records"
+    print(f"Building {mode} for {len(all_requests)} requests...",
           file=sys.stderr)
-    records = collect_union_tries(test_requests, cache, mtp_requests=mtp_test)
+    records = collect_union_tries(
+        all_requests,
+        suffix_by_key=suffix_by_key,
+        dm_by_key=dm_by_key,
+        mtp_requests=mtp_all_requests,
+        include_union_trie=include_union_trie,
+    )
     elapsed = time.time() - t0
+    print(f"  assembled {len(records)} step records in {elapsed:.1f}s",
+          file=sys.stderr)
+    return records
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--agent-results", required=True,
+                        help="Path to agent_results_eagle3.json (Stage 1)")
+    parser.add_argument("--output", required=True,
+                        help="Output JSONL path for union trie data")
+    parser.add_argument("--suffix-drafts", default=None,
+                        help="Path to suffix_drafts.jsonl (Stage 3a)")
+    parser.add_argument("--draft-model-drafts", default=None,
+                        help="Path to draft_model_drafts.jsonl (Stage 3b)")
+    parser.add_argument("--mtp-agent-results", default=None,
+                        help="Path to agent_results_mtp.json (Stage 3c)")
+    parser.add_argument("--exclude", default=None)
+    parser.add_argument("--model", default=None,
+                        help="Target model name for tokenizer")
+    parser.add_argument("--responses", default=None,
+                        help="Path to agent_results_responses.json (BFCL)")
+    parser.add_argument("--dataset", default=None,
+                        help="Path to dataset.jsonl (BFCL/SpecBench)")
+    args = parser.parse_args()
+
+    records = assemble_records_from_artifacts(
+        agent_results_path=args.agent_results,
+        suffix_drafts_path=args.suffix_drafts,
+        draft_model_drafts_path=args.draft_model_drafts,
+        mtp_agent_results_path=args.mtp_agent_results,
+        exclude_path=args.exclude,
+        model=args.model,
+        dataset_path=args.dataset,
+        responses_path=args.responses,
+        include_union_trie=True,
+    )
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -487,13 +501,12 @@ def main():
 
     total_union_nodes = sum(
         len(r["union_trie"]["token_ids"]) for r in records)
-    proposer_counts = {}
+    proposer_counts: Dict[str, int] = {}
     for r in records:
         for name in r["per_proposer"]:
             proposer_counts[name] = proposer_counts.get(name, 0) + 1
 
-    print(f"\nDone in {elapsed:.1f}s", file=sys.stderr)
-    print(f"Steps: {len(records)}", file=sys.stderr)
+    print(f"\nSteps: {len(records)}", file=sys.stderr)
     print(f"Total union trie nodes: {total_union_nodes:,} "
           f"(avg {total_union_nodes / max(len(records), 1):.1f}/step)",
           file=sys.stderr)

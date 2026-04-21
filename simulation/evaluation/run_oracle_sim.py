@@ -7,7 +7,7 @@ the notebook can load without needing arctic_inference.
 Requires arctic_inference (run inside the container).
 
 Ported from agentic-bench/analysis/bfcl/run_oracle_sim.py for use with
-SGLang + GLM-4.7-Flash in the advance-spec project.
+SGLang in the advance-spec project.
 
 Usage:
   # GLM-4.7-Flash with SGLang-collected oracle data
@@ -1813,8 +1813,7 @@ def main():
         try:
             PROJECT_ROOT = Path(__file__).resolve().parents[2]
             sys.path.insert(0, str(PROJECT_ROOT))
-            sys.path.insert(0, str(PROJECT_ROOT / "bench"))
-            from bench.bfcl_agent import preprocess_bfcl_requests
+            from simulation.agents.bfcl_agent import preprocess_bfcl_requests
             entries = []
             with open(args.dataset) as f:
                 for line in f:

@@ -6,14 +6,14 @@ decoding mode (not oracle vanilla) to get real acceptance metrics.
 
 Usage:
     # Default configs (~45 min):
-    python3 scripts/bench_eagle3_configs.py \
+    python3 simulation/scripts/bench_eagle3_configs.py \
         --model Qwen/Qwen3-8B \
         --draft-model Tengyunw/qwen3_8b_eagle3 \
         --dataset data/specbench/dataset.jsonl \
         --output simulation/results/qwen3_8b/eagle3_bench.json
 
     # Custom configs:
-    python3 scripts/bench_eagle3_configs.py \
+    python3 simulation/scripts/bench_eagle3_configs.py \
         --model Qwen/Qwen3-8B \
         --draft-model Tengyunw/qwen3_8b_eagle3 \
         --dataset data/specbench/dataset.jsonl \

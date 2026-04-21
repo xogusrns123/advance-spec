@@ -456,7 +456,7 @@ def main() -> None:
         prompts = _make_dummy_prompts(5)
     else:
         try:
-            from ..analysis.collect_eagle3_drafts import load_dataset
+            from simulation.analysis.collect_eagle3_drafts import load_dataset
             prompts = load_dataset(config.dataset, config.max_samples)
         except Exception:
             print("Could not load dataset, using dummy prompts")

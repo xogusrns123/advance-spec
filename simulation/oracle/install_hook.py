@@ -182,6 +182,13 @@ def install_oracle_patch() -> None:
     )
 
 
+NEW_ORACLE_IMPORT = "from simulation.oracle.oracle_patch import patch_eagle_worker_full"
+OLD_ORACLE_IMPORT = (
+    "from hybrid_spec_decoding.sglang_integration.oracle_patch "
+    "import patch_eagle_worker_full"
+)
+
+
 def _inject_oracle_into_worker(worker_path: Path, worker_name: str) -> None:
     """Inject oracle patch call at the end of a worker's __init__."""
     if not worker_path.exists():
@@ -190,8 +197,18 @@ def _inject_oracle_into_worker(worker_path: Path, worker_name: str) -> None:
 
     text = worker_path.read_text()
 
-    if "oracle_patch" in text:
-        return  # already patched
+    # Migration: prior versions of the patch used the now-removed
+    # ``hybrid_spec_decoding.sglang_integration.oracle_patch`` import path.
+    # Rewrite it in place so older on-disk patches keep working after the
+    # module moved to simulation.oracle.
+    if OLD_ORACLE_IMPORT in text:
+        text = text.replace(OLD_ORACLE_IMPORT, NEW_ORACLE_IMPORT)
+        worker_path.write_text(text)
+        logger.info(f"Migrated oracle import path in {worker_path} ({worker_name})")
+        return
+
+    if NEW_ORACLE_IMPORT in text:
+        return  # already patched with current path
 
     # Ensure `from __future__ import annotations` so runtime type hints
     # (e.g. -> ModelRunner in TYPE_CHECKING block) don't raise NameError.
