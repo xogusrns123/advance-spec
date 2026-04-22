@@ -193,11 +193,18 @@ def process_request(
     all_turn_messages[0] = system_prompt_pre_processing_chat_model(
         all_turn_messages[0], functions, entry_id
     )
-    # Append efficiency instruction to system prompt
+    # Append efficiency instruction to system prompt. The second line counteracts
+    # Qwen3-14B's tendency to bail with 'I do not know' whenever the question
+    # references events after its knowledge cutoff — it must at least try a
+    # search before invoking the BFCL escape hatch.
     all_turn_messages[0][0]["content"] += (
         "\n\nIMPORTANT: Be efficient. Use the minimum number of function calls needed. "
         "Once you have enough information to answer, respond with the final answer immediately "
-        "instead of making additional searches. Do NOT over-verify or repeat similar queries."
+        "instead of making additional searches. Do NOT over-verify or repeat similar queries.\n"
+        "BUT: if the question references any entity, event, or fact that may be outside your "
+        "training data (including anything dated after your knowledge cutoff), you MUST attempt "
+        "at least one search_engine_query before responding. Do NOT answer "
+        "'I do not know' or 'I cannot answer this question' without first trying a search."
     )
     messages = []
     for turn_msgs in all_turn_messages:
@@ -334,7 +341,11 @@ def replay_request(
     all_turn_messages[0][0]["content"] += (
         "\n\nIMPORTANT: Be efficient. Use the minimum number of function calls needed. "
         "Once you have enough information to answer, respond with the final answer immediately "
-        "instead of making additional searches. Do NOT over-verify or repeat similar queries."
+        "instead of making additional searches. Do NOT over-verify or repeat similar queries.\n"
+        "BUT: if the question references any entity, event, or fact that may be outside your "
+        "training data (including anything dated after your knowledge cutoff), you MUST attempt "
+        "at least one search_engine_query before responding. Do NOT answer "
+        "'I do not know' or 'I cannot answer this question' without first trying a search."
     )
     messages = []
     for turn_msgs in all_turn_messages:

@@ -104,7 +104,9 @@ case $BENCHMARK in
     ;;
   bfcl_v4)
     AGENT_MODULE="simulation.agents.bfcl_v4_agent"
-    INPUT_FILE="data/bfcl_agent/dataset.jsonl"
+    # BFCL_V4_INPUT lets callers pre-filter the agent dataset (e.g. to web_search
+    # only) to avoid the prereq-dependency expansion that balloons num_requests.
+    INPUT_FILE="${BFCL_V4_INPUT:-data/bfcl_agent/dataset.jsonl}"
     DATASET_FLAG="--model $MODEL"
     MAX_ITER_FLAG="--max-iterations 5"
     TEMP_FLAG=""
@@ -120,7 +122,10 @@ case $BENCHMARK in
     AGENT_MODULE="simulation.agents.swebench_agent"
     INPUT_FILE="data/swebench/dataset.jsonl"
     DATASET_FLAG="--model $MODEL"
-    MAX_ITER_FLAG="--max-iterations 30 --repos-dir data/swebench/repos"
+    # SWE_MAX_ITER overrides the agent loop cap; 30 is the full SWE-Bench budget
+    # but an order of magnitude cheaper caps still produce enough trajectory
+    # data for oracle simulation at a fraction of the wall time.
+    MAX_ITER_FLAG="--max-iterations ${SWE_MAX_ITER:-30} --repos-dir data/swebench/repos"
     TEMP_FLAG="--temperature 0.0"
     ;;
   *)
@@ -227,10 +232,17 @@ echo ""
 echo "=== Stage 1: EAGLE3 Oracle Vanilla ==="
 
 NUM_GPUS=${NUM_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}
+MAX_TOKENS_FLAG=""
+# Only specbench_agent exposes --max-tokens as a CLI flag; bfcl/swebench agents
+# hard-code their own caps. Keep override scoped to specbench until agents
+# accept a unified flag.
+if [ -n "${MAX_TOKENS_OVERRIDE:-}" ] && [ "$BENCHMARK" = "specbench" ]; then
+  MAX_TOKENS_FLAG="--max-tokens $MAX_TOKENS_OVERRIDE"
+fi
 bash simulation/scripts/run_parallel_stage1.sh \
   "$INPUT_FILE" "$OUTPUT_DIR" "$MODEL" "$DRAFT_MODEL" \
   "$AGENT_MODULE" "$NUM_GPUS" \
-  $TEMP_FLAG $NUM_REQ_FLAG $MAX_ITER_FLAG
+  $TEMP_FLAG $NUM_REQ_FLAG $MAX_ITER_FLAG $MAX_TOKENS_FLAG
 
 # ============================================================
 # Stage 2: Extract Trajectory

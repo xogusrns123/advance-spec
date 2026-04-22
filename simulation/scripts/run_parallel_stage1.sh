@@ -69,7 +69,13 @@ print(f'Shard $SHARD_IDX (GPU $GPU_ID): {len(shard)} requests')
 import sys; sys.stdout.flush()
 "
 
-  # Launch server + agent in background
+  # Launch server + agent in background.
+  # --tool-call-parser qwen25: required for LangChain-based agents
+  # (swebench_agent) to receive OpenAI-format tool_calls. Without this,
+  # Qwen3 emits <tool_call>…</tool_call> XML that bind_tools() can't
+  # recognize, so the agent bails after 1 turn with no actions taken.
+  # bfcl_v4 has its own native-syntax parser and isn't affected, but the
+  # flag is harmless for it.
   (
     CUDA_VISIBLE_DEVICES=$GPU_ID python3 -m sglang.launch_server \
       --model-path "$MODEL" --tp-size 1 \
@@ -77,6 +83,7 @@ import sys; sys.stdout.flush()
       --speculative-num-steps $STAGE1_STEPS \
       --speculative-eagle-topk $STAGE1_TOPK \
       --speculative-num-draft-tokens $STAGE1_NUM_DRAFT_TOKENS \
+      --tool-call-parser qwen25 \
       --mem-fraction-static 0.85 --disable-cuda-graph --watchdog-timeout 600 \
       --host 0.0.0.0 --port $PORT > "$SHARD_DIR/server.log" 2>&1 &
     SRV_PID=$!
