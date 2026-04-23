@@ -394,8 +394,15 @@ echo ""
 echo "=== Stage 6: Oracle Simulation ==="
 
 LATENCY_FLAG=""
-if [ ! -f "$OUTPUT_DIR/latency_config.json" ] && [ -f "simulation/results/${MODEL_SHORT}/latency_config.json" ]; then
-  cp "simulation/results/${MODEL_SHORT}/latency_config.json" "$OUTPUT_DIR/latency_config.json"
+# Preferred location: simulation/config/latency/<preset>.json (committed).
+# Fallback: simulation/results/<preset>/latency_config.json (local-only,
+# from legacy measurement runs).
+if [ ! -f "$OUTPUT_DIR/latency_config.json" ]; then
+  if [ -f "simulation/config/latency/${MODEL_SHORT}.json" ]; then
+    cp "simulation/config/latency/${MODEL_SHORT}.json" "$OUTPUT_DIR/latency_config.json"
+  elif [ -f "simulation/results/${MODEL_SHORT}/latency_config.json" ]; then
+    cp "simulation/results/${MODEL_SHORT}/latency_config.json" "$OUTPUT_DIR/latency_config.json"
+  fi
 fi
 if [ -f "$OUTPUT_DIR/latency_config.json" ]; then
   LATENCY_FLAG="--latency-config $OUTPUT_DIR/latency_config.json"

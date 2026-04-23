@@ -1,0 +1,100 @@
+{
+  "vanilla_step_ms": 15.8752,
+  "target_forward_ms": {
+    "4": 15.8752,
+    "16": 16.0145,
+    "32": 17.0418,
+    "64": 21.105,
+    "128": 21.4282,
+    "256": 27.1555,
+    "512": 50.853
+  },
+  "eagle3_draft_ms": {
+    "4": 3.095,
+    "16": 3.068,
+    "32": 3.12,
+    "64": 3.085,
+    "128": 3.137,
+    "256": 3.108,
+    "512": 3.102
+  },
+  "eagle3_draft_ms_by_steps": {
+    "2": {
+      "4": 1.487,
+      "16": 1.4715,
+      "32": 1.465,
+      "64": 1.512,
+      "128": 1.484,
+      "256": 1.477
+    },
+    "4": {
+      "4": 3.095,
+      "16": 3.068,
+      "32": 3.12,
+      "64": 3.085,
+      "128": 3.137,
+      "256": 3.108,
+      "512": 3.102
+    },
+    "6": {
+      "4": 4.591,
+      "16": 4.674,
+      "32": 4.578,
+      "64": 4.607,
+      "128": 4.642,
+      "256": 4.662,
+      "512": 4.647
+    },
+    "8": {
+      "4": 6.303,
+      "16": 6.1375,
+      "32": 6.236,
+      "64": 6.1335,
+      "128": 6.125,
+      "256": 6.149,
+      "512": 6.131
+    }
+  },
+  "draft_lm_tpot_ms": 11.328,
+  "suffix_speculate_ms": 0.013,
+  "_metadata": {
+    "target_model": "Qwen/Qwen3-8B",
+    "draft_model": "Tengyunw/qwen3_8b_eagle3",
+    "draft_lm": "Qwen/Qwen3-0.6B",
+    "canonical_steps": 4,
+    "draft_ref_n": 3,
+    "available_steps": [
+      2,
+      4,
+      6,
+      8
+    ],
+    "available_budgets": [
+      4,
+      16,
+      32,
+      64,
+      128,
+      256,
+      512
+    ],
+    "aggregation": "median across workloads (+steps for target_forward_ms)",
+    "source_files": {
+      "eagle3_cost": "/workspace/simulation/results/latency/qwen3_8b/eagle3_cost.json",
+      "draft_model_cost": "/workspace/simulation/results/latency/qwen3_8b/draft_model_cost.json",
+      "suffix_cost": "/workspace/simulation/results/latency/qwen3_8b/suffix_cost.json"
+    }
+  },
+  "_detailed": {
+    "draft_lm_tpot_ms_by_n": {
+      "1": 32.227,
+      "3": 11.328,
+      "5": 9.769
+    },
+    "suffix_speculate_ms_by_workload": {
+      "specbench": 0.0095,
+      "bfcl_v4": 0.013,
+      "swebench": 0.0132
+    }
+  }
+}

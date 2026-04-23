@@ -1,0 +1,99 @@
+{
+  "vanilla_step_ms": 28.2332,
+  "target_forward_ms": {
+    "4": 28.2332,
+    "16": 28.8138,
+    "32": 33.208,
+    "64": 37.3568,
+    "128": 40.408,
+    "256": 50.82,
+    "512": 90.356
+  },
+  "eagle3_draft_ms": {
+    "4": 3.449,
+    "16": 3.459,
+    "32": 3.427,
+    "64": 3.476,
+    "128": 3.46,
+    "256": 3.4415,
+    "512": 3.465
+  },
+  "eagle3_draft_ms_by_steps": {
+    "2": {
+      "4": 1.818,
+      "16": 1.844,
+      "32": 1.8375,
+      "64": 1.843,
+      "128": 1.862,
+      "256": 1.8485
+    },
+    "4": {
+      "4": 3.449,
+      "16": 3.459,
+      "32": 3.427,
+      "64": 3.476,
+      "128": 3.46,
+      "256": 3.4415,
+      "512": 3.465
+    },
+    "6": {
+      "4": 4.96,
+      "16": 4.944,
+      "32": 5.01,
+      "64": 5.053,
+      "128": 5.037,
+      "256": 4.957,
+      "512": 5.0545
+    },
+    "8": {
+      "4": 6.561,
+      "16": 6.5205,
+      "32": 6.542,
+      "64": 6.588,
+      "128": 6.568,
+      "256": 6.568,
+      "512": 6.473
+    }
+  },
+  "draft_lm_tpot_ms": 11.328,
+  "suffix_speculate_ms": 0.0513,
+  "_metadata": {
+    "target_model": "Qwen/Qwen3-14B",
+    "draft_model": "AngelSlim/Qwen3-14B_eagle3",
+    "draft_lm": "Qwen/Qwen3-0.6B",
+    "canonical_steps": 4,
+    "draft_ref_n": 3,
+    "available_steps": [
+      2,
+      4,
+      6,
+      8
+    ],
+    "available_budgets": [
+      4,
+      16,
+      32,
+      64,
+      128,
+      256,
+      512
+    ],
+    "aggregation": "median across workloads (+steps for target_forward_ms)",
+    "source_files": {
+      "eagle3_cost": "/workspace/simulation/results/latency/qwen3_14b/eagle3_cost.json",
+      "draft_model_cost": "/workspace/simulation/results/latency/qwen3_14b/draft_model_cost.json",
+      "suffix_cost": "/workspace/simulation/results/latency/qwen3_14b/suffix_cost.json"
+    }
+  },
+  "_detailed": {
+    "draft_lm_tpot_ms_by_n": {
+      "1": 32.227,
+      "3": 11.328,
+      "5": 9.769
+    },
+    "suffix_speculate_ms_by_workload": {
+      "specbench": 0.0512,
+      "swebench": 0.0513
+    }
+  }
+}
