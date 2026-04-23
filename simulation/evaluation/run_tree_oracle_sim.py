@@ -1249,6 +1249,8 @@ def compute_latency_speedup(
     p_t_key: str = "p_t",
     enable_eu: bool = False,
     enable_union_trie: bool = True,
+    topk: Optional[int] = None,
+    steps: Optional[int] = None,
 ) -> dict:
     """Run step-by-step simulation for each budget with measured latencies.
 
@@ -1282,9 +1284,61 @@ def compute_latency_speedup(
     # --- Decomposed latencies ---
     # target_forward_ms[B]: pure target model verify cost for B tokens
     # eagle3_draft_ms[B]: EAGLE3 draft generation cost for B tokens
-    # Backward compat: derive from verify_latencies_ms if new keys absent
-    target_fwd = dict(latency_config.get("target_forward_ms", {}))
-    eagle3_draft = dict(latency_config.get("eagle3_draft_ms", {}))
+    #
+    # Topk-aware tables (new schema):
+    #   target_forward_ms_by_topk[K][B]
+    #   eagle3_draft_ms_by_topk_steps[K][S][B]
+    # When `topk` is supplied and the per-topk table exists, use it. Else
+    # fall back to the legacy flat tables (cross-topk median / canonical topk).
+    tfwd_by_topk = latency_config.get("target_forward_ms_by_topk", {}) or {}
+    e3draft_by_ts = latency_config.get("eagle3_draft_ms_by_topk_steps", {}) or {}
+
+    def _pick_topk_table(table_by_k: dict, label: str) -> dict:
+        if not table_by_k:
+            return {}
+        if topk is None:
+            return {}
+        key = str(int(topk))
+        if key in table_by_k:
+            return dict(table_by_k[key])
+        # Nearest-topk fallback
+        avail = sorted(int(k) for k in table_by_k.keys())
+        nearest = min(avail, key=lambda k: abs(k - int(topk)))
+        print(f"WARN: {label} has no topk={topk} entry; using nearest "
+              f"measured topk={nearest} (available={avail})", file=sys.stderr)
+        return dict(table_by_k[str(nearest)])
+
+    target_fwd = _pick_topk_table(tfwd_by_topk, "target_forward_ms_by_topk")
+    if not target_fwd:
+        target_fwd = dict(latency_config.get("target_forward_ms", {}))
+
+    eagle3_draft: dict = {}
+    if e3draft_by_ts and topk is not None:
+        key_k = str(int(topk))
+        if key_k not in e3draft_by_ts:
+            avail = sorted(int(k) for k in e3draft_by_ts.keys())
+            nearest = min(avail, key=lambda k: abs(k - int(topk)))
+            print(f"WARN: eagle3_draft_ms_by_topk_steps has no topk={topk}; "
+                  f"using nearest={nearest}", file=sys.stderr)
+            key_k = str(nearest)
+        per_steps = e3draft_by_ts.get(key_k, {}) or {}
+        if per_steps and steps is not None:
+            key_s = str(int(steps))
+            if key_s in per_steps:
+                eagle3_draft = dict(per_steps[key_s])
+            else:
+                avail_s = sorted(int(s) for s in per_steps.keys())
+                if avail_s:
+                    nearest_s = min(avail_s, key=lambda s: abs(s - int(steps)))
+                    print(f"WARN: eagle3_draft_ms_by_topk_steps[{key_k}] has "
+                          f"no steps={steps}; using nearest={nearest_s}",
+                          file=sys.stderr)
+                    eagle3_draft = dict(per_steps[str(nearest_s)])
+
+    if not eagle3_draft:
+        # Fall back to legacy flat table (canonical topk/steps from compile)
+        eagle3_draft = dict(latency_config.get("eagle3_draft_ms", {}))
+
     legacy_verify = latency_config.get("verify_latencies_ms",
                                        latency_config.get("eagle3_step_ms", {}))
 
@@ -1900,6 +1954,16 @@ def main():
                         help="Per-proposer draft cost in ms, e.g. "
                              "'eagle3=3.3,mtp=2.0,suffix=0.3'. "
                              "Multi-proposer methods use max() (parallel).")
+    parser.add_argument("--topk", type=int, default=None,
+                        help="EAGLE3 topk used for this Stage 1 run. "
+                             "When set, latency lookups pull from the "
+                             "per-topk tables in latency_config.json "
+                             "(target_forward_ms_by_topk / "
+                             "eagle3_draft_ms_by_topk_steps).")
+    parser.add_argument("--steps", type=int, default=None,
+                        help="EAGLE3 num_steps used for this Stage 1 run. "
+                             "Used together with --topk to pick the right "
+                             "eagle3_draft_ms table.")
     parser.add_argument("--print-summary", action="store_true")
     parser.add_argument("--enable-eu", action="store_true",
                         help="Enable EU Oracle (slow tree knapsack DP). "
@@ -1993,7 +2057,8 @@ def main():
 
     latency_results = compute_latency_speedup(
         records, budgets, latency_config, p_t_key=args.p_t_key,
-        enable_eu=args.enable_eu, enable_union_trie=enable_union_trie)
+        enable_eu=args.enable_eu, enable_union_trie=enable_union_trie,
+        topk=args.topk, steps=args.steps)
 
     if args.print_summary:
         print_summary(choose_one, {}, choose_one_budget,

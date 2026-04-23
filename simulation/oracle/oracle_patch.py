@@ -32,8 +32,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-ORACLE_LOG_PATH = Path("/tmp/sglang_oracle_vanilla.jsonl")
-ORACLE_TIMING_PATH = Path("/tmp/sglang_oracle_timing.jsonl")
+ORACLE_LOG_PATH = Path(
+    os.environ.get("SGLANG_ORACLE_LOG", "/tmp/sglang_oracle_vanilla.jsonl"))
+ORACLE_TIMING_PATH = Path(
+    os.environ.get("SGLANG_ORACLE_TIMING_LOG", "/tmp/sglang_oracle_timing.jsonl"))
 ORACLE_REPLAY_PATH = os.environ.get("SGLANG_ORACLE_REPLAY", "")
 ORACLE_DRAFT_BUDGET = os.environ.get("SGLANG_DRAFT_BUDGET", "")  # override draft token count
 ORACLE_VERIFY_TRIES_PATH = os.environ.get("SGLANG_ORACLE_VERIFY_TRIES", "")

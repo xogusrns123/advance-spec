@@ -19,7 +19,7 @@ Usage:
         --workloads specbench,bfcl_v4 \\
         --budgets 4,16,32,64,128,256,512 \\
         --steps 2,4,6,8 \\
-        --topk 16 \\
+        --topks 4,8,16 \\
         --output results/latency/eagle3_cost.json
 """
 
@@ -41,10 +41,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 from _workload_prompts import load_workload_prompts
 
 
-TIMING_LOG = Path("/tmp/sglang_oracle_timing.jsonl")
+TIMING_LOG = Path(
+    os.environ.get("SGLANG_ORACLE_TIMING_LOG", "/tmp/sglang_oracle_timing.jsonl"))
 
 
-def wait_for_server(url: str, timeout: int = 600) -> bool:
+def wait_for_server(url: str, timeout: int = 900) -> bool:
     import requests
     t0 = time.time()
     while time.time() - t0 < timeout:
@@ -76,13 +77,20 @@ def kill_server(proc: subprocess.Popen):
 
 
 def max_tree_capacity(topk: int, steps: int) -> int:
-    """Maximum tree node count possible at a (topk, steps) setting."""
-    total = 0
-    level = topk
-    for _ in range(steps):
-        total += level
-        level *= topk
-    return total
+    """Upper bound on the ``num_draft_tokens`` budget SGLang will accept for
+    a given (topk, steps) EAGLE3 run.
+
+    SGLang's ``organize_draft_results`` builds a score_pool of size
+    ``topk + (steps-1) * topk²`` and then asks for ``topk(score_pool,
+    num_draft_tokens - 1)``. If num_draft_tokens > score_pool + 1, torch.topk
+    raises ``RuntimeError: selected index k out of range`` and the scheduler
+    dies. So the actual budget ceiling is ``topk + (steps-1)*topk² + 1``.
+
+    (The naive "total descendants" count ``sum_{i=1..steps} topk^i`` is much
+    larger but isn't the limiting factor — SGLang never materializes the
+    deeper levels into the score pool.)
+    """
+    return topk + (steps - 1) * (topk ** 2) + 1
 
 
 def read_timing_window(
@@ -167,7 +175,12 @@ def main():
     parser.add_argument("--workloads", default="specbench,bfcl_v4,swebench")
     parser.add_argument("--budgets", default="4,16,32,64,128,256,512")
     parser.add_argument("--steps", default="2,4,6,8")
-    parser.add_argument("--topk", type=int, default=16)
+    parser.add_argument("--topk", type=int, default=None,
+                        help="Single topk (legacy). Ignored if --topks is set.")
+    parser.add_argument("--topks", default=None,
+                        help="Comma-separated topk sweep (e.g. '4,8,16'). "
+                             "Overrides --topk. Each row in the output "
+                             "carries its own topk.")
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--max-tokens", type=int, default=200,
                         help="Generation cap for both warmup and measurement calls")
@@ -180,6 +193,12 @@ def main():
     workloads = [w.strip() for w in args.workloads.split(",") if w.strip()]
     budgets = [int(b) for b in args.budgets.split(",")]
     steps_list = [int(s) for s in args.steps.split(",")]
+    if args.topks:
+        topks = [int(k) for k in args.topks.split(",") if k.strip()]
+    elif args.topk is not None:
+        topks = [int(args.topk)]
+    else:
+        topks = [16]
     url = f"http://localhost:{args.port}"
 
     # Load 2 prompts per workload
@@ -202,27 +221,33 @@ def main():
             with open(output_path) as f:
                 prev = json.load(f)
             if (prev.get("model") == args.model
-                    and prev.get("draft_model") == args.draft_model
-                    and prev.get("topk") == args.topk):
+                    and prev.get("draft_model") == args.draft_model):
                 for r in prev.get("results", []):
                     if "error" in r:
                         continue
-                    key = (r["workload"], r["budget"], r["steps"])
+                    # Prefer per-row topk (new schema). Fall back to file-level
+                    # topk (legacy) so old outputs can still be resumed under
+                    # the same topks grid.
+                    row_topk = r.get("topk", prev.get("topk"))
+                    if row_topk is None:
+                        continue
+                    key = (int(row_topk), r["workload"], r["budget"], r["steps"])
                     cached[key] = r
                 print(f"Resuming: {len(cached)} entries cached.", file=sys.stderr)
         except (json.JSONDecodeError, KeyError):
             pass
 
-    # Enumerate all (budget, steps) pairs with capacity check
-    bs_pairs: list[tuple[int, int]] = []
-    for B in budgets:
-        for S in steps_list:
-            cap = max_tree_capacity(args.topk, S)
-            if B > cap:
-                print(f"SKIP capacity: budget={B} > max_capacity(topk={args.topk},steps={S})={cap}",
-                      file=sys.stderr)
-                continue
-            bs_pairs.append((B, S))
+    # Enumerate all (topk, budget, steps) triples with capacity check
+    tbs_triples: list[tuple[int, int, int]] = []
+    for K in topks:
+        for B in budgets:
+            for S in steps_list:
+                cap = max_tree_capacity(K, S)
+                if B > cap:
+                    print(f"SKIP capacity: budget={B} > max_capacity(topk={K},steps={S})={cap}",
+                          file=sys.stderr)
+                    continue
+                tbs_triples.append((K, B, S))
 
     # Install hook (idempotent; ensures SGLang worker sources are patched)
     hook_env = os.environ.copy()
@@ -232,22 +257,25 @@ def main():
         env=hook_env, check=True)
 
     results: list[dict] = []
-    # Carry over cached entries in stable order (by input workload × bs_pair)
+    # Carry over cached entries in stable order (by input workload × triple)
     for w in workload_prompts:
-        for B, S in bs_pairs:
-            if (w, B, S) in cached:
-                results.append(cached[(w, B, S)])
+        for K, B, S in tbs_triples:
+            if (K, w, B, S) in cached:
+                results.append(cached[(K, w, B, S)])
 
     def _save_output():
         out = {
             "model": args.model,
             "draft_model": args.draft_model,
-            "topk": args.topk,
+            "topks": topks,
             "workloads": list(workload_prompts.keys()),
             "budgets": budgets,
             "steps": steps_list,
             "results": results,
         }
+        # Keep "topk" key only when a single value is swept (legacy readers).
+        if len(topks) == 1:
+            out["topk"] = topks[0]
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, "w") as f:
             json.dump(out, f, indent=2)
@@ -257,18 +285,18 @@ def main():
     timing_dir = output_path.parent / "timing_logs"
     timing_dir.mkdir(parents=True, exist_ok=True)
 
-    for pair_idx, (B, S) in enumerate(bs_pairs, 1):
-        # Skip entire (B, S) pair if every workload is already cached
-        all_cached = all((w, B, S) in cached for w in workload_prompts)
+    for pair_idx, (K, B, S) in enumerate(tbs_triples, 1):
+        # Skip entire (K, B, S) triple if every workload is already cached
+        all_cached = all((K, w, B, S) in cached for w in workload_prompts)
         if all_cached:
-            print(f"[{pair_idx}/{len(bs_pairs)}] budget={B} steps={S}: "
+            print(f"[{pair_idx}/{len(tbs_triples)}] topk={K} budget={B} steps={S}: "
                   f"all workloads cached — server skip",
                   file=sys.stderr)
             continue
 
         print("=" * 72, file=sys.stderr)
-        print(f"[{pair_idx}/{len(bs_pairs)}] budget={B} steps={S} "
-              f"topk={args.topk} cap={max_tree_capacity(args.topk, S)}",
+        print(f"[{pair_idx}/{len(tbs_triples)}] topk={K} budget={B} steps={S} "
+              f"cap={max_tree_capacity(K, S)}",
               file=sys.stderr)
         print("=" * 72, file=sys.stderr)
 
@@ -284,7 +312,7 @@ def main():
             "--speculative-algorithm", "EAGLE3",
             "--speculative-draft-model-path", args.draft_model,
             "--speculative-num-steps", str(S),
-            "--speculative-eagle-topk", str(args.topk),
+            "--speculative-eagle-topk", str(K),
             "--speculative-num-draft-tokens", str(B),
             "--mem-fraction-static", str(args.mem_fraction_static),
             "--disable-cuda-graph",
@@ -292,14 +320,17 @@ def main():
             "--host", "0.0.0.0", "--port", str(args.port),
         ] + args.extra_args
 
-        # Truncate the timing log for this (B, S) window
+        # Truncate the timing log for this (K, B, S) window
         try:
             TIMING_LOG.unlink(missing_ok=True)
         except TypeError:  # py<3.8 (unlikely here)
             if TIMING_LOG.exists():
                 TIMING_LOG.unlink()
 
-        log_path = Path(f"/tmp/sglang_eagle3_cost_b{B}_s{S}.log")
+        # Include port so parallel runs (e.g. 8B on :30000 + 14B on :30001)
+        # don't clobber each other's per-triple server logs under /tmp.
+        log_path = Path(
+            f"/tmp/sglang_eagle3_cost_p{args.port}_k{K}_b{B}_s{S}.log")
         log_fh = open(log_path, "w")
         proc = subprocess.Popen(cmd, env=env, stdout=log_fh, stderr=log_fh)
         try:
@@ -308,9 +339,9 @@ def main():
                 log_fh.close()
                 print(f"ERROR: server failed. See {log_path}", file=sys.stderr)
                 for w in workload_prompts:
-                    if (w, B, S) not in cached:
+                    if (K, w, B, S) not in cached:
                         results.append({
-                            "workload": w, "budget": B, "steps": S,
+                            "workload": w, "topk": K, "budget": B, "steps": S,
                             "error": "server_failed",
                         })
                 _save_output()
@@ -320,7 +351,7 @@ def main():
             client = OpenAI(base_url=f"{url}/v1", api_key="dummy")
 
             for w, prompts in workload_prompts.items():
-                if (w, B, S) in cached:
+                if (K, w, B, S) in cached:
                     continue
                 warmup_msgs = prompts[0]["messages"]
                 measure_msgs = prompts[1]["messages"]
@@ -343,7 +374,7 @@ def main():
                 except Exception as e:
                     print(f"  ERROR {w} measure failed: {e}", file=sys.stderr)
                     results.append({
-                        "workload": w, "budget": B, "steps": S,
+                        "workload": w, "topk": K, "budget": B, "steps": S,
                         "error": f"chat_failed: {e}",
                     })
                     _save_output()
@@ -353,9 +384,10 @@ def main():
                 summ = summarize_entries(window)
                 entry = {
                     "workload": w,
+                    "topk": K,
                     "budget": B,
                     "steps": S,
-                    "max_capacity": max_tree_capacity(args.topk, S),
+                    "max_capacity": max_tree_capacity(K, S),
                 }
                 entry.update(summ)
                 if "target_cost_ms" in summ and "draft_cost_ms" in summ and "step_ms" in summ:
@@ -374,7 +406,7 @@ def main():
             # Copy per-config raw timing log for post-hoc analysis
             if TIMING_LOG.exists():
                 try:
-                    shutil.copyfile(TIMING_LOG, timing_dir / f"b{B}_s{S}.jsonl")
+                    shutil.copyfile(TIMING_LOG, timing_dir / f"k{K}_b{B}_s{S}.jsonl")
                 except Exception as e:
                     print(f"  WARN: timing log copy failed: {e}", file=sys.stderr)
             time.sleep(3)

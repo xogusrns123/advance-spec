@@ -9,6 +9,17 @@ __pycache__/
 # Result Files
 results/
 
+# Exceptions: track the compiled latency-cost summaries so Stage 6 latency
+# configs stay reproducible from committed raw data. The per-step timing
+# dumps and run logs stay ignored (big and derivable).
+!simulation/results/
+simulation/results/*
+!simulation/results/latency/
+!simulation/results/latency/*/
+!simulation/results/latency/**/*.json
+simulation/results/latency/**/timing_logs/
+simulation/results/latency/_logs/
+
 # Data Files
 data/
 

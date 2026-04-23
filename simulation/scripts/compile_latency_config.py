@@ -5,9 +5,11 @@ scripts and emits a single config that ``run_tree_oracle_sim.py`` (Stage 6)
 consumes. Also emits richer ``_detailed`` nesting for analysis notebooks.
 
 Aggregation rules:
-  * target_forward_ms[B]   median across (workload, steps) — near steps-invariant
-  * eagle3_draft_ms[B]     median across workloads at --canonical-steps (default 4)
-  * eagle3_draft_ms_by_steps[S][B]  median across workloads per S
+  * target_forward_ms_by_topk[K][B]        median across (workload, steps) per (K, B)
+  * eagle3_draft_ms_by_topk_steps[K][S][B] median across workloads per (K, S, B)
+  * target_forward_ms[B]   — legacy flat: median across (workload, steps, topk)
+  * eagle3_draft_ms[B]     — legacy flat: at --canonical-steps & --canonical-topk
+  * eagle3_draft_ms_by_steps[S][B] — legacy flat: at --canonical-topk
   * draft_lm_tpot_ms       per_token_ms at --draft-ref-n (default 3)
                            from measure_draft_model_cost.json, median across workloads
   * suffix_speculate_ms    median across workloads
@@ -71,6 +73,9 @@ def main():
                    help="measure_suffix_cost.py output JSON (optional)")
     p.add_argument("--canonical-steps", type=int, default=4,
                    help="Steps value used for the flat eagle3_draft_ms table")
+    p.add_argument("--canonical-topk", type=int, default=16,
+                   help="Topk value used for the flat legacy tables. "
+                        "Only matters when the eagle3_cost.json has >1 topk.")
     p.add_argument("--draft-ref-n", type=int, default=3,
                    help="num_draft_tokens value used to derive per-token TPOT")
     p.add_argument("--vanilla-tpot-ms", type=float, default=None,
@@ -84,32 +89,72 @@ def main():
     if not eagle3_rows:
         sys.exit("ERROR: no rows in eagle3_cost file")
 
+    # Pull topk from row (new schema) or file-level (legacy). Default 16.
+    file_level_topk = eagle3.get("topk")
+
+    def _row_topk(r: dict) -> int:
+        if "topk" in r and r["topk"] is not None:
+            return int(r["topk"])
+        if file_level_topk is not None:
+            return int(file_level_topk)
+        return 16
+
+    # Stamp per-row topk for consistent downstream filtering.
+    for r in eagle3_rows:
+        if "error" in r:
+            continue
+        r.setdefault("topk", _row_topk(r))
+
     available_steps = sorted({int(r["steps"]) for r in eagle3_rows
                               if "steps" in r})
     available_budgets = sorted({int(r["budget"]) for r in eagle3_rows
                                 if "budget" in r})
-    print(f"eagle3_cost: {len(eagle3_rows)} rows, steps={available_steps}, "
-          f"budgets={available_budgets}", file=sys.stderr)
+    available_topks = sorted({int(r["topk"]) for r in eagle3_rows
+                              if "topk" in r})
+    print(f"eagle3_cost: {len(eagle3_rows)} rows, topks={available_topks}, "
+          f"steps={available_steps}, budgets={available_budgets}",
+          file=sys.stderr)
 
-    # Flat target_forward_ms[B] — median across (workload, steps) per budget
+    # Topk-aware tables
+    # target_forward_ms_by_topk[K][B] — median across (workload, steps) per (K, B)
+    target_forward_ms_by_topk: dict[str, dict[str, float]] = {}
+    for K in available_topks:
+        subset = _filter_rows(eagle3_rows, topk=K)
+        target_forward_ms_by_topk[str(K)] = _median_by_budget(
+            subset, "target_cost_ms")
+
+    # eagle3_draft_ms_by_topk_steps[K][S][B] — median across workloads per (K, S, B)
+    eagle3_draft_ms_by_topk_steps: dict[str, dict[str, dict[str, float]]] = {}
+    for K in available_topks:
+        per_step: dict[str, dict[str, float]] = {}
+        for S in available_steps:
+            subset = _filter_rows(eagle3_rows, topk=K, steps=S)
+            per_step[str(S)] = _median_by_budget(subset, "draft_cost_ms")
+        eagle3_draft_ms_by_topk_steps[str(K)] = per_step
+
+    # Legacy flat target_forward_ms[B] — median across (workload, steps, topk)
     target_forward_ms = _median_by_budget(eagle3_rows, "target_cost_ms")
 
-    # eagle3_draft_ms_by_steps[S][B] — median across workloads per (steps, B)
-    eagle3_draft_ms_by_steps: dict[str, dict[str, float]] = {}
-    for S in available_steps:
-        subset = _filter_rows(eagle3_rows, steps=S)
-        eagle3_draft_ms_by_steps[str(S)] = _median_by_budget(
-            subset, "draft_cost_ms")
+    # Canonical topk for legacy flat tables
+    canon_topk = args.canonical_topk
+    if canon_topk not in available_topks:
+        closest_k = min(available_topks, key=lambda k: abs(k - canon_topk))
+        print(f"WARN: canonical_topk={canon_topk} not measured; using closest={closest_k}",
+              file=sys.stderr)
+        canon_topk = closest_k
 
-    # Canonical flat eagle3_draft_ms[B] — from canonical_steps
+    # Legacy eagle3_draft_ms_by_steps[S][B] — at canonical topk
+    eagle3_draft_ms_by_steps = eagle3_draft_ms_by_topk_steps.get(
+        str(canon_topk), {})
+
+    # Canonical flat eagle3_draft_ms[B] — from canonical_steps at canonical_topk
     canon = args.canonical_steps
     if canon not in available_steps:
-        # Fall back to closest
         closest = min(available_steps, key=lambda s: abs(s - canon))
         print(f"WARN: canonical_steps={canon} not measured; using closest={closest}",
               file=sys.stderr)
         canon = closest
-    eagle3_draft_ms = eagle3_draft_ms_by_steps[str(canon)]
+    eagle3_draft_ms = eagle3_draft_ms_by_steps.get(str(canon), {})
 
     # Vanilla TPOT
     if args.vanilla_tpot_ms is not None:
@@ -170,6 +215,8 @@ def main():
         "target_forward_ms": target_forward_ms,
         "eagle3_draft_ms": eagle3_draft_ms,
         "eagle3_draft_ms_by_steps": eagle3_draft_ms_by_steps,
+        "target_forward_ms_by_topk": target_forward_ms_by_topk,
+        "eagle3_draft_ms_by_topk_steps": eagle3_draft_ms_by_topk_steps,
         "draft_lm_tpot_ms": draft_lm_tpot_ms,
         "suffix_speculate_ms": suffix_speculate_ms,
         "_metadata": {
@@ -177,7 +224,9 @@ def main():
             "draft_model": eagle3.get("draft_model"),
             "draft_lm": draft_lm_src,
             "canonical_steps": canon,
+            "canonical_topk": canon_topk,
             "draft_ref_n": args.draft_ref_n,
+            "available_topks": available_topks,
             "available_steps": available_steps,
             "available_budgets": available_budgets,
             "aggregation": "median across workloads (+steps for target_forward_ms)",
@@ -207,6 +256,7 @@ def main():
     print(f"vanilla_step_ms:      {vanilla_step_ms:.3f}", file=sys.stderr)
     print(f"draft_lm_tpot_ms:     {draft_lm_tpot_ms}", file=sys.stderr)
     print(f"suffix_speculate_ms:  {suffix_speculate_ms}", file=sys.stderr)
+    print(f"canonical_topk:       {canon_topk}", file=sys.stderr)
     print(f"canonical_steps:      {canon}", file=sys.stderr)
     print(f"{'budget':>7} | {'target_fwd_ms':>13} | {'e3_draft_ms':>12}",
           file=sys.stderr)
@@ -218,6 +268,15 @@ def main():
               f"{tfm if tfm is None else f'{tfm:>13.3f}'} | "
               f"{e3d if e3d is None else f'{e3d:>12.3f}'}",
               file=sys.stderr)
+
+    # Per-topk target_forward_ms preview
+    for K in available_topks:
+        tbl = target_forward_ms_by_topk.get(str(K), {})
+        if not tbl:
+            continue
+        print(f"\ntarget_forward_ms @ topk={K}:", file=sys.stderr)
+        for b in sorted(tbl.keys(), key=int):
+            print(f"  B={b:>4}  {tbl[b]:>7.3f} ms", file=sys.stderr)
     print(f"\nOutput: {args.output}", file=sys.stderr)
 
 

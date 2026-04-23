@@ -1,0 +1,56 @@
+{
+  "model": "Qwen/Qwen3-0.6B",
+  "workloads": [
+    "specbench",
+    "bfcl_v4"
+  ],
+  "num_draft_tokens": [
+    1,
+    3,
+    5
+  ],
+  "results": [
+    {
+      "workload": "specbench",
+      "num_draft_tokens": 1,
+      "n_actual_tokens": 1,
+      "total_ms": 70.108,
+      "per_token_ms": 70.108
+    },
+    {
+      "workload": "specbench",
+      "num_draft_tokens": 3,
+      "n_actual_tokens": 3,
+      "total_ms": 92.519,
+      "per_token_ms": 30.84
+    },
+    {
+      "workload": "specbench",
+      "num_draft_tokens": 5,
+      "n_actual_tokens": 5,
+      "total_ms": 132.174,
+      "per_token_ms": 26.435
+    },
+    {
+      "workload": "bfcl_v4",
+      "num_draft_tokens": 1,
+      "n_actual_tokens": 1,
+      "total_ms": 55.574,
+      "per_token_ms": 55.574
+    },
+    {
+      "workload": "bfcl_v4",
+      "num_draft_tokens": 3,
+      "n_actual_tokens": 3,
+      "total_ms": 97.58,
+      "per_token_ms": 32.527
+    },
+    {
+      "workload": "bfcl_v4",
+      "num_draft_tokens": 5,
+      "n_actual_tokens": 5,
+      "total_ms": 128.781,
+      "per_token_ms": 25.756
+    }
+  ]
+}
