@@ -1,0 +1,110 @@
+# ============================================================
+# Experiment identity
+# ============================================================
+name: example_qwen3_8b_sweep
+
+# ============================================================
+# Model preset(s). Scalar or list. List => sweep axis.
+# Each preset encodes (TARGET_MODEL, EAGLE3_DRAFT_MODEL, DRAFT_LM,
+# TP_SIZE, MEM_FRAC, TOOL_CALL_PARSER). Defaults:
+#   glm4_flash : zai-org/GLM-4.7-Flash / thoughtworks/GLM-4.7-Flash-Eagle3 / -
+#   qwen3_8b   : Qwen/Qwen3-8B        / AngelSlim/Qwen3-8B_eagle3  / Qwen/Qwen3-0.6B
+#   qwen3_14b  : Qwen/Qwen3-14B       / AngelSlim/Qwen3-14B_eagle3 / Qwen/Qwen3-0.6B
+#   qwen3_32b  : Qwen/Qwen3-32B       / Zhihu-ai/Zhi-Create-Qwen3-32B-Eagle3 / Qwen/Qwen3-0.6B
+#   llama3_8b  : meta-llama/Llama-3.1-8B-Instruct / yuhuili/EAGLE3-LLaMA3.1-Instruct-8B / meta-llama/Llama-3.2-1B-Instruct
+# Override any of these via the `models:` block below.
+# ============================================================
+model_preset: qwen3_8b
+
+# Optional model overrides (forwarded as env). Leave a field unset to
+# fall back to the preset default. Set only what needs to diverge.
+models:
+  # target_model: Qwen/Qwen3-8B
+  draft_model: AngelSlim/Qwen3-8B_eagle3     # EAGLE3 draft head
+  # draft_lm: Qwen/Qwen3-0.6B                 # Stage 3b small LM
+
+# ============================================================
+# Sweep axes (scalar or list).
+# ============================================================
+workloads: [specbench, bfcl_v4, swebench]
+
+# EAGLE3 tree depth (Stage 1).
+stage1_steps: [2, 4, 6, 8]
+
+# Paired (topk, num_draft_tokens, sim_budgets) — these three are strongly
+# coupled because EAGLE3 tree capacity = topk + (steps-1)*topk^2 + 1 caps
+# num_draft_tokens, and Stage 6 sim_budgets should not exceed the tree cap.
+# Each entry = one sweep value.
+stage1_configs:
+  - topk: 4
+    num_draft_tokens: 64
+    sim_budgets: [1, 2, 4, 8, 16, 32, 64]
+  - topk: 8
+    num_draft_tokens: 256
+    sim_budgets: [1, 2, 4, 8, 16, 32, 64, 128]
+  - topk: 16
+    num_draft_tokens: 256
+    sim_budgets: [1, 2, 4, 8, 16, 32, 64, 128]
+
+# ============================================================
+# Global defaults for per-workload fields (override in workload_overrides).
+# ============================================================
+defaults:
+  req_start: 0
+  req_end: 4
+  max_tokens_override: null    # specbench only
+  max_iterations: null         # bfcl_v3 / bfcl_v4 / swebench
+  input_file: null             # bfcl_v4 only (BFCL_V4_INPUT)
+
+# ============================================================
+# Per-workload overrides. Merged over `defaults` for each workload.
+# ============================================================
+workload_overrides:
+  specbench:
+    req_start: 0
+    req_end: 4
+    max_tokens_override: 1024
+
+  bfcl_v4:
+    req_start: 0
+    req_end: 10
+    input_file: data/bfcl_agent/dataset_small.jsonl
+    max_iterations: 5
+
+  swebench:
+    req_start: 0
+    req_end: 4
+    max_iterations: 10
+
+# ============================================================
+# Stage toggles.
+# ============================================================
+stages:
+  union_trie: false   # Stage 4 (collect_union_trie)
+  eu_oracle: false    # Stage 5 (collect p_t) + EU oracle in Stage 6
+                      # — requires union_trie: true.
+
+# ============================================================
+# Stage 3b (draft model) settings.
+# ============================================================
+stage3b:
+  max_draft_tokens: 16
+
+# ============================================================
+# Infrastructure.
+# ============================================================
+infra:
+  num_gpus: 4
+  gpu_ids: null        # null = 0..num_gpus-1. Or e.g. [0, 2, 3]
+  port: 30000
+  num_workers: 1
+
+# ============================================================
+# Output naming. `suffix_template` fields: {steps} {topk}
+# {num_draft_tokens} {workload} {preset} {req_start} {req_end}
+# Final dir: <root>/<preset>/<workload>_<suffix>[_req<start>-<end>]/
+# ============================================================
+output:
+  root: simulation/results
+  suffix_template: "steps{steps}_topk{topk}_b{num_draft_tokens}"
+  skip_if_exists: true     # skip run if <out_dir>/tree_oracle_sim.json present

@@ -56,7 +56,7 @@ python3 -m simulation.oracle.install_hook
 PIDS=()
 for SHARD_IDX in $(seq 0 $((NUM_GPUS - 1))); do
   GPU_ID=${GPU_LIST[$SHARD_IDX]}
-  PORT=$((30000 + SHARD_IDX))
+  PORT=$((${STAGE1_BASE_PORT:-30000} + SHARD_IDX))
   SHARD_DIR="$OUTPUT_DIR/_stage1_shard${SHARD_IDX}"
   mkdir -p "$SHARD_DIR"
 
@@ -76,6 +76,9 @@ import sys; sys.stdout.flush()
   # recognize, so the agent bails after 1 turn with no actions taken.
   # bfcl_v4 has its own native-syntax parser and isn't affected, but the
   # flag is harmless for it.
+  # Source .env so HF_TOKEN (for gated repos like Llama) is available
+  # to sglang's download path.
+  if [ -f /workspace/.env ]; then set -a; source /workspace/.env; set +a; fi
   (
     CUDA_VISIBLE_DEVICES=$GPU_ID python3 -m sglang.launch_server \
       --model-path "$MODEL" --tp-size 1 \
@@ -83,7 +86,7 @@ import sys; sys.stdout.flush()
       --speculative-num-steps $STAGE1_STEPS \
       --speculative-eagle-topk $STAGE1_TOPK \
       --speculative-num-draft-tokens $STAGE1_NUM_DRAFT_TOKENS \
-      --tool-call-parser qwen25 \
+      --tool-call-parser ${TOOL_CALL_PARSER:-qwen25} \
       --mem-fraction-static 0.85 --disable-cuda-graph --watchdog-timeout 600 \
       --host 0.0.0.0 --port $PORT > "$SHARD_DIR/server.log" 2>&1 &
     SRV_PID=$!

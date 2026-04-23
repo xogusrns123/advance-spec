@@ -332,6 +332,10 @@ def simulate_decoding(
     total_target_ms = 0.0 if real_step_cost_ms is not None else None
     total_draft_ms = 0.0 if real_step_cost_ms is not None else None
     total_target_tokens = 0 if real_step_cost_ms is not None else None
+    # Per-step ext_size distribution (for variance / box plots).
+    target_tokens_sq = 0 if real_step_cost_ms is not None else None
+    target_tokens_min = None
+    target_tokens_max = None
     total_time_real_always_ms = 0.0 if (real_step_cost_ms is not None and is_hybrid) else None
 
     total_generated = 0
@@ -567,6 +571,9 @@ def simulate_decoding(
                     total_target_ms += target_ms_step
                     total_draft_ms += real_step_draft_only_ms
                     total_target_tokens += ext_size
+                    target_tokens_sq += ext_size * ext_size
+                    if target_tokens_min is None or ext_size < target_tokens_min: target_tokens_min = ext_size
+                    if target_tokens_max is None or ext_size > target_tokens_max: target_tokens_max = ext_size
                     # For hybrid: the 'always' variant assumes draft every
                     # step (no suffix shortcut), so it still uses the flat
                     # fallback cost.
@@ -580,11 +587,17 @@ def simulate_decoding(
                         total_target_ms += sfx_cost_ms * 0.85   # rough split
                         total_draft_ms += sfx_cost_ms * 0.15
                         total_target_tokens += budget
+                        target_tokens_sq += budget * budget
+                        if target_tokens_min is None or budget < target_tokens_min: target_tokens_min = budget
+                        if target_tokens_max is None or budget > target_tokens_max: target_tokens_max = budget
                     else:
                         total_time_real_ms += real_step_cost_ms
                         total_target_ms += real_step_cost_ms * 0.85
                         total_draft_ms += real_step_cost_ms * 0.15
                         total_target_tokens += budget
+                        target_tokens_sq += budget * budget
+                        if target_tokens_min is None or budget < target_tokens_min: target_tokens_min = budget
+                        if target_tokens_max is None or budget > target_tokens_max: target_tokens_max = budget
                     if total_time_real_always_ms is not None:
                         total_time_real_always_ms += real_step_cost_ms
                 else:
@@ -598,6 +611,9 @@ def simulate_decoding(
                     # the breakdown.
                     total_target_ms += real_step_cost_ms
                     total_target_tokens += budget
+                    target_tokens_sq += budget * budget
+                    if target_tokens_min is None or budget < target_tokens_min: target_tokens_min = budget
+                    if target_tokens_max is None or budget > target_tokens_max: target_tokens_max = budget
 
             # Feed accepted tokens to suffix cache
             if suffix_cache is not None:
@@ -661,6 +677,9 @@ def simulate_decoding(
         result["total_target_ms"] = total_target_ms
         result["total_draft_ms"] = total_draft_ms
         result["total_target_tokens"] = total_target_tokens
+        result["total_target_tokens_sq"] = target_tokens_sq
+        result["total_target_tokens_min"] = target_tokens_min
+        result["total_target_tokens_max"] = target_tokens_max
     if total_time_real_always_ms is not None:
         result["speedup_real_always"] = (vanilla_time_ms / total_time_real_always_ms
                                          if total_time_real_always_ms > 0 else 1.0)
@@ -909,7 +928,8 @@ def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str,
                     base_proposer: str = "eagle3",
                     score_threshold: Optional[float] = None,
                     max_count: Optional[int] = None,
-                    pathprob_threshold: Optional[float] = None):
+                    pathprob_threshold: Optional[float] = None,
+                    pt_threshold: Optional[float] = None):
     """Extension: base proposer's tree (truncated to budget) + suffix extension
     at every node.
 
@@ -998,6 +1018,16 @@ def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str,
 
     allowed_nodes = None
 
+    # Trie-invariant children index: maps parent_idx → {token_id: child_idx}.
+    # Populated with the base tree first; suffix extensions then merge
+    # into this structure so that a (parent, token) pair never occurs
+    # twice in the extended tree (deduplicates base/suffix overlap).
+    children = {}
+    for i in range(len(ext_tids)):
+        p = ext_pids[i]
+        tok = ext_tids[i]
+        children.setdefault(p, {})[tok] = i
+
     for node_idx in range(n):
         if max_count is not None and len(ext_tids) >= max_count:
             break  # hit the overall tree-size cap before iterating this node
@@ -1034,17 +1064,32 @@ def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str,
             if path_p_t[node_idx] < pt_threshold:
                 continue
 
-        # Attach suffix chain to this node. With max_count, stop mid-attach
-        # once the cap is reached so total ext_tids never exceeds it.
-        offset = len(ext_tids)
+        # Attach suffix chain with dedup. Each draft token is checked
+        # against the current children[tree_parent] map; if the same
+        # token already exists under that parent (backbone or previously-
+        # merged suffix), reuse it — otherwise append. local_to_tree
+        # threads parent-index resolution for multi-token chains.
+        # Assumes draft.parents is topologically ordered (parent idx <
+        # child idx) — sglang's SuffixDecodingCache returns BFS.
+        local_to_tree = {}
         for j, (tid, pid) in enumerate(zip(draft.token_ids, draft.parents)):
-            if max_count is not None and len(ext_tids) >= max_count:
-                break
-            ext_tids.append(tid)
             if pid == -1:
-                ext_pids.append(node_idx)  # suffix root children → attach to node
+                tree_parent = node_idx
             else:
-                ext_pids.append(offset + pid)
+                tree_parent = local_to_tree.get(pid)
+                if tree_parent is None:
+                    break  # malformed draft — abort this chain
+            existing = children.get(tree_parent, {}).get(tid)
+            if existing is not None:
+                local_to_tree[j] = existing  # merge into existing node
+                continue
+            if max_count is not None and len(ext_tids) >= max_count:
+                break  # cap reached — stop adding new nodes
+            new_idx = len(ext_tids)
+            ext_tids.append(tid)
+            ext_pids.append(tree_parent)
+            children.setdefault(tree_parent, {})[tid] = new_idx
+            local_to_tree[j] = new_idx
 
     # Inline greedy walk that also tracks how many accepted steps reside
     # in the base portion (node_idx < n). Once the walk transitions into
@@ -1395,7 +1440,10 @@ def compute_latency_speedup(
             entry[f"{prefix}_always_speedup_real"] = sim["speedup_real_always"]
         # Cost/token breakdowns (per-run totals; per-step = total / steps).
         for k in ("total_time_real_ms", "total_target_ms",
-                  "total_draft_ms", "total_target_tokens"):
+                  "total_draft_ms", "total_target_tokens",
+                  "total_target_tokens_sq",
+                  "total_target_tokens_min",
+                  "total_target_tokens_max"):
             if k in sim:
                 entry[f"{prefix}_{k}"] = sim[k]
 

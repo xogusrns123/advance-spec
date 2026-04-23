@@ -60,38 +60,48 @@ fi
 # shard one server per GPU with TP=1, so new presets default to TP_SIZE=1.
 case $MODEL_PRESET in
   glm4_flash)
-    MODEL="zai-org/GLM-4.7-Flash"
-    DRAFT_MODEL="thoughtworks/GLM-4.7-Flash-Eagle3"
-    DRAFT_LM=""
+    MODEL="${MODEL:-zai-org/GLM-4.7-Flash}"
+    DRAFT_MODEL="${DRAFT_MODEL:-thoughtworks/GLM-4.7-Flash-Eagle3}"
+    DRAFT_LM="${DRAFT_LM:-}"
     TP_SIZE=4
     MEM_FRAC=0.8
     ;;
   qwen3_8b)
-    MODEL="Qwen/Qwen3-8B"
-    DRAFT_MODEL="Tengyunw/qwen3_8b_eagle3"
-    DRAFT_LM="Qwen/Qwen3-0.6B"
+    MODEL="${MODEL:-Qwen/Qwen3-8B}"
+    DRAFT_MODEL="${DRAFT_MODEL:-AngelSlim/Qwen3-8B_eagle3}"
+    DRAFT_LM="${DRAFT_LM:-Qwen/Qwen3-0.6B}"
     TP_SIZE=1
     MEM_FRAC=0.85
     ;;
   qwen3_14b)
-    MODEL="Qwen/Qwen3-14B"
-    DRAFT_MODEL="AngelSlim/Qwen3-14B_eagle3"
-    DRAFT_LM="Qwen/Qwen3-0.6B"
+    MODEL="${MODEL:-Qwen/Qwen3-14B}"
+    DRAFT_MODEL="${DRAFT_MODEL:-AngelSlim/Qwen3-14B_eagle3}"
+    DRAFT_LM="${DRAFT_LM:-Qwen/Qwen3-0.6B}"
     TP_SIZE=1
     MEM_FRAC=0.85
     ;;
   qwen3_32b)
-    MODEL="Qwen/Qwen3-32B"
-    DRAFT_MODEL="Zhihu-ai/Zhi-Create-Qwen3-32B-Eagle3"
-    DRAFT_LM="Qwen/Qwen3-0.6B"
+    MODEL="${MODEL:-Qwen/Qwen3-32B}"
+    DRAFT_MODEL="${DRAFT_MODEL:-Zhihu-ai/Zhi-Create-Qwen3-32B-Eagle3}"
+    DRAFT_LM="${DRAFT_LM:-Qwen/Qwen3-0.6B}"
     TP_SIZE=1
     MEM_FRAC=0.85
     ;;
+  llama3_8b)
+    MODEL="${MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
+    DRAFT_MODEL="${DRAFT_MODEL:-yuhuili/EAGLE3-LLaMA3.1-Instruct-8B}"
+    DRAFT_LM="${DRAFT_LM:-meta-llama/Llama-3.2-1B-Instruct}"
+    TP_SIZE=1
+    MEM_FRAC=0.85
+    export TOOL_CALL_PARSER=llama3
+    ;;
   *)
-    echo "Unknown model preset: $MODEL_PRESET (use glm4_flash, qwen3_8b, qwen3_14b, or qwen3_32b)"
+    echo "Unknown model preset: $MODEL_PRESET (use glm4_flash, qwen3_8b, qwen3_14b, qwen3_32b, or llama3_8b)"
     exit 1
     ;;
 esac
+# Qwen models use qwen25 parser; override via preset for non-Qwen.
+export TOOL_CALL_PARSER=${TOOL_CALL_PARSER:-qwen25}
 
 # --- Benchmark config ---
 case $BENCHMARK in
@@ -99,7 +109,7 @@ case $BENCHMARK in
     AGENT_MODULE="simulation.agents.bfcl_agent"
     INPUT_FILE="data/bfcl_multi_turn/dataset.jsonl"
     DATASET_FLAG="--model $MODEL"
-    MAX_ITER_FLAG="--max-iterations 5"
+    MAX_ITER_FLAG="--max-iterations ${BFCL_MAX_ITER:-5}"
     TEMP_FLAG="--temperature 0.0"
     ;;
   bfcl_v4)
@@ -108,7 +118,7 @@ case $BENCHMARK in
     # only) to avoid the prereq-dependency expansion that balloons num_requests.
     INPUT_FILE="${BFCL_V4_INPUT:-data/bfcl_agent/dataset.jsonl}"
     DATASET_FLAG="--model $MODEL"
-    MAX_ITER_FLAG="--max-iterations 5"
+    MAX_ITER_FLAG="--max-iterations ${BFCL_MAX_ITER:-5}"
     TEMP_FLAG=""
     ;;
   specbench)
@@ -284,7 +294,7 @@ if [ -n "$DRAFT_LM" ]; then
     "$OUTPUT_DIR/agent_results_eagle3.json" \
     "$OUTPUT_DIR/draft_model_drafts.jsonl" \
     "$DRAFT_LM" \
-    "$NUM_GPUS" 16 \
+    "$NUM_GPUS" "${STAGE3B_MAX_TOKENS:-16}" \
     $DM_DATASET_FLAG
   DM_FLAG="--draft-model-drafts $OUTPUT_DIR/draft_model_drafts.jsonl"
 else

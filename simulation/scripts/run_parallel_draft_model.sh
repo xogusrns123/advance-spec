@@ -55,7 +55,7 @@ echo "======================================"
 
 # Start SGLang servers (one per GPU)
 SRV_PIDS=()
-BASE_PORT=31000
+BASE_PORT=${STAGE3B_BASE_PORT:-31000}
 for SHARD_IDX in $(seq 0 $((NUM_GPUS - 1))); do
   GPU_ID=${GPU_LIST[$SHARD_IDX]}
   PORT=$((BASE_PORT + SHARD_IDX))

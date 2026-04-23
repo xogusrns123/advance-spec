@@ -104,7 +104,11 @@ simulation/                     --- Oracle simulation pipeline ---
     compute_agreement.py        Agreement score + correlation with correctness
     plot_results.py             Visualization (case distribution, depth curves, ...)
 
+  config/                       Experiment config files (YAML)
+    example.yaml                Sample sweep config — copy & edit to define a run
+
   scripts/                      Shell drivers + utility scripts
+    run_experiment.py           Config-driven sweep runner (reads simulation/config/*.yaml)
     run_pipeline.sh             Canonical end-to-end oracle pipeline (Stages 1-6)
     run_parallel_stage1.sh      Stage 1: multi-GPU EAGLE3 oracle vanilla
     run_parallel_draft_model.sh Stage 3b: multi-GPU SGLang draft-model proposals
@@ -331,7 +335,41 @@ bash simulation/scripts/run_pipeline.sh <benchmark> <model_preset> [num_requests
 ```
 
 - `benchmark`: `bfcl_v3` / `bfcl_v4` / `specbench` / `swebench`
-- `model_preset`: `glm4_flash` (GLM-4.7-Flash, TP=4) / `qwen3_8b` (Qwen3-8B, TP=1)
+- `model_preset`: `glm4_flash` (GLM-4.7-Flash, TP=4) / `qwen3_8b` (Qwen3-8B, TP=1) / `qwen3_14b` / `qwen3_32b` / `llama3_8b`
+
+### Config-driven Sweep (권장)
+
+복수 (workload × steps × topk × model) 조합을 한 번에 돌릴 때는 YAML config 한 파일만 편집하면 됨. 런너가 Cartesian product 로 전개 후 각 조합에 맞춰 env 세팅 + `run_pipeline.sh` 호출.
+
+```bash
+# 1. 템플릿 복사 + 편집
+cp simulation/config/example.yaml simulation/config/my_run.yaml
+vim simulation/config/my_run.yaml
+
+# 2. 미리보기 (sweep 전개, EAGLE3 capacity 검증만 수행)
+python3 simulation/scripts/run_experiment.py simulation/config/my_run.yaml --dry-run
+
+# 3. 실제 실행 (이미 결과가 있는 run 은 자동 skip)
+python3 simulation/scripts/run_experiment.py simulation/config/my_run.yaml
+```
+
+`simulation/config/example.yaml` 주요 필드:
+
+| 필드 | 타입 | 역할 |
+|---|---|---|
+| `model_preset` | str 또는 list | 모델 preset. list 면 sweep 축 |
+| `models.{target_model, draft_model, draft_lm}` | str | preset 기본값을 오버라이드 (예: `draft_model: AngelSlim/Qwen3-8B_eagle3`) |
+| `workloads` | list | `[specbench, bfcl_v4, swebench, bfcl_v3]` 중 선택 |
+| `stage1_steps` | list | EAGLE3 tree depth — sweep |
+| `stage1_configs[]` | list of dict | `(topk, num_draft_tokens, sim_budgets)` paired 엔트리 — sweep 값 1개 단위 |
+| `defaults` | dict | workload 공통 기본값 (`req_start`, `req_end`, …) |
+| `workload_overrides` | dict | workload별 맞춤값 (req 범위, `input_file`, `max_iterations`, `max_tokens_override`) |
+| `stages.union_trie` / `stages.eu_oracle` | bool | Stage 4/5 토글 (`UNION_TRIE` / `EU_ORACLE` env 와 동일) |
+| `stage3b.max_draft_tokens` | int | Stage 3b 생성 토큰 수 (기본 16) |
+| `infra.{num_gpus, gpu_ids, port, num_workers}` | — | 실행 환경 |
+| `output.{root, suffix_template, skip_if_exists}` | — | 출력 dir 패턴, 재실행 skip 정책 |
+
+**EAGLE3 capacity 자동 검증**: `num_draft_tokens ≤ topk + (steps-1)·topk² + 1` 조건 체크. 초과 조합은 INVALID 로 자동 skip (SGLang `organize_draft_results` crash 방지).
 
 ### Execution Toggles
 
