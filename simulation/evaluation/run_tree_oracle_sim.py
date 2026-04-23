@@ -326,6 +326,12 @@ def simulate_decoding(
     # Real-cost accumulators (use measured latencies)
     sfx_cost_ms = real_step_cost_suffix_ms if real_step_cost_suffix_ms is not None else vanilla_latency_ms
     total_time_real_ms = 0.0 if real_step_cost_ms is not None else None
+    # Breakdown: per-step (target_forward part, draft-only part, tokens
+    # fed to target forward = ext_size). Populated only when real-cost is
+    # computed via the dynamic ext_size path.
+    total_target_ms = 0.0 if real_step_cost_ms is not None else None
+    total_draft_ms = 0.0 if real_step_cost_ms is not None else None
+    total_target_tokens = 0 if real_step_cost_ms is not None else None
     total_time_real_always_ms = 0.0 if (real_step_cost_ms is not None and is_hybrid) else None
 
     total_generated = 0
@@ -390,14 +396,17 @@ def simulate_decoding(
                     rec, budget, suffix_cache, cache_req_id,
                     base_proposer="eagle3")
             elif method == "extension_oracle":
-                # Oracle: target verifies only the accepted path
-                # (accepted + 1 tokens), not the full extended tree.
-                # Upper bound on Extension if the "right" suffix chains
-                # could be chosen a priori.
+                # Oracle: full base tree still goes through target verify
+                # (EAGLE3 draft is always produced and loaded on GPU), but
+                # only the accepted suffix extension tokens are charged —
+                # i.e. "if the right suffix chain were known a priori, we
+                # would skip verifying the alternative suffix candidates".
+                #   ext_size_oracle = base_size + accepted_in_suffix
                 accepted, _ = _extension_step(
                     rec, budget, suffix_cache, cache_req_id,
                     base_proposer="eagle3")
-                ext_size = accepted + 1
+                ext_size = (_extension_step._last_base_size
+                            + _extension_step._last_accepted_suffix)
             elif method == "extension_dmsfx":
                 accepted, ext_size = _extension_step(
                     rec, budget, suffix_cache, cache_req_id,
@@ -406,17 +415,43 @@ def simulate_decoding(
                 accepted, _ = _extension_step(
                     rec, budget, suffix_cache, cache_req_id,
                     base_proposer="draft_model")
-                ext_size = accepted + 1
-            elif method == "extension_by_count":
-                # Total extended tree capped at budget. Suffix extensions
-                # stop growing once len(ext_tids) == budget.
+                ext_size = (_extension_step._last_base_size
+                            + _extension_step._last_accepted_suffix)
+            elif method.startswith("extension_by_count:"):
+                # Count cap = B × count_ratio (ratio > 1). Base tree stays
+                # at budget B; suffix extensions fill up to C = B × ratio.
+                ratio = float(method.split(":", 1)[1])
+                cap = max(1, int(round(budget * ratio)))
                 accepted, ext_size = _extension_step(
                     rec, budget, suffix_cache, cache_req_id,
-                    base_proposer="eagle3", max_count=budget)
-            elif method == "extension_dmsfx_by_count":
+                    base_proposer="eagle3", max_count=cap)
+            elif method.startswith("extension_dmsfx_by_count:"):
+                ratio = float(method.split(":", 1)[1])
+                cap = max(1, int(round(budget * ratio)))
                 accepted, ext_size = _extension_step(
                     rec, budget, suffix_cache, cache_req_id,
-                    base_proposer="draft_model", max_count=budget)
+                    base_proposer="draft_model", max_count=cap)
+            elif method.startswith("extension_by_count_score:"):
+                # Combo: count cap (C = B × ratio) + score filter.
+                _, rest = method.split(":", 1)
+                ratio_s, t_s = rest.split(":", 1)
+                ratio = float(ratio_s)
+                thr = float(t_s)
+                cap = max(1, int(round(budget * ratio)))
+                accepted, ext_size = _extension_step(
+                    rec, budget, suffix_cache, cache_req_id,
+                    base_proposer="eagle3", max_count=cap,
+                    score_threshold=thr)
+            elif method.startswith("extension_dmsfx_by_count_score:"):
+                _, rest = method.split(":", 1)
+                ratio_s, t_s = rest.split(":", 1)
+                ratio = float(ratio_s)
+                thr = float(t_s)
+                cap = max(1, int(round(budget * ratio)))
+                accepted, ext_size = _extension_step(
+                    rec, budget, suffix_cache, cache_req_id,
+                    base_proposer="draft_model", max_count=cap,
+                    score_threshold=thr)
             elif method.startswith("extension_by_score:"):
                 threshold = float(method.split(":", 1)[1])
                 accepted, ext_size = _extension_step(
@@ -427,6 +462,16 @@ def simulate_decoding(
                 accepted, ext_size = _extension_step(
                     rec, budget, suffix_cache, cache_req_id,
                     base_proposer="draft_model", score_threshold=threshold)
+            elif method.startswith("extension_by_pathprob:"):
+                t = float(method.split(":", 1)[1])
+                accepted, ext_size = _extension_step(
+                    rec, budget, suffix_cache, cache_req_id,
+                    base_proposer="eagle3", pathprob_threshold=t)
+            elif method.startswith("extension_by_pt:"):
+                t = float(method.split(":", 1)[1])
+                accepted, ext_size = _extension_step(
+                    rec, budget, suffix_cache, cache_req_id,
+                    base_proposer="eagle3", pt_threshold=t)
             elif method == "eu":
                 accepted = _eu_step(rec, budget, p_t_key)
             elif method.startswith("eu_pair:"):
@@ -516,9 +561,12 @@ def simulate_decoding(
                 # doesn't depend on ext_size.
                 if (ext_size is not None and real_step_target_fn is not None
                         and real_step_draft_only_ms is not None):
-                    step_real = (real_step_target_fn(ext_size)
-                                 + real_step_draft_only_ms)
+                    target_ms_step = real_step_target_fn(ext_size)
+                    step_real = target_ms_step + real_step_draft_only_ms
                     total_time_real_ms += step_real
+                    total_target_ms += target_ms_step
+                    total_draft_ms += real_step_draft_only_ms
+                    total_target_tokens += ext_size
                     # For hybrid: the 'always' variant assumes draft every
                     # step (no suffix shortcut), so it still uses the flat
                     # fallback cost.
@@ -529,15 +577,27 @@ def simulate_decoding(
                     # no dynamic cost wired in: use the flat fallback cost.
                     if used_suffix:
                         total_time_real_ms += sfx_cost_ms
+                        total_target_ms += sfx_cost_ms * 0.85   # rough split
+                        total_draft_ms += sfx_cost_ms * 0.15
+                        total_target_tokens += budget
                     else:
                         total_time_real_ms += real_step_cost_ms
+                        total_target_ms += real_step_cost_ms * 0.85
+                        total_draft_ms += real_step_cost_ms * 0.15
+                        total_target_tokens += budget
                     if total_time_real_always_ms is not None:
                         total_time_real_always_ms += real_step_cost_ms
                 else:
                     # single:eagle3, single:draft_model, union_trie, eu —
                     # flat real_step_cost_ms (verified size == B in all
-                    # these cases).
+                    # these cases). Approximate split from B-dependent
+                    # target_forward + draft_only (not tracked directly).
                     total_time_real_ms += real_step_cost_ms
+                    # Best-effort split: full B tokens to target, draft
+                    # portion unknown here so lump it into target for
+                    # the breakdown.
+                    total_target_ms += real_step_cost_ms
+                    total_target_tokens += budget
 
             # Feed accepted tokens to suffix cache
             if suffix_cache is not None:
@@ -597,6 +657,10 @@ def simulate_decoding(
     if total_time_real_ms is not None:
         result["speedup_real"] = (vanilla_time_ms / total_time_real_ms
                                   if total_time_real_ms > 0 else 1.0)
+        result["total_time_real_ms"] = total_time_real_ms
+        result["total_target_ms"] = total_target_ms
+        result["total_draft_ms"] = total_draft_ms
+        result["total_target_tokens"] = total_target_tokens
     if total_time_real_always_ms is not None:
         result["speedup_real_always"] = (vanilla_time_ms / total_time_real_always_ms
                                          if total_time_real_always_ms > 0 else 1.0)
@@ -844,7 +908,8 @@ def _union_trie_step(rec: dict, budget: int,
 def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str,
                     base_proposer: str = "eagle3",
                     score_threshold: Optional[float] = None,
-                    max_count: Optional[int] = None):
+                    max_count: Optional[int] = None,
+                    pathprob_threshold: Optional[float] = None):
     """Extension: base proposer's tree (truncated to budget) + suffix extension
     at every node.
 
@@ -857,12 +922,14 @@ def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str,
     with the actually-verified tree size, not just the EAGLE3 base budget).
 
     base_proposer: "eagle3" (default) or "draft_model".
-    score_threshold: if set, only attach the extension when the suffix
-        draft's ``.score`` is ≥ threshold (mirrors the hybrid score gating
-        semantics; used by ``extension_by_score:t`` methods).
-    max_count: if set, stop extending once ``len(ext_tids) >= max_count``
-        (target-verify budget cap; used by ``extension_by_count`` methods).
-        Unlike the base-tree budget, this caps the total extended tree.
+    Filtering strategies (pick one at a time; orthogonal to max_count):
+      score_threshold  — attach only if suffix ``draft.score >= t_score``.
+      pathprob_threshold — attach only if
+                         ``product(p_t along root→node) × draft.score >= t``
+                         (weights deeper nodes less since reaching them
+                         requires all ancestors to also be accepted).
+    max_count: overall extended-tree size cap (stops extending once
+        len(ext_tids) >= max_count). Combines with any filter above.
     """
     gt = rec.get("ground_truth_future", [])
     if not gt:
@@ -875,7 +942,9 @@ def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str,
     tids = base["token_ids"]
     pids = base["parents"]
 
-    # Truncate base tree to budget
+    # Base tree always truncated to budget. The count cap (max_count)
+    # is set by the caller; when max_count > budget, len(ext_tids) can
+    # grow beyond the base tree via suffix extensions (up to max_count).
     n = min(budget, len(tids))
     tids = tids[:n]
     pids = pids[:n]
@@ -900,24 +969,50 @@ def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str,
         path.reverse()
         paths[i] = path
 
-    # For every node, extend with suffix. Parameters match Stage 3a
-    # (collect_suffix_drafts) so both use ArcticInference's official
-    # tree-mode simulator with identical knobs:
-    #   use_tree_spec=True  → real branching tree, not linear chain
-    #   max_spec_tokens=256 → Stage 3a's default; previously 64 here, which
-    #                         undersized extension trees relative to the
-    #                         drafts actually recorded in suffix_drafts.jsonl
-    #   max_spec_factor=4.0 + min_token_prob=0.0 → aggressive exploration
+    # EAGLE3 draft-side path probability (root→node cumulative). Captured
+    # at Stage 1 by the oracle_patch organize_draft_results tracer, so it
+    # is available PRE-verify — realistic to use as a filter signal.
+    # Shape: list[n] with path_p_t[0] == 1.0 (root) and path_p_t[i] >= 0.
+    path_draft_p_t_raw = (base.get("path_draft_p_t")
+                          if isinstance(base, dict) else None)
+    if (path_draft_p_t_raw is not None
+            and len(path_draft_p_t_raw) < n):
+        path_draft_p_t_raw = None  # length mismatch → disable filter
+
+    # Derive per-edge p_t from path_draft_p_t via division by parent's
+    # cumulative: p_t[i] = path_p_t[i] / path_p_t[parent]. node_p_t stays
+    # None when draft-side p_t is unavailable (e.g. mango3 artifacts that
+    # predate the capture) — filters needing it are then skipped.
+    node_p_t = None
+    path_p_t = None
+    if path_draft_p_t_raw is not None:
+        path_p_t = [float(path_draft_p_t_raw[i] or 0.0) for i in range(n)]
+        node_p_t = [1.0] * n
+        for i in range(n):
+            parent = pids[i]
+            parent_path = path_p_t[parent] if parent >= 0 else 1.0
+            if parent_path > 1e-12:
+                node_p_t[i] = path_p_t[i] / parent_path
+            else:
+                node_p_t[i] = 0.0
+
+    allowed_nodes = None
+
     for node_idx in range(n):
         if max_count is not None and len(ext_tids) >= max_count:
             break  # hit the overall tree-size cap before iterating this node
 
+        if allowed_nodes is not None and node_idx not in allowed_nodes:
+            continue  # ptopk filter
+
         ext_context = np.array(base_context + paths[node_idx], dtype=np.int32)
+
+        max_spec = 256
 
         try:
             draft = suffix_cache.speculate(
                 cache_req_id, ext_context,
-                max_spec_tokens=256,
+                max_spec_tokens=max_spec,
                 max_spec_factor=4.0,
                 min_token_prob=0.0,
                 use_tree_spec=True,
@@ -927,10 +1022,17 @@ def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str,
 
         if not draft.token_ids:
             continue
-        if (score_threshold is not None
-                and getattr(draft, "score", 0.0) < score_threshold):
-            # extension_by_score: skip low-confidence matches
+        draft_score = float(getattr(draft, "score", 0.0))
+        if score_threshold is not None and draft_score < score_threshold:
             continue
+        if pathprob_threshold is not None and path_p_t is not None:
+            if draft_score * path_p_t[node_idx] < pathprob_threshold:
+                continue
+        if pt_threshold is not None and path_p_t is not None:
+            # EAGLE3 path_p_t alone (no suffix score multiplier) —
+            # "how likely to reach this node if earlier drafts are all accepted".
+            if path_p_t[node_idx] < pt_threshold:
+                continue
 
         # Attach suffix chain to this node. With max_count, stop mid-attach
         # once the cap is reached so total ext_tids never exceeds it.
@@ -944,7 +1046,38 @@ def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str,
             else:
                 ext_pids.append(offset + pid)
 
-    return greedy_tree_walk(ext_tids, ext_pids, gt), len(ext_tids)
+    # Inline greedy walk that also tracks how many accepted steps reside
+    # in the base portion (node_idx < n). Once the walk transitions into
+    # suffix (node_idx >= n), all subsequent accepts are suffix. Needed
+    # for the realistic oracle which charges full base + accepted suffix.
+    from collections import defaultdict as _dd
+    _children = _dd(list)
+    for _i, _p in enumerate(ext_pids):
+        _children[_p].append(_i)
+    _node = -1
+    _acc = 0
+    _acc_base = 0
+    for _t in gt:
+        _picked = None
+        for _c in _children.get(_node, []):
+            if ext_tids[_c] == _t:
+                _picked = _c
+                break
+        if _picked is None:
+            break
+        _acc += 1
+        if _picked < n:
+            _acc_base += 1
+        _node = _picked
+
+    # Stash the breakdown on the function so the oracle dispatch can use
+    # it (side-channel — avoids widening the return signature which many
+    # existing callers unpack as a 2-tuple).
+    _extension_step._last_base_size = n
+    _extension_step._last_ext_size_full = len(ext_tids)
+    _extension_step._last_accepted_base = _acc_base
+    _extension_step._last_accepted_suffix = _acc - _acc_base
+    return _acc, len(ext_tids)
 
 
 def _truncate_and_walk(tids, pids, p_t, gt, budget):
@@ -1144,7 +1277,14 @@ def compute_latency_speedup(
             return float(table[key])
         keys = sorted(int(k) for k in table.keys())
         if B <= keys[0]:
-            return float(table[str(keys[0])])
+            # Linear interpolation from (B=1, vanilla_ms) up to the
+            # smallest measured key. Previously this clamped to the
+            # smallest key which made suffix cost flat for tiny trees.
+            if B <= 1:
+                return fallback
+            v_at_small = float(table[str(keys[0])])
+            frac = (B - 1) / (keys[0] - 1)
+            return fallback + frac * (v_at_small - fallback)
         if B >= keys[-1]:
             if len(keys) >= 2:
                 k_hi, k_lo = keys[-1], keys[-2]
@@ -1253,6 +1393,11 @@ def compute_latency_speedup(
             entry[f"{prefix}_speedup_real"] = sim["speedup_real"]
         if "speedup_real_always" in sim:
             entry[f"{prefix}_always_speedup_real"] = sim["speedup_real_always"]
+        # Cost/token breakdowns (per-run totals; per-step = total / steps).
+        for k in ("total_time_real_ms", "total_target_ms",
+                  "total_draft_ms", "total_target_tokens"):
+            if k in sim:
+                entry[f"{prefix}_{k}"] = sim[k]
 
     if enable_eu and not enable_union_trie:
         print("WARN: enable_eu=True requires enable_union_trie=True; "
@@ -1446,16 +1591,35 @@ def compute_latency_speedup(
                   "real_step_target_fn": _target_forward,
                   "real_step_draft_only_ms": ext_draft_only},
                  "extension_oracle")
-            # Extension by count: total extended tree capped at budget B
-            # (suffix extensions stop once ext_tids reaches B).
-            _run("extension_by_count",
-                 {**common, "method": "extension_by_count",
-                  "suffix_cache": compute_latency_speedup._ext_cache,
-                  "real_step_cost_ms": ext_cost_fallback,
-                  "real_step_target_fn": _target_forward,
-                  "real_step_draft_only_ms": ext_draft_only},
-                 "extension_by_count")
-            for t in thresholds:
+            # Extension by count cap. Base tree stays at budget B; total
+            # tree (base + suffix extensions) capped at C = B × ratio.
+            # ratio must be > 1 to leave room for suffix beyond the base
+            # tree; ratio ≤ 1 degenerates to single:eagle3.
+            for r in [2, 4, 8]:
+                _run(f"extension_by_count:{r}",
+                     {**common, "method": f"extension_by_count:{r}",
+                      "suffix_cache": compute_latency_speedup._ext_cache,
+                      "real_step_cost_ms": ext_cost_fallback,
+                      "real_step_target_fn": _target_forward,
+                      "real_step_draft_only_ms": ext_draft_only},
+                     f"extension_by_count_r{r}")
+            # Combo: count cap (C = B × ratio) + score filter. Only
+            # attach suffix when suffix.score ≥ t, total tree still
+            # capped at C.
+            for r in [2, 4]:
+                for t in [1.0, 3.0, 10.0]:
+                    _run(f"extension_by_count_score:{r}:{t}",
+                         {**common,
+                          "method": f"extension_by_count_score:{r}:{t}",
+                          "suffix_cache": compute_latency_speedup._ext_cache,
+                          "real_step_cost_ms": ext_cost_fallback,
+                          "real_step_target_fn": _target_forward,
+                          "real_step_draft_only_ms": ext_draft_only},
+                         f"extension_by_count_score_r{r}_t{t}")
+            # Extended score threshold range: prior micro-analysis of
+            # extension_oracle showed 97%+ of winning suffix chains have
+            # score ≥ 20, so we probe higher thresholds too.
+            for t in thresholds + [25.0, 30.0, 35.0]:
                 _run(f"extension_by_score:{t}",
                      {**common, "method": f"extension_by_score:{t}",
                       "suffix_cache": compute_latency_speedup._ext_cache,
@@ -1463,6 +1627,44 @@ def compute_latency_speedup(
                       "real_step_target_fn": _target_forward,
                       "real_step_draft_only_ms": ext_draft_only},
                      f"extension_by_score_t{t:.1f}")
+            # p_t–based extension filters (eagle3 base only — require
+            # EAGLE3 draft-side path probabilities, captured at Stage 1 by
+            # the oracle_patch organize_draft_results tracer).
+            # Legacy artifacts (mango3 union_trie-based, no re-collection
+            # possible) don't carry path_draft_p_t → skip these methods.
+            has_draft_p_t = any(
+                (rec.get("per_proposer", {})
+                    .get("eagle3", {}) or {}).get("path_draft_p_t") is not None
+                for rec in records)
+            if not has_draft_p_t:
+                print("NOTE: no path_draft_p_t available — skipping "
+                      "ptopk/product/pathprob/topp/dynsfx methods",
+                      file=sys.stderr)
+
+            # pathprob: attach only when path_p_t × draft.score ≥ t
+            # (weights deeper nodes less — closer to Oracle's
+            # "accepted path only" ideal).
+            if has_draft_p_t:
+                for t in [0.001, 0.01, 0.05, 0.1, 0.3]:
+                    _run(f"extension_by_pathprob:{t}",
+                         {**common, "method": f"extension_by_pathprob:{t}",
+                          "suffix_cache": compute_latency_speedup._ext_cache,
+                          "real_step_cost_ms": ext_cost_fallback,
+                          "real_step_target_fn": _target_forward,
+                          "real_step_draft_only_ms": ext_draft_only},
+                         f"extension_by_pathprob_t{t}")
+            # by_pt: same idea without the suffix.score multiplier —
+            # "how likely is this node reached" alone, no suffix
+            # cache confidence involved.
+            if has_draft_p_t:
+                for t in [0.001, 0.005, 0.01, 0.05, 0.1, 0.3]:
+                    _run(f"extension_by_pt:{t}",
+                         {**common, "method": f"extension_by_pt:{t}",
+                          "suffix_cache": compute_latency_speedup._ext_cache,
+                          "real_step_cost_ms": ext_cost_fallback,
+                          "real_step_target_fn": _target_forward,
+                          "real_step_draft_only_ms": ext_draft_only},
+                         f"extension_by_pt_t{t}")
 
         # Extension with draft_model base + suffix extensions
         if "suffix" in proposers and "draft_model" in proposers:
@@ -1491,13 +1693,25 @@ def compute_latency_speedup(
                   "real_step_target_fn": _target_forward,
                   "real_step_draft_only_ms": ext_dm_draft_only},
                  "extension_dmsfx_oracle")
-            _run("extension_dmsfx_by_count",
-                 {**common, "method": "extension_dmsfx_by_count",
-                  "suffix_cache": compute_latency_speedup._ext_cache_dm,
-                  "real_step_cost_ms": ext_dm_cost_fallback,
-                  "real_step_target_fn": _target_forward,
-                  "real_step_draft_only_ms": ext_dm_draft_only},
-                 "extension_dmsfx_by_count")
+            for r in [2, 4, 8]:
+                _run(f"extension_dmsfx_by_count:{r}",
+                     {**common, "method": f"extension_dmsfx_by_count:{r}",
+                      "suffix_cache": compute_latency_speedup._ext_cache_dm,
+                      "real_step_cost_ms": ext_dm_cost_fallback,
+                      "real_step_target_fn": _target_forward,
+                      "real_step_draft_only_ms": ext_dm_draft_only},
+                     f"extension_dmsfx_by_count_r{r}")
+            # Combo: count cap + score filter (DM base).
+            for r in [2, 4]:
+                for t in [1.0, 3.0, 10.0]:
+                    _run(f"extension_dmsfx_by_count_score:{r}:{t}",
+                         {**common,
+                          "method": f"extension_dmsfx_by_count_score:{r}:{t}",
+                          "suffix_cache": compute_latency_speedup._ext_cache_dm,
+                          "real_step_cost_ms": ext_dm_cost_fallback,
+                          "real_step_target_fn": _target_forward,
+                          "real_step_draft_only_ms": ext_dm_draft_only},
+                         f"extension_dmsfx_by_count_score_r{r}_t{t}")
             for t in thresholds:
                 _run(f"extension_dmsfx_by_score:{t}",
                      {**common, "method": f"extension_dmsfx_by_score:{t}",

@@ -242,8 +242,11 @@ def collect_union_tries(
 
                 # EAGLE3: prefer full tree, else flat chain
                 eagle3_p_t = None
+                eagle3_path_draft_p_t = None
                 e3_trees = req.get("per_call_eagle3_trees")
                 e3_p_ts = req.get("per_call_eagle3_tree_p_ts")
+                e3_draft_p_ts = req.get(
+                    "per_call_eagle3_tree_path_draft_p_ts")
                 e3_attached = False
                 if e3_trees and call_idx < len(e3_trees):
                     call_trees = e3_trees[call_idx]
@@ -255,6 +258,11 @@ def collect_union_tries(
                             call_p_ts = e3_p_ts[call_idx]
                             if pos < len(call_p_ts) and call_p_ts[pos] is not None:
                                 eagle3_p_t = call_p_ts[pos]
+                        if e3_draft_p_ts and call_idx < len(e3_draft_p_ts):
+                            call_draft_p_ts = e3_draft_p_ts[call_idx]
+                            if (pos < len(call_draft_p_ts)
+                                    and call_draft_p_ts[pos] is not None):
+                                eagle3_path_draft_p_t = call_draft_p_ts[pos]
                 if not e3_attached:
                     e_draft = eagle3s[pos] if pos < len(eagle3s) else []
                     if e_draft:
@@ -320,6 +328,8 @@ def collect_union_tries(
                     }
                     if name == "eagle3" and eagle3_p_t is not None:
                         entry["p_t"] = eagle3_p_t
+                    if name == "eagle3" and eagle3_path_draft_p_t is not None:
+                        entry["path_draft_p_t"] = eagle3_path_draft_p_t
                     if name == "suffix":
                         entry["score"] = suffix_score
                     per_proposer[name] = entry

@@ -20,6 +20,8 @@ export STAGE1_TOPK=16
 export STAGE1_NUM_DRAFT_TOKENS=256
 export SWE_MAX_ITER=10
 export BFCL_V4_INPUT=data/bfcl_agent/dataset_memory_4.jsonl
+# Stage 6 budget cap — 256/512 were the long tail on qwen3_14b swebench.
+export SIM_BUDGETS=1,2,4,8,16,32,64,128
 
 LOG_DIR=/workspace/simulation/results/qwen3_14b/_pipeline_logs
 mkdir -p "$LOG_DIR"

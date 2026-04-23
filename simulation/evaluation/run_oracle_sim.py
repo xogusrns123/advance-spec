@@ -372,6 +372,7 @@ def _extract_entries(entries):
     call_eagle3s = []
     call_eagle3_trees = []
     call_eagle3_tree_p_ts = []
+    call_eagle3_tree_path_draft_p_ts = []
     call_mtp_trees = []
     for e in entries:
         toks = (e["tokens"][0]
@@ -382,8 +383,12 @@ def _extract_entries(entries):
             if e.get("eagle3") and e["eagle3"] else [])
         call_eagle3_trees.append(e.get("eagle3_tree"))
         call_eagle3_tree_p_ts.append(e.get("eagle3_tree_p_t"))
+        call_eagle3_tree_path_draft_p_ts.append(
+            e.get("eagle3_tree_path_draft_p_t"))
         call_mtp_trees.append(e.get("mtp_tree"))
-    return call_tokens, call_eagle3s, call_eagle3_trees, call_eagle3_tree_p_ts, call_mtp_trees
+    return (call_tokens, call_eagle3s, call_eagle3_trees,
+            call_eagle3_tree_p_ts, call_eagle3_tree_path_draft_p_ts,
+            call_mtp_trees)
 
 
 def _langchain_to_openai_messages(messages):
@@ -540,6 +545,7 @@ def _extract_bfcl(questions, exclude_ids, dm_by_id=None,
         per_call_eagle3s = []
         per_call_eagle3_trees = []
         per_call_eagle3_tree_p_ts = []
+        per_call_eagle3_tree_path_draft_p_ts = []
         per_call_mtp_trees = []
 
         for s in q["agent_metrics"]["steps"]:
@@ -547,11 +553,12 @@ def _extract_bfcl(questions, exclude_ids, dm_by_id=None,
                 "oracle_vanilla_entries", [])
             if not entries:
                 continue
-            ct, ce, c_trees, c_p_ts, c_mtp_trees = _extract_entries(entries)
+            ct, ce, c_trees, c_p_ts, c_draft_p_ts, c_mtp_trees = _extract_entries(entries)
             per_call_tokens.append(ct)
             per_call_eagle3s.append(ce)
             per_call_eagle3_trees.append(c_trees)
             per_call_eagle3_tree_p_ts.append(c_p_ts)
+            per_call_eagle3_tree_path_draft_p_ts.append(c_draft_p_ts)
             per_call_mtp_trees.append(c_mtp_trees)
 
         # Reconstruct prompt token IDs for suffix cache local tree
@@ -592,6 +599,10 @@ def _extract_bfcl(questions, exclude_ids, dm_by_id=None,
         has_p_ts = any(
             p is not None for pts in per_call_eagle3_tree_p_ts for p in pts
         )
+        has_draft_p_ts = any(
+            p is not None
+            for pts in per_call_eagle3_tree_path_draft_p_ts for p in pts
+        )
 
         req_data = {
             "bfcl_id": bfcl_id,
@@ -606,6 +617,9 @@ def _extract_bfcl(questions, exclude_ids, dm_by_id=None,
             req_data["per_call_eagle3_trees"] = per_call_eagle3_trees
         if has_p_ts:
             req_data["per_call_eagle3_tree_p_ts"] = per_call_eagle3_tree_p_ts
+        if has_draft_p_ts:
+            req_data["per_call_eagle3_tree_path_draft_p_ts"] = \
+                per_call_eagle3_tree_path_draft_p_ts
         has_mtp_trees = any(
             t is not None for trees in per_call_mtp_trees for t in trees
         )
@@ -640,6 +654,7 @@ def _extract_online(data, exclude_ids, dm_by_id=None,
             per_call_eagle3s = []
             per_call_eagle3_trees = []
             per_call_eagle3_tree_p_ts = []
+            per_call_eagle3_tree_path_draft_p_ts = []
             per_call_mtp_trees = []
 
             for turn in q["turns"]:
@@ -648,11 +663,12 @@ def _extract_online(data, exclude_ids, dm_by_id=None,
                         "oracle_vanilla_entries", [])
                     if not entries:
                         continue
-                    ct, ce, c_trees, c_p_ts, c_mtp_trees = _extract_entries(entries)
+                    ct, ce, c_trees, c_p_ts, c_draft_p_ts, c_mtp_trees = _extract_entries(entries)
                     per_call_tokens.append(ct)
                     per_call_eagle3s.append(ce)
                     per_call_eagle3_trees.append(c_trees)
                     per_call_eagle3_tree_p_ts.append(c_p_ts)
+                    per_call_eagle3_tree_path_draft_p_ts.append(c_draft_p_ts)
                     per_call_mtp_trees.append(c_mtp_trees)
 
             if not per_call_tokens:
@@ -685,6 +701,13 @@ def _extract_online(data, exclude_ids, dm_by_id=None,
             )
             if has_p_ts:
                 req_data["per_call_eagle3_tree_p_ts"] = per_call_eagle3_tree_p_ts
+            has_draft_p_ts = any(
+                p is not None
+                for pts in per_call_eagle3_tree_path_draft_p_ts for p in pts
+            )
+            if has_draft_p_ts:
+                req_data["per_call_eagle3_tree_path_draft_p_ts"] = \
+                    per_call_eagle3_tree_path_draft_p_ts
             has_mtp_trees = any(
                 t is not None for trees in per_call_mtp_trees for t in trees
             )
@@ -699,12 +722,13 @@ def _extract_online(data, exclude_ids, dm_by_id=None,
             if not entries:
                 continue
 
-            ct, ce, c_trees, c_p_ts, c_mtp_trees = _extract_entries(entries)
+            ct, ce, c_trees, c_p_ts, c_draft_p_ts, c_mtp_trees = _extract_entries(entries)
             qid = str(ri)
             category = q_map.get(qid, "") if ri < len(questions) else ""
 
             has_trees = any(t is not None for t in c_trees)
             has_p_ts = any(p is not None for p in c_p_ts)
+            has_draft_p_ts = any(p is not None for p in c_draft_p_ts)
             req_data = {
                 "bfcl_id": qid,
                 "category": category,
@@ -718,6 +742,8 @@ def _extract_online(data, exclude_ids, dm_by_id=None,
                 req_data["per_call_eagle3_trees"] = [c_trees]
             if has_p_ts:
                 req_data["per_call_eagle3_tree_p_ts"] = [c_p_ts]
+            if has_draft_p_ts:
+                req_data["per_call_eagle3_tree_path_draft_p_ts"] = [c_draft_p_ts]
             has_mtp_trees = any(t is not None for t in c_mtp_trees)
             if has_mtp_trees:
                 req_data["per_call_mtp_trees"] = [c_mtp_trees]

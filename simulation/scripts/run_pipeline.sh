@@ -424,7 +424,7 @@ fi
 
 python3 -m simulation.evaluation.run_tree_oracle_sim \
   "${SIM_INPUT_FLAGS[@]}" \
-  --budgets 1,2,4,8,16,32,64,128,256,512 \
+  --budgets "${SIM_BUDGETS:-1,2,4,8,16,32,64,128,256,512}" \
   --p-t-key "$PT_KEY" \
   --output "$OUTPUT_DIR/tree_oracle_sim.json" \
   "${METHOD_FLAGS[@]}" \

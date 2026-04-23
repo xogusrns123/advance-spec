@@ -290,6 +290,101 @@ def _extract_tree_p_t(
         return None
 
 
+def _extract_tree_path_draft_p_t(
+    path_probs: "torch.Tensor",
+    eagle3_tree: dict,
+    req_idx: int,
+) -> list | None:
+    """Per-tree-node cumulative path probability from the DRAFT model.
+
+    path_probs shape: (bs, num_draft). Each cell is the path probability
+    (product of per-edge conditional probs along root→node) that EAGLE3's
+    internal ranking produced. path_probs[req, 0] = 1.0 (root); for
+    positions 1..num_draft-1 it's the cumulative prob of the selected
+    tree node at that candidates position.
+
+    eagle3_tree["candidates_positions"][bfs_idx] tells us which candidates
+    position each BFS-ordered node occupies; we just look it up.
+    """
+    try:
+        cand_pos = eagle3_tree.get("candidates_positions")
+        if cand_pos is None:
+            return None
+        row = path_probs[req_idx]
+        n = len(eagle3_tree["token_ids"])
+        out = []
+        for i in range(n):
+            cp = cand_pos[i]
+            if cp < 0 or cp >= row.shape[0]:
+                out.append(0.0)
+            else:
+                out.append(float(row[cp].item()))
+        return out
+    except Exception:
+        return None
+
+
+def _install_draft_p_t_tracer() -> None:
+    """Monkey-patch organize_draft_results to stash the per-position path
+    probability tensor on the eagle_worker module.
+
+    SGLang's organize_draft_results selects the top-N candidate tree
+    positions by cumulative path probability. We compute those same
+    probabilities alongside, via torch.gather on the same flat score_list
+    concatenation, and stash them so patched_draft can use them per-request.
+    """
+    import sglang.srt.speculative.eagle_worker as ew_module
+    if getattr(ew_module, "_oracle_organize_traced", False):
+        return
+    original = ew_module.organize_draft_results
+
+    def traced(score_list, token_list, parents_list, num_draft_token):
+        import torch
+        try:
+            flat_scores = torch.cat(score_list, dim=1).flatten(1)  # (bs, total)
+        except Exception as e:
+            if not getattr(ew_module, "_oracle_tracer_logged_err1", False):
+                logger.warning(f"draft-p_t tracer: cat/flatten failed: {e}")
+                ew_module._oracle_tracer_logged_err1 = True
+            flat_scores = None
+        parent_list, top_scores_index, draft_tokens = original(
+            score_list, token_list, parents_list, num_draft_token)
+        # Compute per-candidate-position path prob:
+        # draft_tokens[req, i] corresponds to top_scores_index[req, i-1] for i >= 1
+        # (tree position 0 is the verified root, prob = 1.0).
+        try:
+            if flat_scores is not None:
+                path_probs = torch.gather(
+                    flat_scores, 1, top_scores_index)  # (bs, num_draft-1)
+                bs = path_probs.shape[0]
+                root_col = torch.ones(
+                    bs, 1, device=path_probs.device, dtype=path_probs.dtype)
+                path_probs_full = torch.cat([root_col, path_probs], dim=1)
+                ew_module._oracle_last_path_probs = \
+                    path_probs_full.detach().cpu().clone()
+                # Log the shape distribution across calls (each unique bs only once)
+                seen_bs = getattr(ew_module, "_oracle_tracer_seen_bs", set())
+                if bs not in seen_bs:
+                    seen_bs.add(bs)
+                    ew_module._oracle_tracer_seen_bs = seen_bs
+                    logger.info(
+                        f"draft-p_t tracer: saw bs={bs}, "
+                        f"path_probs shape={tuple(path_probs_full.shape)}, "
+                        f"row0[:5]={path_probs_full[0, :5].tolist()}")
+            else:
+                ew_module._oracle_last_path_probs = None
+        except Exception as e:
+            if not getattr(ew_module, "_oracle_tracer_logged_err2", False):
+                logger.warning(f"draft-p_t tracer: gather failed: {e}")
+                ew_module._oracle_tracer_logged_err2 = True
+            ew_module._oracle_last_path_probs = None
+        return parent_list, top_scores_index, draft_tokens
+
+    ew_module.organize_draft_results = traced
+    ew_module._oracle_organize_traced = True
+    logger.info("Installed EAGLE3 draft-p_t tracer on organize_draft_results")
+
+
 # ---------------------------------------------------------------------------
 # Main patch
 # ---------------------------------------------------------------------------
@@ -505,6 +600,7 @@ def _patch_draft_stash(eagle_worker: "EAGLEWorker", trie_feeder=None) -> None:
     replaced with the pre-built union trie after running the original draft
     (which is still needed for hidden state updates).
     """
+    _install_draft_p_t_tracer()
     original_draft = eagle_worker.draft
 
     def patched_draft(batch: "ScheduleBatch") -> "EagleVerifyInput":
@@ -513,6 +609,34 @@ def _patch_draft_stash(eagle_worker: "EAGLEWorker", trie_feeder=None) -> None:
         spec_info = original_draft(batch)
         _t_draft_end = _time.perf_counter()
         eagle_worker._oracle_last_draft_ms = (_t_draft_end - _t_draft_start) * 1000
+
+        # Pick up the draft-side path probs from organize_draft_results tracer
+        try:
+            import sglang.srt.speculative.eagle_worker as ew_module
+            pp = getattr(ew_module, "_oracle_last_path_probs", None)
+            eagle_worker._oracle_stashed_path_probs = pp
+            ew_module._oracle_last_path_probs = None  # consume
+            pp_shape = None if pp is None else tuple(pp.shape)
+            batch_bs = len(batch.reqs) if hasattr(batch, "reqs") else None
+            dt_numel = (spec_info.draft_token.numel()
+                        if getattr(spec_info, "draft_token", None) is not None
+                        else None)
+            num_draft = getattr(spec_info, "draft_token_num", None)
+            inferred_bs = (dt_numel // num_draft
+                           if dt_numel and num_draft else None)
+            seen_sigs = getattr(
+                eagle_worker, "_oracle_draft_stash_seen", set())
+            sig = (batch_bs, inferred_bs, pp_shape)
+            if sig not in seen_sigs:
+                seen_sigs.add(sig)
+                eagle_worker._oracle_draft_stash_seen = seen_sigs
+                logger.info(
+                    f"patched_draft: batch.reqs={batch_bs}, "
+                    f"inferred_bs={inferred_bs}, path_probs_shape={pp_shape}, "
+                    f"forward_mode={getattr(batch, 'forward_mode', None)}")
+        except Exception as e:
+            eagle_worker._oracle_stashed_path_probs = None
+            logger.warning(f"patched_draft: path-probs stash failed: {e}")
 
         # Verify-tries mode: replace draft tree with union trie
         if trie_feeder is not None:
@@ -791,6 +915,15 @@ def _patch_forward_log(
                     tree_p_t = _extract_tree_p_t(
                         verify_logits, draft_cpu, eagle3_tree, i, num_draft)
 
+                # Extract per-node draft-side cumulative path prob from the
+                # organize_draft_results tracer. This is available PRE-verify
+                # so filters using it are deployment-realistic.
+                tree_path_draft_p_t = None
+                path_probs = getattr(eagle_worker, "_oracle_stashed_path_probs", None)
+                if path_probs is not None and eagle3_tree is not None:
+                    tree_path_draft_p_t = _extract_tree_path_draft_p_t(
+                        path_probs, eagle3_tree, i)
+
                 proposer = getattr(eagle_worker, "_oracle_proposer_type", "eagle3")
                 entry = {
                     "eagle3": [req_draft],
@@ -806,6 +939,8 @@ def _patch_forward_log(
                     }
                 if tree_p_t is not None:
                     entry["eagle3_tree_p_t"] = tree_p_t
+                if tree_path_draft_p_t is not None:
+                    entry["eagle3_tree_path_draft_p_t"] = tree_path_draft_p_t
                 _log_entry(entry)
 
                 # Verify-tries mode: log p_t for union trie nodes
@@ -817,6 +952,7 @@ def _patch_forward_log(
 
             eagle_worker._oracle_stashed_draft = None
             eagle_worker._oracle_stashed_verify_logits = None
+            eagle_worker._oracle_stashed_path_probs = None
 
             # Log per-step timing (eagle3_draft + target_forward)
             draft_ms = getattr(eagle_worker, "_oracle_last_draft_ms", None)

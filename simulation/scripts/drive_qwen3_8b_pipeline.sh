@@ -24,6 +24,9 @@ export STAGE1_TOPK=16
 export STAGE1_NUM_DRAFT_TOKENS=256
 export MAX_TOKENS_OVERRIDE=1024
 export SWE_MAX_ITER=10
+# Stage 6 budget cap — 256/512 double the simulator runtime for no new
+# insight (all methods saturate before 128 on realistic draft-model cost).
+export SIM_BUDGETS=1,2,4,8,16,32,64,128
 
 LOG_DIR=/workspace/simulation/results/qwen3_8b/_pipeline_logs
 mkdir -p "$LOG_DIR"
