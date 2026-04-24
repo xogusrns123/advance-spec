@@ -1,28 +1,22 @@
-"""Merge per-step draft trees from multiple proposers into a union trie (Stage 4).
+"""Per-step record assembly library used by Stage 3 (oracle simulation).
 
-Consumes:
-  * --agent-results     : Stage 1 EAGLE3 output (provides EAGLE3 trees + prompts)
-  * --suffix-drafts     : Stage 3a output (per-step suffix trees)
-  * --draft-model-drafts: Stage 3b output (per-step draft-model chains)  [optional]
-  * --mtp-agent-results : Stage 3c output (MTP round agent_results)      [optional]
+The Stage 3 driver (``run_tree_oracle_sim.py``) calls
+``assemble_records_from_artifacts()`` to read Stage 1's
+``agent_results_eagle3.json`` plus Stage 2's ``draft_model_drafts.jsonl``
+and emit an in-memory list of per-step records ready for simulation. No
+union-trie file is written to disk — Stage 6 does live suffix speculate
+inside the simulator.
 
-For every decoding step it emits one JSONL record with the merged union
-trie, per-proposer sub-trees, context_token_ids (needed by Stage 5), and
-the ground-truth future suffix.
-
-Usage:
-    python3 -m simulation.pipeline.collect_union_trie \\
-        --agent-results results/.../agent_results_eagle3.json \\
-        --suffix-drafts results/.../suffix_drafts.jsonl \\
-        --draft-model-drafts results/.../draft_model_drafts.jsonl \\
-        --mtp-agent-results results/.../agent_results_mtp.json \\
-        --output simulation/results/.../union_trie_data.jsonl \\
-        --model zai-org/GLM-4.7-Flash
+Historical artifacts from prior pipeline runs (``union_trie_data.jsonl``)
+are NOT produced or consumed any more; ``build_union_trie`` is still
+exported because ``collect_union_tries`` uses it internally to construct
+the per-record ``union_trie`` / ``source_map`` fields when
+``include_union_trie=True`` (legacy mode retained for one-off tooling —
+the default is ``False``).
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import sys
 import time
@@ -31,7 +25,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from simulation.evaluation.run_oracle_sim import (
+from simulation.pipeline._agent_io import (
     _flat_to_tree,
     extract_requests,
     load_exclude_ids,
@@ -468,62 +462,3 @@ def assemble_records_from_artifacts(
     return records
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--agent-results", required=True,
-                        help="Path to agent_results_eagle3.json (Stage 1)")
-    parser.add_argument("--output", required=True,
-                        help="Output JSONL path for union trie data")
-    parser.add_argument("--suffix-drafts", default=None,
-                        help="Path to suffix_drafts.jsonl (Stage 3a)")
-    parser.add_argument("--draft-model-drafts", default=None,
-                        help="Path to draft_model_drafts.jsonl (Stage 3b)")
-    parser.add_argument("--mtp-agent-results", default=None,
-                        help="Path to agent_results_mtp.json (Stage 3c)")
-    parser.add_argument("--exclude", default=None)
-    parser.add_argument("--model", default=None,
-                        help="Target model name for tokenizer")
-    parser.add_argument("--responses", default=None,
-                        help="Path to agent_results_responses.json (BFCL)")
-    parser.add_argument("--dataset", default=None,
-                        help="Path to dataset.jsonl (BFCL/SpecBench)")
-    args = parser.parse_args()
-
-    records = assemble_records_from_artifacts(
-        agent_results_path=args.agent_results,
-        suffix_drafts_path=args.suffix_drafts,
-        draft_model_drafts_path=args.draft_model_drafts,
-        mtp_agent_results_path=args.mtp_agent_results,
-        exclude_path=args.exclude,
-        model=args.model,
-        dataset_path=args.dataset,
-        responses_path=args.responses,
-        include_union_trie=True,
-    )
-
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w") as f:
-        for rec in records:
-            f.write(json.dumps(rec) + "\n")
-
-    total_union_nodes = sum(
-        len(r["union_trie"]["token_ids"]) for r in records)
-    proposer_counts: Dict[str, int] = {}
-    for r in records:
-        for name in r["per_proposer"]:
-            proposer_counts[name] = proposer_counts.get(name, 0) + 1
-
-    print(f"\nSteps: {len(records)}", file=sys.stderr)
-    print(f"Total union trie nodes: {total_union_nodes:,} "
-          f"(avg {total_union_nodes / max(len(records), 1):.1f}/step)",
-          file=sys.stderr)
-    for name, count in sorted(proposer_counts.items()):
-        print(f"  {name}: {count} steps with drafts", file=sys.stderr)
-    print(f"Output: {args.output}", file=sys.stderr)
-
-
-if __name__ == "__main__":
-    main()

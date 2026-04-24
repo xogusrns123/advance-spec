@@ -1,13 +1,14 @@
 """Side experiment — suffix-driven trajectory counterfactual accept dump.
 
-For every request in Stage 1 (EAGLE3 oracle-vanilla) + Stage 3a artifacts,
-walk the decoding steps with advancement driven by ``single:suffix``'s
-accept count (``step += suffix_acc + 1``). At each visited step, measure
-the *counterfactual* accept length each of the following methods would
+For every request in Stage 1 (EAGLE3 oracle-vanilla) artifacts, walk the
+decoding steps with advancement driven by ``single:suffix``'s accept
+count (``step += suffix_acc + 1``). At each visited step, measure the
+*counterfactual* accept length each of the following methods would
 produce **at that same step_idx context**:
 
   * ``eagle3``   — budget-truncated EAGLE3 tree, greedy walk vs gt.
   * ``suffix``   — full suffix tree (never budget-truncated), greedy walk.
+                   Drawn live from ``SuffixDecodingCache.speculate()``.
   * ``extension`` — EAGLE3 base (budget-truncated) + suffix extensions at
                     every anchor node including root (node_idx=0). Returns
                     a (backbone, extension) accept split via the existing
@@ -18,12 +19,11 @@ Per-step rows are dumped to a new JSONL. The notebook
 ``simulation/notebooks/side_suffix_trajectory.ipynb`` consumes it.
 
 This script NEVER writes to ``tree_oracle_sim.json`` or any other existing
-Stage 6 output. Output directory is ``simulation/results/side_suffix_trajectory/``.
+pipeline output. Output directory is ``simulation/results/side_suffix_trajectory/``.
 
 Usage:
     python3 -m simulation.evaluation.run_side_suffix_trajectory \\
         --agent-results simulation/results/qwen3_8b/bfcl_v4/agent_results_eagle3.json \\
-        --suffix-drafts simulation/results/qwen3_8b/bfcl_v4/suffix_drafts.jsonl \\
         --model Qwen/Qwen3-8B \\
         --budget 64 \\
         --output simulation/results/side_suffix_trajectory/qwen3_8b/bfcl_v4/B64/per_step.jsonl
@@ -46,6 +46,7 @@ from simulation.evaluation.run_tree_oracle_sim import (
     _extension_step,
     _proposer_tree_walk,
 )
+from simulation.evaluation.tree_knapsack import greedy_tree_walk
 
 
 def _group_by_request(records):
@@ -79,9 +80,27 @@ def _walk_tree_size(per_proposer: dict, name: str, budget: int) -> int:
     tids = tree.get("token_ids") or []
     if not tids:
         return 0
-    if name == "suffix":
-        return len(tids)  # suffix is never budget-truncated
     return min(budget, len(tids))
+
+
+def _live_suffix_walk(cache, cache_req_id, context, gt):
+    """Live suffix counterfactual: speculate on the given context and
+    greedy-walk against ground truth. Returns (accepted, tree_size)."""
+    ctx_np = np.asarray(context, dtype=np.int32)
+    try:
+        draft = cache.speculate(
+            cache_req_id, ctx_np,
+            max_spec_tokens=256, max_spec_factor=4.0,
+            min_token_prob=0.0, use_tree_spec=True,
+        )
+    except Exception:
+        return 0, 0
+    if not draft.token_ids:
+        return 0, 0
+    tids = list(draft.token_ids)
+    pids = list(draft.parents)
+    acc = greedy_tree_walk(tids, pids, gt)
+    return acc, len(tids)
 
 
 def _collect_per_step(records, budget: int, *, verify: bool = False):
@@ -128,10 +147,11 @@ def _collect_per_step(records, budget: int, *, verify: bool = False):
                     per_proposer, "eagle3", gt, budget)
                 e_size = _walk_tree_size(per_proposer, "eagle3", budget)
 
-                # suffix counterfactual (drives trajectory)
-                s_acc = _proposer_tree_walk(
-                    per_proposer, "suffix", gt, budget)
-                s_size = _walk_tree_size(per_proposer, "suffix", budget)
+                # suffix counterfactual (drives trajectory).
+                # Drawn live from the shared SuffixDecodingCache so state
+                # matches what _extension_step observes for this step.
+                ctx = rec.get("context_token_ids") or []
+                s_acc, s_size = _live_suffix_walk(cache, seq_req_id, ctx, gt)
 
                 # extension (eagle3 backbone + suffix extensions at every
                 # anchor node including root). Uses live SuffixDecodingCache.
@@ -166,7 +186,7 @@ def _collect_per_step(records, budget: int, *, verify: bool = False):
                 stats["n_steps_visited"] += 1
 
                 # Warm cache with committed gt tokens. Feed one-at-a-time
-                # to match Stage 3a's collect_suffix_drafts semantics.
+                # to mirror the per-step cache accumulation used by Stage 3.
                 for t in gt[:commit]:
                     cache.add_active_response(seq_req_id, [int(t)])
 
@@ -211,8 +231,6 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--agent-results", required=True,
                         help="Stage 1 EAGLE3 oracle-vanilla JSON path.")
-    parser.add_argument("--suffix-drafts", required=True,
-                        help="Stage 3a suffix drafts JSONL path.")
     parser.add_argument("--model", required=True,
                         help="Target model name (for tokenizer).")
     parser.add_argument("--budget", type=int, required=True,
@@ -237,11 +255,13 @@ def main():
                              "confirms root-node extension.")
     args = parser.parse_args()
 
-    # Static reference for the root-extension guarantee (printed always).
+    # Static reference: every base-tree node is an anchor for suffix
+    # extension (virtual root + for node_idx in range(n)) inside
+    # _extension_step(). Printed so readers of --verify output know why we
+    # expect ext_tree_size_total > ext_base_size at most steps.
     print(
-        "[prereq] run_tree_oracle_sim.py:1031 uses "
-        "`for node_idx in range(n):` — root (node_idx=0) IS an anchor "
-        "for suffix extension.",
+        "[prereq] _extension_step() grafts suffix at the virtual root "
+        "and at every base-tree node.",
         file=sys.stderr)
 
     from simulation.pipeline.collect_union_trie import (
@@ -251,7 +271,7 @@ def main():
     t0 = time.time()
     records = assemble_records_from_artifacts(
         agent_results_path=args.agent_results,
-        suffix_drafts_path=args.suffix_drafts,
+        suffix_drafts_path=None,
         draft_model_drafts_path=None,
         mtp_agent_results_path=None,
         exclude_path=args.exclude,
@@ -297,7 +317,6 @@ def main():
     meta = {
         "script": "run_side_suffix_trajectory",
         "agent_results_path": str(Path(args.agent_results).resolve()),
-        "suffix_drafts_path": str(Path(args.suffix_drafts).resolve()),
         "model": args.model,
         "budget": args.budget,
         "req_start": args.req_start,

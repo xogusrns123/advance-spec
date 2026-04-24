@@ -4,7 +4,7 @@ SpecBench / MT-Bench agent for SGLang oracle trajectory collection.
 Multi-turn Q&A without tool calls. Sends each turn's user message,
 collects the assistant response, and logs oracle draft entries.
 
-Output format is compatible with _extract_online() in run_oracle_sim.py.
+Output format is compatible with _extract_online() in simulation.pipeline._agent_io.
 
 Usage:
     python3 -m simulation.agents.specbench_agent \

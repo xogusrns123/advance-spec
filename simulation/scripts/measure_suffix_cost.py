@@ -1,13 +1,13 @@
 """Measure ArcticInference SuffixDecodingCache.speculate() latency under
 realistic load.
 
-Mirrors Stage 3a's (simulation/pipeline/collect_suffix_drafts.py) usage
-pattern so the numbers are representative of what Stage 6 simulates:
+Produces numbers representative of what Stage 3 (oracle simulation)
+observes per step:
 
-  1. Populate the cache with full trajectories from an existing Stage 1
-     output (agent_results_eagle3.json). Each trajectory's per-call token
-     stream is fed via start_request / add_active_response / stop_request,
-     just like Stage 3a's _warmup_cache.
+  1. Populate the cache with full trajectories extracted from an existing
+     Stage 1 output (agent_results_eagle3.json). Each trajectory's
+     per-call token stream is fed via start_request /
+     add_active_response / stop_request.
   2. For each workload, pick one held-out trajectory and replay it
      token-by-token. At every step, call speculate() on the growing
      (prompt + decoded) context and time it.
@@ -15,9 +15,9 @@ pattern so the numbers are representative of what Stage 6 simulates:
 
 This is the right benchmark because the cost of speculate() scales with
 (a) tree size — dominated by prior trajectory tokens — and (b) suffix
-context length — grows through a single generation. The previous
-one-shot benchmark had an empty tree and a short context, which is why
-it reported microsecond-level times.
+context length — grows through a single generation. A one-shot benchmark
+on an empty tree with a short context reports microsecond-level times
+that aren't representative.
 
 Usage:
     python3 simulation/scripts/measure_suffix_cost.py \\
@@ -47,31 +47,61 @@ WORKLOAD_DIR_CANDIDATES = {
 }
 
 
-def _find_trajectory(base: Path, workload: str) -> Path | None:
+def _find_agent_results(base: Path, workload: str) -> Path | None:
+    """Locate agent_results_eagle3.json for a workload under base dir."""
     for cand in WORKLOAD_DIR_CANDIDATES.get(workload, []):
-        p = base / cand / "trajectory.json"
+        p = base / cand / "agent_results_eagle3.json"
         if p.exists():
             return p
     return None
 
 
-def _extract_trajectories(trajectory_path: Path) -> list[dict]:
-    """Read Stage 2's trajectory.json ({id: [token_ids...]}) and emit a
-    list of dicts compatible with the Stage 3a cache-population API.
+def _extract_trajectories(agent_results_path: Path) -> list[dict]:
+    """Read Stage 1's agent_results_eagle3.json and emit a list of dicts
+    compatible with the cache-population API.
 
-    Each trajectory is a flat token stream; we wrap it into a single
-    per_call_tokens entry (prompt unknown).
+    For each question, concatenate committed tokens from every
+    oracle_vanilla_entries record (one per LLM call). Output:
+        {"bfcl_id", "per_call_tokens", "per_call_prompt_ids"}.
     """
-    with open(trajectory_path) as f:
+    with open(agent_results_path) as f:
         data = json.load(f)
     trajectories: list[dict] = []
-    for tid, tokens in data.items():
-        if not tokens:
+    for q in data.get("questions", []):
+        bfcl_id = (q.get("bfcl_id") or q.get("instance_id")
+                   or str(q.get("question_id", "")))
+        per_call_tokens: list[list[int]] = []
+        # BFCL/SWE-bench: agent_metrics.steps[].spec_decode.oracle_vanilla_entries
+        for s in q.get("agent_metrics", {}).get("steps", []):
+            entries = s.get("spec_decode", {}).get(
+                "oracle_vanilla_entries", [])
+            call_tokens: list[int] = []
+            for e in entries:
+                toks = (e["tokens"][0]
+                        if e.get("tokens") and e["tokens"] else [])
+                call_tokens.extend(toks)
+            if call_tokens:
+                per_call_tokens.append(call_tokens)
+        # SpecBench: turns[].spec_decode.oracle_vanilla_entries
+        if not per_call_tokens:
+            for turn in q.get("turns", []):
+                if not isinstance(turn, dict):
+                    continue
+                entries = turn.get("spec_decode", {}).get(
+                    "oracle_vanilla_entries", [])
+                call_tokens = []
+                for e in entries:
+                    toks = (e["tokens"][0]
+                            if e.get("tokens") and e["tokens"] else [])
+                    call_tokens.extend(toks)
+                if call_tokens:
+                    per_call_tokens.append(call_tokens)
+        if not per_call_tokens:
             continue
         trajectories.append({
-            "bfcl_id": tid,
-            "per_call_tokens": [list(tokens)],
-            "per_call_prompt_ids": [[]],
+            "bfcl_id": bfcl_id,
+            "per_call_tokens": per_call_tokens,
+            "per_call_prompt_ids": [[] for _ in per_call_tokens],
         })
     return trajectories
 
@@ -184,9 +214,10 @@ def main():
 
     results = []
     for w in workloads:
-        ar = _find_trajectory(base, w)
+        ar = _find_agent_results(base, w)
         if ar is None:
-            print(f"SKIP {w}: no trajectory.json under {base}", file=sys.stderr)
+            print(f"SKIP {w}: no agent_results_eagle3.json under {base}",
+                  file=sys.stderr)
             continue
         trajectories = _extract_trajectories(ar)
         if len(trajectories) < 2:

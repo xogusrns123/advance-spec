@@ -143,8 +143,7 @@ def main():
             json.dump(config, f, indent=2)
 
         print(f"\nSaved to {output_path} (label: {args.label})")
-        print(f"\nFor run_oracle_sim.py, use:")
-        print(f"  --step-latencies {args.label}={results['median_tpot_s']:.6f}")
+        print(f"\nMedian TPOT for {args.label}: {results['median_tpot_s']:.6f}s")
 
 
 if __name__ == "__main__":

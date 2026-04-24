@@ -36,7 +36,7 @@ import time
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
 
-from simulation.evaluation.run_oracle_sim import (
+from simulation.pipeline._agent_io import (
     extract_requests,
     load_exclude_ids,
 )
@@ -48,7 +48,7 @@ def _iter_steps(req: dict) -> Iterator[Tuple[int, int, List[int]]]:
     ``prompt + tokens[0:step_idx]``.
 
     Steps where the remaining future has ≤1 token are skipped (nothing to
-    verify) — same guard used in collect_suffix_drafts.
+    verify).
     """
     prompt_ids_list = req.get("per_call_prompt_ids")
     for call_idx in range(len(req["per_call_tokens"])):
