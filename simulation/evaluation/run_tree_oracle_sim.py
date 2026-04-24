@@ -505,52 +505,53 @@ def simulate_decoding(
                 if method.startswith("hybrid_e3:"):
                     threshold = float(method.split(":", 1)[1])
                     accepted, used_suffix = _hybrid_step(
-                        rec, budget, threshold, fallback="eagle3")
+                        rec, budget, threshold, fallback="eagle3",
+                        suffix_cache=local_cache,
+                        cache_req_id=cache_req_id)
                 else:
                     threshold = float(method.split(":", 1)[1])
                     accepted, used_suffix = _hybrid_step(
-                        rec, budget, threshold, fallback="draft_model")
+                        rec, budget, threshold, fallback="draft_model",
+                        suffix_cache=local_cache,
+                        cache_req_id=cache_req_id)
                 # Suffix branch: target verifies the full suffix tree (no
-                # budget truncation). Expose its size so the cost path can
-                # interpolate target_forward(actual_sfx_size) instead of
-                # under-charging target_forward(B).
+                # budget truncation). Use the live-drawn tree size.
                 if used_suffix:
-                    sfx_tree = rec.get("per_proposer", {}).get("suffix", {})
-                    tok_ids = sfx_tree.get("token_ids") or []
-                    # _hybrid_step only returns used_suffix=True when
-                    # token_ids is non-empty, but defensively fall back to
-                    # ext_size=1 (vanilla-sized verify) if it is.
-                    ext_size = len(tok_ids) if tok_ids else 1
+                    _base_ctx = rec.get("context_token_ids") or []
+                    _tids, _, _ = _live_suffix_draft(
+                        local_cache, cache_req_id, _base_ctx)
+                    ext_size = len(_tids) if _tids else 1
             elif method.startswith("single:"):
                 proposer_name = method.split(":", 1)[1]
-                accepted = _single_proposer_step(rec, budget, proposer_name,
-                                                 p_t_key)
-                # Target-forward cost should scale with the actually-verified
-                # tree size, not the budget B:
-                #   * suffix: full tree (no budget truncation)
-                #   * eagle3: min(B, actual_tree_size) — actual is bounded
-                #     by num_draft_tokens (≈ 256), so at B=512 we over-charge
-                #     target_forward(512) vs the correct target_forward(256).
-                #   * draft_model: min(B, actual_tree_size) — already capped
-                #     at 16 tokens in Stage 3b.
-                # Empty tree → vanilla-sized verify (ext_size=1).
-                tree_data = rec.get("per_proposer", {}).get(proposer_name, {})
-                tok_ids = tree_data.get("token_ids") or []
-                if not tok_ids:
-                    ext_size = 1
-                elif proposer_name == "suffix":
-                    ext_size = len(tok_ids)
-                else:  # eagle3, draft_model, mtp, …
-                    ext_size = min(budget, len(tok_ids))
+                accepted = _single_proposer_step(
+                    rec, budget, proposer_name, p_t_key,
+                    suffix_cache=local_cache, cache_req_id=cache_req_id)
+                # Target-forward cost scales with actual tree size:
+                #   * suffix: live tree (unbounded by B)
+                #   * eagle3: min(B, actual)
+                #   * draft_model: min(B, actual) (Stage 3b capped at 16)
+                if proposer_name == "suffix":
+                    _base_ctx = rec.get("context_token_ids") or []
+                    _tids, _, _ = _live_suffix_draft(
+                        local_cache, cache_req_id, _base_ctx)
+                    ext_size = len(_tids) if _tids else 1
+                else:
+                    tree_data = rec.get("per_proposer", {}).get(proposer_name, {})
+                    tok_ids = tree_data.get("token_ids") or []
+                    if not tok_ids:
+                        ext_size = 1
+                    else:
+                        ext_size = min(budget, len(tok_ids))
             elif method.startswith("subset:"):
                 names = method.split(":", 1)[1].split(",")
-                accepted, chosen_size = _subset_step(rec, budget, names,
-                                                    p_t_key)
-                # chosen_size == 0 → all proposers had empty trees this
-                # step, so realistically nothing to verify — vanilla cost.
+                accepted, chosen_size = _subset_step(
+                    rec, budget, names, p_t_key,
+                    suffix_cache=local_cache, cache_req_id=cache_req_id)
                 ext_size = chosen_size if chosen_size > 0 else 1
             else:  # choose_one
-                accepted, chosen_size = _choose_one_step(rec, budget, p_t_key)
+                accepted, chosen_size = _choose_one_step(
+                    rec, budget, p_t_key,
+                    suffix_cache=local_cache, cache_req_id=cache_req_id)
                 ext_size = chosen_size if chosen_size > 0 else 1
 
             advance = accepted + 1
@@ -871,9 +872,36 @@ def _eu_step(rec: dict, budget: int, p_t_key: str,
     return greedy_tree_walk(sel_tids, sel_pids, gt)
 
 
+def _live_suffix_draft(suffix_cache, cache_req_id: str, context):
+    """Live speculate — returns (token_ids, parents, score) or (None,None,0).
+
+    Replaces the pre-computed ``per_proposer.suffix`` lookup so all methods
+    (single:suffix, hybrid_*, extension, c1, subset) see the SAME cache
+    state at the same step. Eliminates Stage 3a ↔ Stage 6 drift.
+    """
+    if suffix_cache is None or context is None:
+        return None, None, 0.0
+    try:
+        ctx_np = np.asarray(context, dtype=np.int32)
+        draft = suffix_cache.speculate(
+            cache_req_id, ctx_np,
+            max_spec_tokens=256,
+            max_spec_factor=4.0,
+            min_token_prob=0.0,
+            use_tree_spec=True,
+        )
+    except Exception:
+        return None, None, 0.0
+    if not draft.token_ids:
+        return None, None, 0.0
+    return list(draft.token_ids), list(draft.parents), float(
+        getattr(draft, "score", 0.0))
+
+
 def _hybrid_step(rec: dict, budget: int, threshold: float,
-                 fallback: str = "eagle3") -> tuple:
-    """Hybrid: use suffix if score >= threshold, else fallback proposer.
+                 fallback: str = "eagle3",
+                 suffix_cache=None, cache_req_id: str = "") -> tuple:
+    """Hybrid: use live suffix if score >= threshold, else fallback proposer.
 
     Returns (accepted_tokens, used_suffix: bool).
     used_suffix=True → suffix was chosen (no draft cost).
@@ -884,19 +912,19 @@ def _hybrid_step(rec: dict, budget: int, threshold: float,
         return 0, False
 
     per_proposer = rec.get("per_proposer", {})
-    suffix_data = per_proposer.get("suffix")
-    fallback_data = per_proposer.get(fallback)
+    base_context = rec.get("context_token_ids") or []
 
-    use_suffix = (suffix_data is not None
-                  and suffix_data.get("score", 0.0) >= threshold
-                  and suffix_data.get("token_ids"))
+    sfx_tids, sfx_pids, sfx_score = _live_suffix_draft(
+        suffix_cache, cache_req_id, base_context)
+    use_suffix = (sfx_tids is not None and sfx_score >= threshold)
 
     if use_suffix:
-        return _proposer_tree_walk(per_proposer, "suffix", gt, budget), True
-    elif fallback_data and fallback_data.get("token_ids"):
+        # Suffix has no draft cost → full tree used (no budget truncation)
+        return greedy_tree_walk(sfx_tids, sfx_pids, gt), True
+    fallback_data = per_proposer.get(fallback)
+    if fallback_data and fallback_data.get("token_ids"):
         return _proposer_tree_walk(per_proposer, fallback, gt, budget), False
-    else:
-        return 0, False
+    return 0, False
 
 
 def _union_trie_step(rec: dict, budget: int,
@@ -1238,23 +1266,39 @@ def _proposer_tree_walk(per_proposer: dict, name: str, gt: list, budget: int) ->
 
 
 def _single_proposer_step(rec: dict, budget: int, proposer_name: str,
-                          p_t_key: str = "p_t") -> int:
-    """Single proposer: use per_proposer tree directly, truncate to budget."""
+                          p_t_key: str = "p_t",
+                          suffix_cache=None,
+                          cache_req_id: str = "") -> int:
+    """Single proposer: use per_proposer tree directly, truncate to budget.
+
+    Suffix is special — draw the draft LIVE from suffix_cache (Stage 6
+    simulation) so that all methods using suffix see the same cache
+    state. Other proposers (eagle3, draft_model, mtp) still read from
+    pre-computed per_proposer.
+    """
     gt = rec.get("ground_truth_future", [])
     if not gt:
         return 0
+    if proposer_name == "suffix":
+        base_context = rec.get("context_token_ids") or []
+        tids, pids, _ = _live_suffix_draft(
+            suffix_cache, cache_req_id, base_context)
+        if tids is None:
+            return 0
+        # Suffix has no draft cost → full tree used (no budget truncation)
+        return greedy_tree_walk(tids, pids, gt)
     return _proposer_tree_walk(rec.get("per_proposer", {}), proposer_name, gt, budget)
 
 
-def _choose_one_step(rec: dict, budget: int, p_t_key: str = "p_t"):
+def _choose_one_step(rec: dict, budget: int, p_t_key: str = "p_t",
+                     suffix_cache=None, cache_req_id: str = ""):
     """Choose-One Oracle: try each proposer's full tree, pick best.
 
     No budget truncation — each proposer uses its full tree.
-    This is an oracle that picks the best proposer per step.
+    Suffix is drawn LIVE so the result is consistent with other
+    methods' suffix usage in the same simulate_decoding call.
 
-    Returns ``(accepted, chosen_tree_size)`` — the tree size of the winning
-    proposer so target-forward cost can be interpolated against the actual
-    verified tree (not the EAGLE3 budget B, which does not bound suffix).
+    Returns ``(accepted, chosen_tree_size)``.
     """
     gt = rec.get("ground_truth_future", [])
     if not gt:
@@ -1263,17 +1307,30 @@ def _choose_one_step(rec: dict, budget: int, p_t_key: str = "p_t"):
     best_acc = 0
     best_size = 0
     for name, tree_data in rec.get("per_proposer", {}).items():
+        if name == "suffix":
+            continue  # handled below via live speculate
         if not tree_data or not tree_data.get("token_ids"):
             continue
         acc = greedy_tree_walk(tree_data["token_ids"], tree_data["parents"], gt)
         if acc > best_acc:
             best_acc = acc
             best_size = len(tree_data["token_ids"])
+
+    # Live suffix
+    base_context = rec.get("context_token_ids") or []
+    tids, pids, _ = _live_suffix_draft(
+        suffix_cache, cache_req_id, base_context)
+    if tids is not None:
+        acc = greedy_tree_walk(tids, pids, gt)
+        if acc > best_acc:
+            best_acc = acc
+            best_size = len(tids)
     return best_acc, best_size
 
 
 def _subset_step(rec: dict, budget: int, proposer_names: List[str],
-                 p_t_key: str = "p_t"):
+                 p_t_key: str = "p_t",
+                 suffix_cache=None, cache_req_id: str = ""):
     """Choose-One over a subset of proposers. Full trees, no truncation.
 
     Returns ``(accepted, chosen_tree_size)`` — see _choose_one_step.
@@ -1285,6 +1342,16 @@ def _subset_step(rec: dict, budget: int, proposer_names: List[str],
     best_acc = 0
     best_size = 0
     for name in proposer_names:
+        if name == "suffix":
+            base_context = rec.get("context_token_ids") or []
+            tids, pids, _ = _live_suffix_draft(
+                suffix_cache, cache_req_id, base_context)
+            if tids is not None:
+                acc = greedy_tree_walk(tids, pids, gt)
+                if acc > best_acc:
+                    best_acc = acc
+                    best_size = len(tids)
+            continue
         tree_data = rec.get("per_proposer", {}).get(name)
         if not tree_data or not tree_data.get("token_ids"):
             continue
@@ -1583,6 +1650,10 @@ def compute_latency_speedup(
               file=sys.stderr)
         sys.stderr.flush()
 
+    # Sentinel for simulate_decoding's suffix_cache param: non-None value
+    # triggers fresh per-(req,call) SuffixDecodingCache creation inside.
+    _SUFFIX_ENABLED = object()
+
     results = {}
     total_budgets = len(budgets)
     for b_idx, B in enumerate(budgets):
@@ -1635,6 +1706,7 @@ def compute_latency_speedup(
         )
         _run("c1",
              {**common, "method": "choose_one",
+              "suffix_cache": _SUFFIX_ENABLED,
               "real_step_cost_ms": _real_cost(list(proposers), B),
               "real_step_target_fn": _target_forward,
               "real_step_draft_only_ms": c1_draft_only},
@@ -1665,11 +1737,15 @@ def compute_latency_speedup(
                           [pname], B, verify_tokens=verify_n_fallback),
                       "real_step_target_fn": _target_forward,
                       "real_step_draft_only_ms": draft_only}
+            if pname == "suffix":
+                # single:suffix uses live speculate via the simulator's
+                # per-method fresh cache.
+                kwargs["suffix_cache"] = _SUFFIX_ENABLED
             _run(f"single:{pname}", kwargs, pname)
 
         # Hybrid (suffix score threshold): suffix if score >= t, else fallback.
         # When suffix wins, step cost = target_forward + 1 suffix match.
-        thresholds = [1.0, 2.0, 3.0, 5.0, 10.0, 20.0]
+        thresholds = [0.1, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0]
 
         if "suffix" in proposers and "eagle3" in proposers:
             e3_cost = _real_cost(["eagle3"], B)
@@ -1677,6 +1753,7 @@ def compute_latency_speedup(
             for t in thresholds:
                 _run(f"hybrid_e3:{t}",
                      {**common, "method": f"hybrid_e3:{t}",
+                      "suffix_cache": _SUFFIX_ENABLED,
                       "real_step_cost_ms": e3_cost,
                       "real_step_cost_suffix_ms": suffix_only_cost,
                       # Dynamic target cost when suffix branch is taken —
@@ -1695,6 +1772,7 @@ def compute_latency_speedup(
             for t in thresholds:
                 _run(f"hybrid_dm:{t}",
                      {**common, "method": f"hybrid_dm:{t}",
+                      "suffix_cache": _SUFFIX_ENABLED,
                       "real_step_cost_ms": dm_cost,
                       "real_step_cost_suffix_ms": suffix_only_cost,
                       "real_step_target_fn": _target_forward,
@@ -1707,6 +1785,7 @@ def compute_latency_speedup(
             _run("c1_e3sfx",
                  {**common, "method": "subset:eagle3,suffix",
                   "p_t_key": p_t_key,
+                  "suffix_cache": _SUFFIX_ENABLED,
                   "real_step_cost_ms": _real_cost(["eagle3", "suffix"], B),
                   "real_step_target_fn": _target_forward,
                   "real_step_draft_only_ms": c1e3_draft_only},
@@ -1719,10 +1798,8 @@ def compute_latency_speedup(
         # extended tree (not the EAGLE3 base budget B), because target
         # verifies every node. We pass _target_forward as a per-step callable
         # so the simulator can interpolate for any ext_size.
-        # Passed as `suffix_cache` arg; simulate_decoding treats non-None
-        # as a truthy flag and instantiates a FRESH SuffixDecodingCache
-        # per (req, call) iteration internally (see simulate_decoding).
-        _SUFFIX_ENABLED = object()  # sentinel, any truthy non-None value
+        # (`suffix_cache` sentinel defined at function top — signals
+        #  simulate_decoding to instantiate a fresh cache internally)
         if "suffix" in proposers and "eagle3" in proposers:
             # Approximate eagle3 base-tree size: capped by B, typically
             # around topk × steps (pipeline default topk=16, steps ∈ {2..8}).
