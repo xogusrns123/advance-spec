@@ -344,6 +344,23 @@ def simulate_decoding(
     total_time_ms = 0.0
     v_ms = vanilla_latency_ms
 
+    # Fresh SuffixDecodingCache PER METHOD (i.e. per simulate_decoding call).
+    # Global tree is shared across requests within this method, matching
+    # Stage 3a's `collect_suffix_drafts.py` behavior (one cache for the
+    # whole run). Per-request LOCAL tree is reset via start_request below.
+    # This prevents cross-method state leakage (oracle vs realistic getting
+    # different speculate() results) while preserving in-method global-tree
+    # accumulation that's essential for suffix cache's purpose.
+    if suffix_cache is not None:
+        from hybrid_spec_decoding.suffix_decoding.suffix_tree import (
+            SuffixDecodingCache as _FreshCache,
+        )
+        local_cache = _FreshCache(
+            max_tree_depth=64, max_cached_requests=100000,
+        )
+    else:
+        local_cache = None
+
     for seq_key, step_indices in sorted(sequences.items()):
         req_id, call_idx = seq_key
         if not step_indices:
@@ -362,10 +379,12 @@ def simulate_decoding(
             seq_len = step_indices[0] + first_gt_len
 
         cache_req_id = f"{req_id}_{call_idx}"
-        if suffix_cache is not None:
+        # Per-request LOCAL reset. Global tree from previous requests
+        # in this method is retained (matches Stage 3a).
+        if local_cache is not None:
             prompt = first_rec.get("context_token_ids", [])
-            suffix_cache.start_request(cache_req_id,
-                                       np.array(prompt, dtype=np.int32))
+            local_cache.start_request(
+                cache_req_id, np.array(prompt, dtype=np.int32))
 
         pos = step_indices[0]
         step_set = set(step_indices)
@@ -397,7 +416,7 @@ def simulate_decoding(
                 accepted = _union_trie_step(rec, budget, proposer_set=names)
             elif method == "extension":
                 accepted, ext_size = _extension_step(
-                    rec, budget, suffix_cache, cache_req_id,
+                    rec, budget, local_cache, cache_req_id,
                     base_proposer="eagle3")
             elif method == "extension_oracle":
                 # Oracle: full base tree still goes through target verify
@@ -407,17 +426,17 @@ def simulate_decoding(
                 # would skip verifying the alternative suffix candidates".
                 #   ext_size_oracle = base_size + accepted_in_suffix
                 accepted, _ = _extension_step(
-                    rec, budget, suffix_cache, cache_req_id,
+                    rec, budget, local_cache, cache_req_id,
                     base_proposer="eagle3")
                 ext_size = (_extension_step._last_base_size
                             + _extension_step._last_accepted_suffix)
             elif method == "extension_dmsfx":
                 accepted, ext_size = _extension_step(
-                    rec, budget, suffix_cache, cache_req_id,
+                    rec, budget, local_cache, cache_req_id,
                     base_proposer="draft_model")
             elif method == "extension_dmsfx_oracle":
                 accepted, _ = _extension_step(
-                    rec, budget, suffix_cache, cache_req_id,
+                    rec, budget, local_cache, cache_req_id,
                     base_proposer="draft_model")
                 ext_size = (_extension_step._last_base_size
                             + _extension_step._last_accepted_suffix)
@@ -427,13 +446,13 @@ def simulate_decoding(
                 ratio = float(method.split(":", 1)[1])
                 cap = max(1, int(round(budget * ratio)))
                 accepted, ext_size = _extension_step(
-                    rec, budget, suffix_cache, cache_req_id,
+                    rec, budget, local_cache, cache_req_id,
                     base_proposer="eagle3", max_count=cap)
             elif method.startswith("extension_dmsfx_by_count:"):
                 ratio = float(method.split(":", 1)[1])
                 cap = max(1, int(round(budget * ratio)))
                 accepted, ext_size = _extension_step(
-                    rec, budget, suffix_cache, cache_req_id,
+                    rec, budget, local_cache, cache_req_id,
                     base_proposer="draft_model", max_count=cap)
             elif method.startswith("extension_by_count_score:"):
                 # Combo: count cap (C = B × ratio) + score filter.
@@ -443,7 +462,7 @@ def simulate_decoding(
                 thr = float(t_s)
                 cap = max(1, int(round(budget * ratio)))
                 accepted, ext_size = _extension_step(
-                    rec, budget, suffix_cache, cache_req_id,
+                    rec, budget, local_cache, cache_req_id,
                     base_proposer="eagle3", max_count=cap,
                     score_threshold=thr)
             elif method.startswith("extension_dmsfx_by_count_score:"):
@@ -453,28 +472,28 @@ def simulate_decoding(
                 thr = float(t_s)
                 cap = max(1, int(round(budget * ratio)))
                 accepted, ext_size = _extension_step(
-                    rec, budget, suffix_cache, cache_req_id,
+                    rec, budget, local_cache, cache_req_id,
                     base_proposer="draft_model", max_count=cap,
                     score_threshold=thr)
             elif method.startswith("extension_by_score:"):
                 threshold = float(method.split(":", 1)[1])
                 accepted, ext_size = _extension_step(
-                    rec, budget, suffix_cache, cache_req_id,
+                    rec, budget, local_cache, cache_req_id,
                     base_proposer="eagle3", score_threshold=threshold)
             elif method.startswith("extension_dmsfx_by_score:"):
                 threshold = float(method.split(":", 1)[1])
                 accepted, ext_size = _extension_step(
-                    rec, budget, suffix_cache, cache_req_id,
+                    rec, budget, local_cache, cache_req_id,
                     base_proposer="draft_model", score_threshold=threshold)
             elif method.startswith("extension_by_pathprob:"):
                 t = float(method.split(":", 1)[1])
                 accepted, ext_size = _extension_step(
-                    rec, budget, suffix_cache, cache_req_id,
+                    rec, budget, local_cache, cache_req_id,
                     base_proposer="eagle3", pathprob_threshold=t)
             elif method.startswith("extension_by_pt:"):
                 t = float(method.split(":", 1)[1])
                 accepted, ext_size = _extension_step(
-                    rec, budget, suffix_cache, cache_req_id,
+                    rec, budget, local_cache, cache_req_id,
                     base_proposer="eagle3", pt_threshold=t)
             elif method == "eu":
                 accepted = _eu_step(rec, budget, p_t_key)
@@ -616,10 +635,10 @@ def simulate_decoding(
                     if target_tokens_max is None or budget > target_tokens_max: target_tokens_max = budget
 
             # Feed accepted tokens to suffix cache
-            if suffix_cache is not None:
+            if local_cache is not None:
                 gt = rec.get("ground_truth_future", [])
                 if gt and advance <= len(gt):
-                    suffix_cache.add_active_response(
+                    local_cache.add_active_response(
                         cache_req_id, gt[:advance])
 
             pos += advance
@@ -638,8 +657,8 @@ def simulate_decoding(
                 if total_time_real_always_ms is not None:
                     total_time_real_always_ms += remaining * v_ms
 
-        if suffix_cache is not None:
-            suffix_cache.stop_request(cache_req_id)
+        if local_cache is not None:
+            local_cache.stop_request(cache_req_id)
 
     vanilla_time_ms = total_generated * v_ms
     speedup = vanilla_time_ms / total_time_ms if total_time_ms > 0 else 1.0
@@ -1027,6 +1046,48 @@ def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str,
         p = ext_pids[i]
         tok = ext_tids[i]
         children.setdefault(p, {})[tok] = i
+
+    # Virtual-root extension: speculate from base_context alone (no base
+    # tree prefix) and graft the returned suffix tree as root-level
+    # children of the extended tree (tree_parent=-1). Without this,
+    # extension's root-children = eagle3's root-children only, so when
+    # eagle3 misses at the first position the greedy walk terminates
+    # before it can reach any deeper suffix extension. Adding this
+    # ensures extension ≥ single:suffix at the same step (modulo cache
+    # state): suffix's root predictions become siblings to eagle3's
+    # root predictions in the extended tree.
+    try:
+        _root_draft = suffix_cache.speculate(
+            cache_req_id,
+            np.array(base_context, dtype=np.int32),
+            max_spec_tokens=256,
+            max_spec_factor=4.0,
+            min_token_prob=0.0,
+            use_tree_spec=True,
+        )
+    except Exception:
+        _root_draft = None
+    if _root_draft is not None and _root_draft.token_ids:
+        _root_local = {}
+        for _j, (_tid, _pid) in enumerate(
+                zip(_root_draft.token_ids, _root_draft.parents)):
+            if _pid == -1:
+                _tparent = -1
+            else:
+                _tparent = _root_local.get(_pid)
+                if _tparent is None:
+                    break  # malformed draft — abort this chain
+            _existing = children.get(_tparent, {}).get(_tid)
+            if _existing is not None:
+                _root_local[_j] = _existing
+                continue
+            if max_count is not None and len(ext_tids) >= max_count:
+                break
+            _new_idx = len(ext_tids)
+            ext_tids.append(_tid)
+            ext_pids.append(_tparent)
+            children.setdefault(_tparent, {})[_tid] = _new_idx
+            _root_local[_j] = _new_idx
 
     for node_idx in range(n):
         if max_count is not None and len(ext_tids) >= max_count:
@@ -1658,13 +1719,11 @@ def compute_latency_speedup(
         # extended tree (not the EAGLE3 base budget B), because target
         # verifies every node. We pass _target_forward as a per-step callable
         # so the simulator can interpolate for any ext_size.
-        from hybrid_spec_decoding.suffix_decoding.suffix_tree import (
-            SuffixDecodingCache,
-        )
+        # Passed as `suffix_cache` arg; simulate_decoding treats non-None
+        # as a truthy flag and instantiates a FRESH SuffixDecodingCache
+        # per (req, call) iteration internally (see simulate_decoding).
+        _SUFFIX_ENABLED = object()  # sentinel, any truthy non-None value
         if "suffix" in proposers and "eagle3" in proposers:
-            if not hasattr(compute_latency_speedup, '_ext_cache'):
-                compute_latency_speedup._ext_cache = SuffixDecodingCache(
-                    max_tree_depth=64, max_cached_requests=100000)
             # Approximate eagle3 base-tree size: capped by B, typically
             # around topk × steps (pipeline default topk=16, steps ∈ {2..8}).
             e3_nodes = min(B, 16 * 8)
@@ -1678,7 +1737,7 @@ def compute_latency_speedup(
             ext_cost_fallback = _target_forward(B) + ext_draft_only
             _run("extension",
                  {**common, "method": "extension",
-                  "suffix_cache": compute_latency_speedup._ext_cache,
+                  "suffix_cache": _SUFFIX_ENABLED,
                   "real_step_cost_ms": ext_cost_fallback,
                   "real_step_target_fn": _target_forward,
                   "real_step_draft_only_ms": ext_draft_only},
@@ -1688,7 +1747,7 @@ def compute_latency_speedup(
             # chains were known in advance). Serves as an upper bound.
             _run("extension_oracle",
                  {**common, "method": "extension_oracle",
-                  "suffix_cache": compute_latency_speedup._ext_cache,
+                  "suffix_cache": _SUFFIX_ENABLED,
                   "real_step_cost_ms": ext_cost_fallback,
                   "real_step_target_fn": _target_forward,
                   "real_step_draft_only_ms": ext_draft_only},
@@ -1700,7 +1759,7 @@ def compute_latency_speedup(
             for r in [2, 4, 8]:
                 _run(f"extension_by_count:{r}",
                      {**common, "method": f"extension_by_count:{r}",
-                      "suffix_cache": compute_latency_speedup._ext_cache,
+                      "suffix_cache": _SUFFIX_ENABLED,
                       "real_step_cost_ms": ext_cost_fallback,
                       "real_step_target_fn": _target_forward,
                       "real_step_draft_only_ms": ext_draft_only},
@@ -1713,7 +1772,7 @@ def compute_latency_speedup(
                     _run(f"extension_by_count_score:{r}:{t}",
                          {**common,
                           "method": f"extension_by_count_score:{r}:{t}",
-                          "suffix_cache": compute_latency_speedup._ext_cache,
+                          "suffix_cache": _SUFFIX_ENABLED,
                           "real_step_cost_ms": ext_cost_fallback,
                           "real_step_target_fn": _target_forward,
                           "real_step_draft_only_ms": ext_draft_only},
@@ -1724,7 +1783,7 @@ def compute_latency_speedup(
             for t in thresholds + [25.0, 30.0, 35.0]:
                 _run(f"extension_by_score:{t}",
                      {**common, "method": f"extension_by_score:{t}",
-                      "suffix_cache": compute_latency_speedup._ext_cache,
+                      "suffix_cache": _SUFFIX_ENABLED,
                       "real_step_cost_ms": ext_cost_fallback,
                       "real_step_target_fn": _target_forward,
                       "real_step_draft_only_ms": ext_draft_only},
@@ -1750,7 +1809,7 @@ def compute_latency_speedup(
                 for t in [0.001, 0.01, 0.05, 0.1, 0.3]:
                     _run(f"extension_by_pathprob:{t}",
                          {**common, "method": f"extension_by_pathprob:{t}",
-                          "suffix_cache": compute_latency_speedup._ext_cache,
+                          "suffix_cache": _SUFFIX_ENABLED,
                           "real_step_cost_ms": ext_cost_fallback,
                           "real_step_target_fn": _target_forward,
                           "real_step_draft_only_ms": ext_draft_only},
@@ -1762,7 +1821,7 @@ def compute_latency_speedup(
                 for t in [0.001, 0.005, 0.01, 0.05, 0.1, 0.3]:
                     _run(f"extension_by_pt:{t}",
                          {**common, "method": f"extension_by_pt:{t}",
-                          "suffix_cache": compute_latency_speedup._ext_cache,
+                          "suffix_cache": _SUFFIX_ENABLED,
                           "real_step_cost_ms": ext_cost_fallback,
                           "real_step_target_fn": _target_forward,
                           "real_step_draft_only_ms": ext_draft_only},
@@ -1770,9 +1829,8 @@ def compute_latency_speedup(
 
         # Extension with draft_model base + suffix extensions
         if "suffix" in proposers and "draft_model" in proposers:
-            if not hasattr(compute_latency_speedup, '_ext_cache_dm'):
-                compute_latency_speedup._ext_cache_dm = SuffixDecodingCache(
-                    max_tree_depth=64, max_cached_requests=100000)
+            # (suffix_cache sentinel enables suffix in simulate_decoding,
+            # which creates a fresh cache per (req, call) iteration)
             # Draft-model base tree is a linear chain of exactly
             # min(B, MAX_DRAFT_MODEL_N=16) tokens.
             dm_nodes = min(B, MAX_DRAFT_MODEL_N)
@@ -1783,14 +1841,14 @@ def compute_latency_speedup(
             ext_dm_cost_fallback = _target_forward(B) + ext_dm_draft_only
             _run("extension_dmsfx",
                  {**common, "method": "extension_dmsfx",
-                  "suffix_cache": compute_latency_speedup._ext_cache_dm,
+                  "suffix_cache": _SUFFIX_ENABLED,
                   "real_step_cost_ms": ext_dm_cost_fallback,
                   "real_step_target_fn": _target_forward,
                   "real_step_draft_only_ms": ext_dm_draft_only},
                  "extension_dmsfx")
             _run("extension_dmsfx_oracle",
                  {**common, "method": "extension_dmsfx_oracle",
-                  "suffix_cache": compute_latency_speedup._ext_cache_dm,
+                  "suffix_cache": _SUFFIX_ENABLED,
                   "real_step_cost_ms": ext_dm_cost_fallback,
                   "real_step_target_fn": _target_forward,
                   "real_step_draft_only_ms": ext_dm_draft_only},
@@ -1798,7 +1856,7 @@ def compute_latency_speedup(
             for r in [2, 4, 8]:
                 _run(f"extension_dmsfx_by_count:{r}",
                      {**common, "method": f"extension_dmsfx_by_count:{r}",
-                      "suffix_cache": compute_latency_speedup._ext_cache_dm,
+                      "suffix_cache": _SUFFIX_ENABLED,
                       "real_step_cost_ms": ext_dm_cost_fallback,
                       "real_step_target_fn": _target_forward,
                       "real_step_draft_only_ms": ext_dm_draft_only},
@@ -1809,7 +1867,7 @@ def compute_latency_speedup(
                     _run(f"extension_dmsfx_by_count_score:{r}:{t}",
                          {**common,
                           "method": f"extension_dmsfx_by_count_score:{r}:{t}",
-                          "suffix_cache": compute_latency_speedup._ext_cache_dm,
+                          "suffix_cache": _SUFFIX_ENABLED,
                           "real_step_cost_ms": ext_dm_cost_fallback,
                           "real_step_target_fn": _target_forward,
                           "real_step_draft_only_ms": ext_dm_draft_only},
@@ -1817,7 +1875,7 @@ def compute_latency_speedup(
             for t in thresholds:
                 _run(f"extension_dmsfx_by_score:{t}",
                      {**common, "method": f"extension_dmsfx_by_score:{t}",
-                      "suffix_cache": compute_latency_speedup._ext_cache_dm,
+                      "suffix_cache": _SUFFIX_ENABLED,
                       "real_step_cost_ms": ext_dm_cost_fallback,
                       "real_step_target_fn": _target_forward,
                       "real_step_draft_only_ms": ext_dm_draft_only},

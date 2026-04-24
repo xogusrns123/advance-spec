@@ -222,10 +222,9 @@ def main():
         test_requests = all_requests
 
     cache = SuffixDecodingCache(max_tree_depth=64, max_cached_requests=100000)
-    if train_requests:
-        print(f"Warming suffix cache with {len(train_requests)} requests...",
-              file=sys.stderr)
-        _warmup_cache(cache, train_requests)
+    # Warmup removed: cache starts cold and accumulates only within the
+    # test set as requests are processed, matching the simulator's
+    # per-method fresh-cache contract in run_tree_oracle_sim.py.
 
     t0 = time.time()
     print(f"Speculating for {len(test_requests)} requests...", file=sys.stderr)
