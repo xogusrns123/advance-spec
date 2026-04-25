@@ -97,6 +97,11 @@ def run_single_request(
                 "response": "",
                 "error": str(e),
             })
+            # Keep conversation history aligned: every user message must be
+            # followed by an assistant message, otherwise the next turn's
+            # context becomes [..., user, user, ...] and silently shifts the
+            # alignment between turns_data[i] and the i-th assistant turn.
+            messages.append({"role": "assistant", "content": ""})
             continue
 
         latency = time.perf_counter() - t_start
@@ -219,6 +224,7 @@ def run_benchmark(
     max_tokens: int = 2048,
     replay_path: str | None = None,
     num_workers: int = 1,
+    resume: bool = False,
 ) -> None:
     """Run SpecBench benchmark and save results."""
     collect_oracle = is_oracle_enabled()
@@ -228,7 +234,8 @@ def run_benchmark(
     else:
         print("Oracle collection disabled (set SGLANG_ORACLE_VANILLA=1 to enable)")
 
-    dataset = load_specbench_dataset(input_file, num_requests)
+    # Load full dataset; --num-requests applies AFTER resume filter.
+    dataset = load_specbench_dataset(input_file, None)
 
     # Load Round 1 results for replay mode
     round1_map = {}
@@ -241,13 +248,32 @@ def run_benchmark(
             round1_map[qid] = q
         print(f"  Round 1 questions: {len(round1_map)}")
 
-    client = OpenAI(base_url=url, api_key="dummy")
-    print(f"Running {len(dataset)} SpecBench requests against {url}"
-          f" (workers={num_workers})")
-
-    questions = []
+    # Resume: skip questions already in checkpoint partial.
+    from simulation.pipeline.save_results import (
+        load_checkpoint, append_to_checkpoint, save_agent_results,
+        checkpoint_path,
+    )
+    cp = load_checkpoint(output_file) if resume else None
+    done = set()
+    questions: list = []
     total_oracle = 0
     total_tokens = 0
+    if cp:
+        questions = list(cp.get("questions", []))
+        for q in questions:
+            done.add(str(q.get("question_id", "")))
+            total_oracle += q.get("total_oracle_entries", 0)
+            total_tokens += q.get("total_tokens", 0)
+        print(f"RESUME: {len(done)} requests already done; skipping them")
+
+    pending = [item for item in dataset
+               if str(item.get("question_id", "")) not in done]
+    if num_requests is not None:
+        pending = pending[:num_requests]
+
+    client = OpenAI(base_url=url, api_key="dummy")
+    print(f"Running {len(pending)}/{len(dataset)} SpecBench requests against "
+          f"{url} (workers={num_workers})")
 
     if replay_path:
         def _process(item):
@@ -263,22 +289,14 @@ def run_benchmark(
                 client, model, item, temperature, max_tokens, collect_oracle)
 
     if num_workers <= 1:
-        results_iter = (_process(item) for item in dataset)
+        results_iter = (_process(item) for item in pending)
     else:
         from concurrent.futures import ThreadPoolExecutor
         executor = ThreadPoolExecutor(max_workers=num_workers)
-        results_iter = executor.map(_process, dataset)
+        results_iter = executor.map(_process, pending)
 
-    for result in tqdm(results_iter, total=len(dataset), desc="SpecBench"):
-        if result is None:
-            continue
-        questions.append(result)
-        total_oracle += result.get("total_oracle_entries", 0)
-        total_tokens += result.get("total_tokens", 0)
-
-    # Save results
-    output = {
-        "metadata": {
+    def _meta():
+        return {
             "model": model,
             "url": url,
             "benchmark": "specbench",
@@ -286,12 +304,22 @@ def run_benchmark(
             "total_oracle_entries": total_oracle,
             "total_tokens": total_tokens,
             "oracle_enabled": collect_oracle,
-        },
-        "questions": questions,
-    }
+        }
 
-    from simulation.pipeline.save_results import save_agent_results
+    for result in tqdm(results_iter, total=len(pending), desc="SpecBench"):
+        if result is None:
+            continue
+        questions.append(result)
+        total_oracle += result.get("total_oracle_entries", 0)
+        total_tokens += result.get("total_tokens", 0)
+        append_to_checkpoint(output_file, result, _meta())
+
+    output = {"metadata": _meta(), "questions": questions}
     save_agent_results(output, output_file)
+    try:
+        checkpoint_path(output_file).unlink()
+    except FileNotFoundError:
+        pass
 
     print(f"\nResults saved to {output_file}")
     print(f"  Requests: {len(questions)}")
@@ -315,6 +343,8 @@ def main():
                         help="Path to Round 1 results for MTP replay")
     parser.add_argument("--num-workers", type=int, default=1,
                         help="Concurrent requests to SGLang server")
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip questions already saved in <output>.partial")
     args = parser.parse_args()
 
     run_benchmark(
@@ -327,6 +357,7 @@ def main():
         max_tokens=args.max_tokens,
         replay_path=args.replay,
         num_workers=args.num_workers,
+        resume=args.resume,
     )
 
 

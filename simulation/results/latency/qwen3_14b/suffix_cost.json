@@ -1,0 +1,39 @@
+{
+  "params": {
+    "max_spec_tokens": 256,
+    "max_spec_factor": 4.0,
+    "min_token_prob": 0.0,
+    "use_tree_spec": true,
+    "source": "realistic replay \u2014 tree populated from agent_results"
+  },
+  "model": "Qwen/Qwen3-14B",
+  "agent_results_dir": "/workspace/simulation/results/qwen3_14b",
+  "results": [
+    {
+      "workload": "specbench",
+      "cache_populate_trajectories": 9,
+      "cache_populate_tokens": 6529,
+      "held_bfcl_id": "1c46ef77c626400e8ef0852e8f87bd47",
+      "n_speculate_calls": 500,
+      "speculate_ms": 0.0512,
+      "speculate_ms_p90": 0.0531,
+      "speculate_ms_p99": 0.0558,
+      "speculate_ms_mean": 0.0489,
+      "draft_size_mean": 50.19,
+      "draft_size_max": 51
+    },
+    {
+      "workload": "swebench",
+      "cache_populate_trajectories": 4,
+      "cache_populate_tokens": 3434,
+      "held_bfcl_id": "3a1099c7c3dd43d2857f1dfcade12eb7",
+      "n_speculate_calls": 500,
+      "speculate_ms": 0.0513,
+      "speculate_ms_p90": 0.0532,
+      "speculate_ms_p99": 0.0549,
+      "speculate_ms_mean": 0.0488,
+      "draft_size_mean": 50.18,
+      "draft_size_max": 51
+    }
+  ]
+}

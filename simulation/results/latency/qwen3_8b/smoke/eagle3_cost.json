@@ -1,0 +1,82 @@
+{
+  "model": "Qwen/Qwen3-8B",
+  "draft_model": "Tengyunw/qwen3_8b_eagle3",
+  "topk": 16,
+  "workloads": [
+    "specbench"
+  ],
+  "budgets": [
+    16,
+    64
+  ],
+  "steps": [
+    2,
+    4
+  ],
+  "results": [
+    {
+      "workload": "specbench",
+      "budget": 16,
+      "steps": 2,
+      "max_capacity": 272,
+      "n_samples": 70,
+      "target_cost_ms": 15.7875,
+      "draft_cost_ms": 1.476,
+      "step_ms": 18.2085,
+      "target_forward_ms": 7.939500000000001,
+      "accept_length_mean": 1.8428571428571427,
+      "accept_length_median": 2.0,
+      "accept_length_max": 2.0,
+      "committed_tokens_mean": 2.842857142857143,
+      "overhead_ms": 0.945
+    },
+    {
+      "workload": "specbench",
+      "budget": 16,
+      "steps": 4,
+      "max_capacity": 69904,
+      "n_samples": 51,
+      "target_cost_ms": 15.861,
+      "draft_cost_ms": 3.105,
+      "step_ms": 19.939,
+      "target_forward_ms": 8.213,
+      "accept_length_mean": 2.9019607843137254,
+      "accept_length_median": 3.0,
+      "accept_length_max": 4.0,
+      "committed_tokens_mean": 3.9019607843137254,
+      "overhead_ms": 0.973
+    },
+    {
+      "workload": "specbench",
+      "budget": 64,
+      "steps": 2,
+      "max_capacity": 272,
+      "n_samples": 68,
+      "target_cost_ms": 20.607,
+      "draft_cost_ms": 1.496,
+      "step_ms": 23.076,
+      "target_forward_ms": 8.3995,
+      "accept_length_mean": 1.9264705882352942,
+      "accept_length_median": 2.0,
+      "accept_length_max": 2.0,
+      "committed_tokens_mean": 2.926470588235294,
+      "overhead_ms": 0.973
+    },
+    {
+      "workload": "specbench",
+      "budget": 64,
+      "steps": 4,
+      "max_capacity": 69904,
+      "n_samples": 43,
+      "target_cost_ms": 20.685,
+      "draft_cost_ms": 3.073,
+      "step_ms": 24.717,
+      "target_forward_ms": 8.437,
+      "accept_length_mean": 3.627906976744186,
+      "accept_length_median": 4.0,
+      "accept_length_max": 4.0,
+      "committed_tokens_mean": 4.627906976744186,
+      "overhead_ms": 0.959
+    }
+  ]
+}

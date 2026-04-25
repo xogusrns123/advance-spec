@@ -151,10 +151,6 @@ def build_env(run: dict, cfg: dict, suffix: str,
     if run.get("req_end") is not None:
         env["REQ_END"] = str(run["req_end"])
 
-    stages = cfg.get("stages", {}) or {}
-    env["UNION_TRIE"] = "1" if stages.get("union_trie") else "0"
-    env["EU_ORACLE"] = "1" if stages.get("eu_oracle") else "0"
-
     wl = run["workload"]
     if wl in ("bfcl_v3", "bfcl_v4") and run.get("max_iterations") is not None:
         env["BFCL_MAX_ITER"] = str(run["max_iterations"])
@@ -269,12 +265,6 @@ def main() -> int:
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
-
-    stages = cfg.get("stages", {}) or {}
-    if stages.get("eu_oracle") and not stages.get("union_trie"):
-        print("ERROR: stages.eu_oracle=true requires stages.union_trie=true",
-              file=sys.stderr)
-        return 2
 
     infra = cfg.get("infra", {}) or {}
     num_gpus = int(infra.get("num_gpus") or 1)

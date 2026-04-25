@@ -51,14 +51,8 @@ merge_jsonl() {
   return 0
 }
 
-# --- Merge Stage 3a/3b per-step draft artifacts ---
-merge_jsonl suffix_drafts.jsonl || true
+# --- Merge Stage 2 per-step draft artifacts ---
 merge_jsonl draft_model_drafts.jsonl || true
-
-# --- Merge Stage 4/5 outputs ---
-merge_jsonl union_trie_data.jsonl || true
-MERGED_PT="$OUTPUT_DIR/union_trie_data_with_pt.jsonl"
-merge_jsonl union_trie_data_with_pt.jsonl || true
 
 # --- Merge agent_results_eagle3.json (questions arrays) ---
 echo "Merging agent_results_eagle3.json..."
@@ -81,40 +75,24 @@ with open('$OUTPUT_DIR/agent_results_eagle3.json', 'w') as f:
 print(f'  {len(merged[\"questions\"])} questions from {len(files)} shards')
 "
 
-# --- Merge agent_results_mtp.json ---
-echo "Merging agent_results_mtp.json..."
-python3 -c "
-import json, sys, glob
-
-files = sorted(glob.glob('${OUTPUT_DIR}_req*/agent_results_mtp.json'))
-if not files:
-    print('WARN: No agent_results_mtp.json found', file=sys.stderr)
-    sys.exit(0)
-
-merged = json.load(open(files[0]))
-for f in files[1:]:
-    data = json.load(open(f))
-    merged['questions'].extend(data.get('questions', []))
-merged['metadata']['num_requests'] = len(merged['questions'])
-
-with open('$OUTPUT_DIR/agent_results_mtp.json', 'w') as f:
-    json.dump(merged, f)
-print(f'  {len(merged[\"questions\"])} questions from {len(files)} shards')
-"
-
-# --- Run Stage 6: Oracle Simulation ---
+# --- Run Stage 3: Oracle Simulation ---
 echo ""
-echo "=== Stage 6: Oracle Simulation (merged) ==="
+echo "=== Stage 3: Oracle Simulation (merged) ==="
 
 LATENCY_FLAG=""
 if [ -f "$OUTPUT_DIR/latency_config.json" ]; then
   LATENCY_FLAG="--latency-config $OUTPUT_DIR/latency_config.json"
 fi
 
+DM_FLAG=""
+if [ -f "$OUTPUT_DIR/draft_model_drafts.jsonl" ]; then
+  DM_FLAG="--draft-model-drafts $OUTPUT_DIR/draft_model_drafts.jsonl"
+fi
+
 python3 -m simulation.evaluation.run_tree_oracle_sim \
-  --union-trie-data "$MERGED_PT" \
-  --budgets 1,2,4,8,16 \
-  --p-t-key p_t \
+  --agent-results "$OUTPUT_DIR/agent_results_eagle3.json" \
+  $DM_FLAG \
+  --budgets "${SIM_BUDGETS:-1,2,4,8,16,32,64,128,256,512}" \
   --output "$OUTPUT_DIR/tree_oracle_sim.json" \
   --print-summary \
   $LATENCY_FLAG

@@ -3,16 +3,9 @@
 The Stage 3 driver (``run_tree_oracle_sim.py``) calls
 ``assemble_records_from_artifacts()`` to read Stage 1's
 ``agent_results_eagle3.json`` plus Stage 2's ``draft_model_drafts.jsonl``
-and emit an in-memory list of per-step records ready for simulation. No
-union-trie file is written to disk — Stage 6 does live suffix speculate
-inside the simulator.
-
-Historical artifacts from prior pipeline runs (``union_trie_data.jsonl``)
-are NOT produced or consumed any more; ``build_union_trie`` is still
-exported because ``collect_union_tries`` uses it internally to construct
-the per-record ``union_trie`` / ``source_map`` fields when
-``include_union_trie=True`` (legacy mode retained for one-off tooling —
-the default is ``False``).
+and emit an in-memory list of per-(request, call, step) records ready for
+simulation. Stage 3 draws suffix candidates live inside the simulator
+(``_live_suffix_draft``); no per-step suffix file needs to exist.
 """
 
 from __future__ import annotations
@@ -21,7 +14,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -33,123 +26,7 @@ from simulation.pipeline._agent_io import (
 
 
 # ---------------------------------------------------------------------------
-# Lightweight trie builder (no dependency on tree_utils / arctic_inference)
-# ---------------------------------------------------------------------------
-
-class _TrieNode:
-    """Minimal trie node for union trie construction."""
-    __slots__ = ("token_id", "children", "sources", "node_id")
-
-    def __init__(self, token_id: int, node_id: int):
-        self.token_id = token_id
-        self.children: Dict[int, _TrieNode] = {}  # token_id → child
-        self.sources: set = set()
-        self.node_id = node_id
-
-
-def _paths_from_flat_tree(
-    token_ids: Sequence[int],
-    parents: Sequence[int],
-) -> List[List[int]]:
-    """Extract all root-to-leaf paths from a flat (token_ids, parents) tree."""
-    n = len(token_ids)
-    if n == 0:
-        return []
-
-    children: Dict[int, List[int]] = {-1: []}
-    for i in range(n):
-        children.setdefault(i, [])
-        children.setdefault(parents[i], []).append(i)
-
-    paths = []
-
-    def _dfs(node: int, path: List[int]):
-        ch = children.get(node, [])
-        if not ch:
-            if path:
-                paths.append(list(path))
-            return
-        for c in ch:
-            path.append(token_ids[c])
-            _dfs(c, path)
-            path.pop()
-
-    _dfs(-1, [])
-    return paths
-
-
-def build_union_trie(
-    proposer_trees: Dict[str, Tuple[List[int], List[int]]],
-) -> Tuple[List[int], List[int], List[List[str]]]:
-    """Build union trie from multiple proposers' draft trees.
-
-    Parameters
-    ----------
-    proposer_trees : dict
-        Mapping from proposer name to (token_ids, parents).
-
-    Returns
-    -------
-    (flat_token_ids, flat_parents, source_map)
-        flat_token_ids: Merged trie token ids.
-        flat_parents: Parent indices (-1 for root children).
-        source_map: For each node, sorted list of contributing proposers.
-    """
-    root = _TrieNode(token_id=-1, node_id=0)
-    next_id = 1
-
-    for proposer_name, (token_ids, parents) in proposer_trees.items():
-        if not token_ids:
-            continue
-        paths = _paths_from_flat_tree(token_ids, parents)
-        for path in paths:
-            node = root
-            for token_id in path:
-                if token_id in node.children:
-                    child = node.children[token_id]
-                    child.sources.add(proposer_name)
-                else:
-                    child = _TrieNode(token_id, next_id)
-                    next_id += 1
-                    child.sources.add(proposer_name)
-                    node.children[token_id] = child
-                node = child
-
-    # BFS flatten
-    flat_tokens: List[int] = []
-    flat_parents: List[int] = []
-    source_map: List[List[str]] = []
-
-    # node_id → flat_index mapping
-    id_to_idx: Dict[int, int] = {}
-    queue = [(root, -1)]  # (node, parent_flat_idx)
-
-    while queue:
-        next_queue = []
-        for node, parent_idx in queue:
-            if node is root:
-                id_to_idx[root.node_id] = -1
-                for child in sorted(node.children.values(), key=lambda n: n.node_id):
-                    next_queue.append((child, -1))
-            else:
-                idx = len(flat_tokens)
-                id_to_idx[node.node_id] = idx
-                flat_tokens.append(node.token_id)
-                flat_parents.append(parent_idx)
-                source_map.append(sorted(node.sources))
-                for child in sorted(node.children.values(), key=lambda n: n.node_id):
-                    next_queue.append((child, idx))
-        queue = next_queue
-
-    # BFS guarantees: parent[i] < i for all i (enables safe truncation)
-    assert all(p == -1 or p < i for i, p in enumerate(flat_parents)), \
-        "BFS order violated: parent must precede child"
-
-    return flat_tokens, flat_parents, source_map
-
-
-# ---------------------------------------------------------------------------
-# Per-step draft loaders (Stage 3a / 3b outputs)
+# Per-step draft loaders (Stage 2 outputs)
 # ---------------------------------------------------------------------------
 
 def load_per_step_drafts(path: str) -> Dict[Tuple[str, int, int], dict]:
@@ -174,14 +51,19 @@ def load_per_step_drafts(path: str) -> Dict[Tuple[str, int, int], dict]:
 # Main collection loop
 # ---------------------------------------------------------------------------
 
-def collect_union_tries(
+def collect_step_records(
     requests: List[dict],
     suffix_by_key: Optional[Dict[Tuple[str, int, int], dict]] = None,
     dm_by_key: Optional[Dict[Tuple[str, int, int], dict]] = None,
     mtp_requests: Optional[List[dict]] = None,
-    include_union_trie: bool = True,
+    eagle3_reslice: Optional[Tuple[int, int, int, int]] = None,
 ) -> List[dict]:
-    """Collect per-step union trie data for all requests.
+    """Assemble per-step records for all requests.
+
+    Each emitted record carries ``per_proposer`` (eagle3 / suffix /
+    draft_model / mtp draft trees), ``ground_truth_future`` (the remaining
+    target tokens at this step), and ``context_token_ids`` (prompt + tokens
+    already decoded). Stage 3 consumes this list directly.
 
     Parameters
     ----------
@@ -191,15 +73,24 @@ def collect_union_tries(
         Per-step draft records keyed by (request_id, call_idx, step_idx).
     mtp_requests : list[dict], optional
         MTP round requests (same bfcl_ids, same token sequences). If
-        provided, MTP drafts are included in the union trie.
-    include_union_trie : bool
-        When True (default), each record includes the merged ``union_trie``
-        and ``source_map`` fields. When False, those fields are omitted;
-        records still carry ``per_proposer`` / ``context_token_ids`` /
-        ``ground_truth_future``. Used by Stage 6 runs with ``UNION_TRIE=0``.
+        provided, MTP drafts are attached to per_proposer.
+    eagle3_reslice : tuple, optional
+        ``(S_orig, K_orig, s_prime, k_prime)`` — when set and the request
+        carries ``per_call_eagle3_pool_fulls`` (= captured with
+        ``SGLANG_CAPTURE_FULL_POOL=1``), the per-step EAGLE3 tree is
+        REPLACED with one resliced from the full pool to (s', k').
+        ``S_orig`` and ``K_orig`` must match the capture's config (e.g.
+        ``(8, 16)``). Steps where pool data is missing fall back to the
+        original truncated tree.
     """
     suffix_by_key = suffix_by_key or {}
     dm_by_key = dm_by_key or {}
+
+    reslice_args = None
+    if eagle3_reslice is not None:
+        S_orig, K_orig, s_prime, k_prime = eagle3_reslice
+        from simulation.pipeline.pool_reslicer import reslice_eagle3_pool
+        reslice_args = (reslice_eagle3_pool, S_orig, K_orig, s_prime, k_prime)
 
     mtp_by_id: Dict[str, dict] = {}
     if mtp_requests:
@@ -234,15 +125,45 @@ def collect_union_tries(
 
                 proposer_trees: Dict[str, Tuple[List[int], List[int]]] = {}
 
-                # EAGLE3: prefer full tree, else flat chain
+                # EAGLE3: prefer resliced full pool (when reslice config is set
+                # AND pool was captured), else the truncated tree, else flat chain.
                 eagle3_p_t = None
                 eagle3_path_draft_p_t = None
                 e3_trees = req.get("per_call_eagle3_trees")
                 e3_p_ts = req.get("per_call_eagle3_tree_p_ts")
                 e3_draft_p_ts = req.get(
                     "per_call_eagle3_tree_path_draft_p_ts")
+                e3_pool_fulls = req.get("per_call_eagle3_pool_fulls")
                 e3_attached = False
-                if e3_trees and call_idx < len(e3_trees):
+
+                # Reslice path: when (s', k') override active and full pool present
+                if (reslice_args is not None and e3_pool_fulls
+                        and call_idx < len(e3_pool_fulls)):
+                    call_pools = e3_pool_fulls[call_idx]
+                    if (pos < len(call_pools)
+                            and call_pools[pos] is not None):
+                        fp = call_pools[pos]
+                        try:
+                            (reslicer_fn, S_orig, K_orig,
+                             s_p, k_p) = reslice_args
+                            sub_ids, sub_par, sub_pp = reslicer_fn(
+                                fp["draft_tokens"], fp["parent_list"],
+                                fp["path_probs"], fp["pool_size"],
+                                S_orig, K_orig, s_p, k_p)
+                            proposer_trees["eagle3"] = (sub_ids, sub_par)
+                            eagle3_path_draft_p_t = sub_pp
+                            e3_attached = True
+                        except Exception as e:
+                            # Reslicer failed (corrupt entry?) — fall through
+                            # to original tree path; logged once.
+                            if not getattr(collect_step_records,
+                                           "_reslice_warned", False):
+                                print(f"WARN: pool reslice failed at "
+                                      f"({bfcl_id}, call {call_idx}, "
+                                      f"step {pos}): {e}", file=sys.stderr)
+                                collect_step_records._reslice_warned = True
+
+                if not e3_attached and e3_trees and call_idx < len(e3_trees):
                     call_trees = e3_trees[call_idx]
                     if pos < len(call_trees) and call_trees[pos] is not None:
                         et = call_trees[pos]
@@ -263,7 +184,8 @@ def collect_union_tries(
                         e_parents, e_tokens = _flat_to_tree(e_draft)
                         proposer_trees["eagle3"] = (e_tokens, e_parents)
 
-                # Suffix: looked up from Stage 3a output
+                # Suffix: looked up from a precomputed draft file (legacy
+                # path; current pipeline draws suffix live inside Stage 3).
                 key = (bfcl_id, call_idx, pos)
                 suffix_rec = suffix_by_key.get(key)
                 suffix_score = 0.0
@@ -274,7 +196,7 @@ def collect_union_tries(
                     )
                     suffix_score = float(suffix_rec.get("score", 0.0))
 
-                # Draft model: looked up from Stage 3b output
+                # Draft model: looked up from Stage 2 output
                 dm_rec = dm_by_key.get(key)
                 if dm_rec and dm_rec.get("token_ids"):
                     proposer_trees["draft_model"] = (
@@ -282,7 +204,7 @@ def collect_union_tries(
                         list(dm_rec["parents"]),
                     )
 
-                # MTP: from Stage 3c replay
+                # MTP: from optional MTP-replay round
                 if mtp_req:
                     mtp_eagle3s = mtp_req.get("per_call_eagle3s", [])
                     mtp_e3_trees = mtp_req.get("per_call_eagle3_trees")
@@ -336,14 +258,6 @@ def collect_union_tries(
                     "ground_truth_future": list(future),
                     "context_token_ids": context.tolist(),
                 }
-                if include_union_trie:
-                    flat_tokens, flat_parents, source_map = build_union_trie(
-                        proposer_trees)
-                    record["union_trie"] = {
-                        "token_ids": flat_tokens,
-                        "parents": flat_parents,
-                    }
-                    record["source_map"] = source_map
                 records.append(record)
 
                 decoded.append(tokens[pos])
@@ -364,17 +278,13 @@ def assemble_records_from_artifacts(
     model: Optional[str] = None,
     dataset_path: Optional[str] = None,
     responses_path: Optional[str] = None,
-    include_union_trie: bool = True,
+    eagle3_reslice: Optional[Tuple[int, int, int, int]] = None,
 ) -> List[dict]:
-    """End-to-end loader: read Stage 1/3 artifacts, return per-step records.
+    """End-to-end loader: read Stage 1/2 artifacts, return per-step records.
 
     Mirrors the side effects of ``main()`` (tokenizer load, BFCL/SpecBench
     prompt reconstruction, per-step JSONL loading, MTP extraction) and
-    produces the same per-step record list that Stage 4 would write.
-    When ``include_union_trie`` is False, records omit the ``union_trie``
-    and ``source_map`` fields so callers who only need per-proposer data
-    (e.g. ``UNION_TRIE=0`` path in run_tree_oracle_sim) can bypass the
-    Stage 4 build entirely.
+    produces the per-step record list that Stage 3 consumes directly.
     """
     exclude_ids = load_exclude_ids(exclude_path) if exclude_path else set()
 
@@ -446,19 +356,16 @@ def assemble_records_from_artifacts(
         print(f"MTP requests: {len(mtp_all_requests)}", file=sys.stderr)
 
     t0 = time.time()
-    mode = "union tries" if include_union_trie else "per-proposer records"
-    print(f"Building {mode} for {len(all_requests)} requests...",
+    print(f"Assembling per-step records for {len(all_requests)} requests...",
           file=sys.stderr)
-    records = collect_union_tries(
+    records = collect_step_records(
         all_requests,
         suffix_by_key=suffix_by_key,
         dm_by_key=dm_by_key,
         mtp_requests=mtp_all_requests,
-        include_union_trie=include_union_trie,
+        eagle3_reslice=eagle3_reslice,
     )
     elapsed = time.time() - t0
     print(f"  assembled {len(records)} step records in {elapsed:.1f}s",
           file=sys.stderr)
     return records
-
-

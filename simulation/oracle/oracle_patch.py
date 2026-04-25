@@ -38,8 +38,6 @@ ORACLE_TIMING_PATH = Path(
     os.environ.get("SGLANG_ORACLE_TIMING_LOG", "/tmp/sglang_oracle_timing.jsonl"))
 ORACLE_REPLAY_PATH = os.environ.get("SGLANG_ORACLE_REPLAY", "")
 ORACLE_DRAFT_BUDGET = os.environ.get("SGLANG_DRAFT_BUDGET", "")  # override draft token count
-ORACLE_VERIFY_TRIES_PATH = os.environ.get("SGLANG_ORACLE_VERIFY_TRIES", "")
-ORACLE_VERIFY_RID_MAP_PATH = os.environ.get("SGLANG_ORACLE_VERIFY_RID_MAP", "")
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +338,9 @@ def _install_draft_p_t_tracer() -> None:
         return
     original = ew_module.organize_draft_results
 
+    capture_full_pool = (
+        os.environ.get("SGLANG_CAPTURE_FULL_POOL", "0") == "1")
+
     def traced(score_list, token_list, parents_list, num_draft_token):
         import torch
         try:
@@ -349,6 +350,52 @@ def _install_draft_p_t_tracer() -> None:
                 logger.warning(f"draft-p_t tracer: cat/flatten failed: {e}")
                 ew_module._oracle_tracer_logged_err1 = True
             flat_scores = None
+
+        # Optional: capture the FULL score pool tree by calling
+        # organize_draft_results once with num_draft_token = pool_size + 1
+        # (no truncation). Use cloned inputs so any in-place behaviour
+        # inside SGLang doesn't pollute the second call below.
+        if capture_full_pool and flat_scores is not None:
+            try:
+                pool_size = flat_scores.shape[1]
+                # Defensive clones — organize_draft_results is expected to
+                # be functional but cheap insurance.
+                sl_clone = [s.clone() for s in score_list]
+                tl_clone = [t.clone() for t in token_list]
+                pl_clone = [p.clone() for p in parents_list]
+                full_parent, full_top_idx, full_tokens = original(
+                    sl_clone, tl_clone, pl_clone, pool_size + 1)
+                full_path_probs = torch.gather(
+                    flat_scores, 1, full_top_idx)
+                bs = full_path_probs.shape[0]
+                root_col = torch.ones(
+                    bs, 1,
+                    device=full_path_probs.device,
+                    dtype=full_path_probs.dtype)
+                full_pp_with_root = torch.cat([root_col, full_path_probs],
+                                              dim=1)
+                ew_module._oracle_last_full_pool = {
+                    "parent_list": full_parent.detach().cpu().clone(),
+                    "draft_tokens": full_tokens.detach().cpu().clone(),
+                    "path_probs": full_pp_with_root.detach().cpu().clone(),
+                    "pool_size": int(pool_size),
+                }
+                if not getattr(ew_module, "_oracle_full_pool_logged", False):
+                    logger.info(
+                        f"full-pool capture: pool_size={pool_size}, "
+                        f"draft_tokens shape={tuple(full_tokens.shape)}, "
+                        f"path_probs shape={tuple(full_pp_with_root.shape)}")
+                    ew_module._oracle_full_pool_logged = True
+            except Exception as e:
+                if not getattr(
+                        ew_module, "_oracle_full_pool_logged_err", False):
+                    logger.warning(f"full-pool capture failed: {e}")
+                    ew_module._oracle_full_pool_logged_err = True
+                ew_module._oracle_last_full_pool = None
+        elif capture_full_pool:
+            ew_module._oracle_last_full_pool = None
+
+        # Standard path: SGLang's actual truncated tree for verify
         parent_list, top_scores_index, draft_tokens = original(
             score_list, token_list, parents_list, num_draft_token)
         # Compute per-candidate-position path prob:
@@ -424,12 +471,6 @@ def patch_eagle_worker_full(eagle_worker: "EAGLEWorker") -> None:
         eagle_worker.server_args.speculative_num_draft_tokens = budget
         logger.info(f"Oracle DRAFT BUDGET override: {original} → {budget}")
 
-    # Verify-tries mode: inject pre-built union tries into draft()
-    trie_feeder = None
-    if ORACLE_VERIFY_TRIES_PATH:
-        from .oracle_verify_patch import UnionTrieFeeder
-        trie_feeder = UnionTrieFeeder(ORACLE_VERIFY_TRIES_PATH)
-
     # LATENCY-ONLY mode: pure timing instrumentation. No force-accept, no
     # tree/p_t extraction — server runs REAL speculative decoding so target
     # actually commits accepted draft tokens. Used by measure_eagle3_cost.py.
@@ -438,11 +479,11 @@ def patch_eagle_worker_full(eagle_worker: "EAGLEWorker") -> None:
         return
 
     _patch_verify_greedy_func()
-    _patch_draft_stash(eagle_worker, trie_feeder)
+    _patch_draft_stash(eagle_worker)
     _patch_verify_logits(eagle_worker)
-    _patch_forward_log(eagle_worker, replay_state, trie_feeder)
+    _patch_forward_log(eagle_worker, replay_state)
 
-    mode = "VERIFY_TRIES" if trie_feeder else ("REPLAY" if replay_state else "VANILLA")
+    mode = "REPLAY" if replay_state else "VANILLA"
     logger.info(f"Oracle {mode} patch applied to EAGLEWorker")
 
 
@@ -595,13 +636,8 @@ def _patch_verify_greedy_func() -> None:
     logger.info("Patched verify_tree_greedy_func for oracle vanilla (accept_length=0)")
 
 
-def _patch_draft_stash(eagle_worker: "EAGLEWorker", trie_feeder=None) -> None:
-    """Patch draft() to stash full draft tree (token_ids + tree structure).
-
-    When trie_feeder is provided (verify-tries mode), the draft tree is
-    replaced with the pre-built union trie after running the original draft
-    (which is still needed for hidden state updates).
-    """
+def _patch_draft_stash(eagle_worker: "EAGLEWorker") -> None:
+    """Patch draft() to stash full draft tree (token_ids + tree structure)."""
     _install_draft_p_t_tracer()
     original_draft = eagle_worker.draft
 
@@ -618,6 +654,10 @@ def _patch_draft_stash(eagle_worker: "EAGLEWorker", trie_feeder=None) -> None:
             pp = getattr(ew_module, "_oracle_last_path_probs", None)
             eagle_worker._oracle_stashed_path_probs = pp
             ew_module._oracle_last_path_probs = None  # consume
+            # Also pick up the FULL pool (when SGLANG_CAPTURE_FULL_POOL=1).
+            fp = getattr(ew_module, "_oracle_last_full_pool", None)
+            eagle_worker._oracle_stashed_full_pool = fp
+            ew_module._oracle_last_full_pool = None  # consume
             pp_shape = None if pp is None else tuple(pp.shape)
             batch_bs = len(batch.reqs) if hasattr(batch, "reqs") else None
             dt_numel = (spec_info.draft_token.numel()
@@ -639,26 +679,6 @@ def _patch_draft_stash(eagle_worker: "EAGLEWorker", trie_feeder=None) -> None:
         except Exception as e:
             eagle_worker._oracle_stashed_path_probs = None
             logger.warning(f"patched_draft: path-probs stash failed: {e}")
-
-        # Verify-tries mode: replace draft tree with union trie
-        if trie_feeder is not None:
-            try:
-                # Debug: log tensor shapes once
-                if not getattr(eagle_worker, "_oracle_shapes_logged", False):
-                    logger.info(f"EagleVerifyInput shapes: "
-                                f"draft_token={spec_info.draft_token.shape}, "
-                                f"custom_mask={spec_info.custom_mask.shape}, "
-                                f"positions={spec_info.positions.shape}, "
-                                f"retrive_index={spec_info.retrive_index.shape}, "
-                                f"retrive_next_token={spec_info.retrive_next_token.shape}, "
-                                f"retrive_next_sibling={spec_info.retrive_next_sibling.shape}, "
-                                f"draft_token_num={spec_info.draft_token_num}, "
-                                f"topk={spec_info.topk}, "
-                                f"spec_steps={spec_info.spec_steps}")
-                    eagle_worker._oracle_shapes_logged = True
-                _inject_union_trie(spec_info, batch, trie_feeder, eagle_worker)
-            except Exception as e:
-                logger.warning(f"Union trie injection failed: {e}", exc_info=True)
 
         try:
             dt = spec_info.draft_token
@@ -688,82 +708,6 @@ def _patch_draft_stash(eagle_worker: "EAGLEWorker", trie_feeder=None) -> None:
         return spec_info
 
     eagle_worker.draft = patched_draft
-
-
-def _inject_union_trie(spec_info, batch, trie_feeder, eagle_worker):
-    """Replace draft tree in spec_info with pre-built union trie.
-
-    Pops the next record from the sequential feeder and overwrites
-    draft tokens + tree navigation in the EagleVerifyInput.
-    """
-    import torch
-
-    num_draft = spec_info.draft_token_num
-    bs = len(batch.reqs)
-
-    for i in range(bs):
-        req = batch.reqs[i]
-        req_id = getattr(req, "rid", str(i))
-        rec = trie_feeder.get_next_trie()
-        if rec is None:
-            continue
-
-        trie = rec.get("union_trie", {})
-        token_ids = trie.get("token_ids", [])
-        parents = trie.get("parents", [])
-
-        # Stash for p_t logging (single request at a time with workers=1)
-        eagle_worker._oracle_last_trie_rec = rec
-
-        # Truncate to fit draft_token_num - 1
-        max_nodes = num_draft - 1
-        if len(token_ids) > max_nodes:
-            token_ids = token_ids[:max_nodes]
-            parents = parents[:max_nodes]
-
-        n = len(token_ids)
-        if n == 0:
-            continue
-
-        # Overwrite draft tokens for this request
-        # Layout: [root_verified, draft_0, draft_1, ...] per request
-        req_start = i * num_draft
-        for j in range(n):
-            spec_info.draft_token[req_start + 1 + j] = token_ids[j]
-
-        # Rebuild tree navigation (retrive_next_token, retrive_next_sibling)
-        # from flat (token_ids, parents) to child/sibling linked list
-        children = {}  # parent_idx → list of child indices (in trie order)
-        for j in range(n):
-            p = parents[j]
-            children.setdefault(p, []).append(j)
-
-        rnt = spec_info.retrive_next_token
-        rns = spec_info.retrive_next_sibling
-
-        # Clear this request's navigation
-        rnt[i].fill_(-1)
-        rns[i].fill_(-1)
-
-        req_offset = i * num_draft
-
-        # Set first child of root (position 0)
-        root_children = children.get(-1, [])
-        if root_children:
-            rnt[i, 0] = req_offset + 1 + root_children[0]
-
-        # Set child/sibling for each node
-        for j in range(n):
-            pos = j + 1  # +1 because position 0 is root
-            node_children = children.get(j, [])
-            if node_children:
-                rnt[i, pos] = req_offset + 1 + node_children[0]
-            # Sibling: next child of same parent
-            p = parents[j]
-            siblings = children.get(p, [])
-            my_idx = siblings.index(j)
-            if my_idx + 1 < len(siblings):
-                rns[i, pos] = req_offset + 1 + siblings[my_idx + 1]
 
 
 def _patch_verify_logits(eagle_worker: "EAGLEWorker",
@@ -822,13 +766,9 @@ def _patch_verify_logits(eagle_worker: "EAGLEWorker",
     eagle_worker.target_worker.forward_batch_generation = patched_target_forward
 
 
-VERIFY_P_T_LOG_PATH = Path("/tmp/sglang_oracle_verify_p_t.jsonl")
-
-
 def _patch_forward_log(
     eagle_worker: "EAGLEWorker",
     replay_state: TrajectoryState | None,
-    trie_feeder=None,
 ) -> None:
     """Patch forward_batch_generation() to log draft + accepted token."""
     original_forward = eagle_worker.forward_batch_generation
@@ -943,14 +883,49 @@ def _patch_forward_log(
                     entry["eagle3_tree_p_t"] = tree_p_t
                 if tree_path_draft_p_t is not None:
                     entry["eagle3_tree_path_draft_p_t"] = tree_path_draft_p_t
-                _log_entry(entry)
 
-                # Verify-tries mode: log p_t for union trie nodes
-                if trie_feeder is not None and verify_logits is not None:
-                    trie_rec = getattr(eagle_worker, "_oracle_last_trie_rec", None)
-                    if trie_rec is not None:
-                        _log_verify_trie_p_t(
-                            trie_rec, verify_logits, i, num_draft)
+                # Optional: full EAGLE3 score pool tree (untruncated).
+                # Captured when SGLANG_CAPTURE_FULL_POOL=1. We dump raw
+                # tensors (per-request slice along the batch axis) and
+                # let the simulator interpret SGLang's organize_draft_results
+                # output format offline.
+                full_pool = getattr(
+                    eagle_worker, "_oracle_stashed_full_pool", None)
+                if full_pool is not None:
+                    try:
+                        pool_size = int(full_pool["pool_size"])
+                        ft = full_pool["draft_tokens"]
+                        fp = full_pool["parent_list"]
+                        pp = full_pool["path_probs"]
+                        # Detect batched vs flat layout, slice per request.
+                        if ft.dim() == 2:
+                            entry_dt = ft[i].tolist()
+                        else:
+                            ent = pool_size + 1
+                            entry_dt = ft[i * ent:(i + 1) * ent].tolist()
+                        if fp.dim() == 2:
+                            entry_pl = fp[i].tolist()
+                        else:
+                            n_par = fp.numel() // ft.shape[0]
+                            entry_pl = fp[i * n_par:(i + 1) * n_par].tolist()
+                        entry_pp = pp[i].tolist() if pp.dim() == 2 \
+                            else pp.tolist()
+                        entry["eagle3_pool_full"] = {
+                            "draft_tokens": entry_dt,
+                            "parent_list": entry_pl,
+                            "path_probs": entry_pp,
+                            "pool_size": pool_size,
+                        }
+                    except Exception as e:
+                        if not getattr(eagle_worker,
+                                       "_oracle_full_pool_slice_err", False):
+                            logger.warning(
+                                f"full-pool per-req slice failed: {e} "
+                                f"shapes: ft={tuple(ft.shape) if 'ft' in dir() else '?'}, "
+                                f"fp={tuple(fp.shape) if 'fp' in dir() else '?'}, "
+                                f"pp={tuple(pp.shape) if 'pp' in dir() else '?'}")
+                            eagle_worker._oracle_full_pool_slice_err = True
+                _log_entry(entry)
 
             eagle_worker._oracle_stashed_draft = None
             eagle_worker._oracle_stashed_verify_logits = None
@@ -975,43 +950,3 @@ def _patch_forward_log(
         return result
 
     eagle_worker.forward_batch_generation = patched_forward
-
-
-def _log_verify_trie_p_t(rec, verify_logits, req_idx, num_draft):
-    """Log p_t for union trie nodes from verification logits."""
-    import torch.nn.functional as F
-
-    trie = rec.get("union_trie", {})
-    token_ids = trie.get("token_ids", [])
-    parents = trie.get("parents", [])
-    n = min(len(token_ids), num_draft - 1)
-    if n == 0:
-        return
-
-    req_offset = req_idx * num_draft
-    p_t = []
-    for j in range(n):
-        tid = token_ids[j]
-        if parents[j] == -1:
-            parent_pos = req_offset + 0  # root position
-        else:
-            parent_pos = req_offset + 1 + parents[j]
-
-        if parent_pos >= len(verify_logits):
-            p_t.append(0.0)
-            continue
-
-        probs = F.softmax(verify_logits[parent_pos].float(), dim=-1)
-        p_t.append(probs[tid].item())
-
-    entry = {
-        "request_id": rec.get("request_id", ""),
-        "call_idx": rec.get("call_idx", 0),
-        "step_idx": rec.get("step_idx", 0),
-        "p_t": p_t,
-    }
-    try:
-        with open(VERIFY_P_T_LOG_PATH, "a") as f:
-            f.write(json.dumps(entry) + "\n")
-    except OSError:
-        pass

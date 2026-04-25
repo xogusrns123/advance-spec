@@ -45,7 +45,11 @@ from simulation.oracle.oracle_patch import (
     read_oracle_log,
     is_oracle_enabled,
 )
-from simulation.agents.tools.swebench import create_swebench_tools, create_sweagent_tools
+from simulation.agents.tools.swebench import (
+    create_swebench_tools,
+    create_sweagent_tools,
+    create_minisweagent_tools,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +78,125 @@ SYSTEM_PROMPT = (
     "- Use file_str_replace for targeted edits, file_write ONLY for new files\n"
     "- Make minimal, focused changes\n"
 )
+
+
+# mini-swe-agent style: copies the official benchmarks/swebench.yaml
+# templates verbatim. The system_template is intentionally one line; all
+# task-specific guidance lives in the instance_template that becomes the
+# first HumanMessage. The {{task}} placeholder is replaced with the PR
+# description / issue body at runtime.
+MINISWEAGENT_SYSTEM_PROMPT = (
+    "You are a helpful assistant that can interact with a computer shell "
+    "to solve programming tasks."
+)
+
+MINISWEAGENT_INSTANCE_TEMPLATE = """<pr_description>
+Consider the following PR description:
+{task}
+</pr_description>
+
+<instructions>
+# Task Instructions
+
+## Overview
+
+You're a software engineer interacting continuously with a computer by submitting commands.
+You'll be helping implement necessary changes to meet requirements in the PR description.
+Your task is specifically to make changes to non-test files in the current directory in order to fix the issue described in the PR description in a way that is general and consistent with the codebase.
+<IMPORTANT>This is an interactive process where you will think and issue AT LEAST ONE command, see the result, then think and issue your next command(s).</important>
+
+For each response:
+
+1. Include a THOUGHT section explaining your reasoning and what you're trying to accomplish
+2. Provide one or more bash tool calls to execute
+
+## Important Boundaries
+
+- MODIFY: Regular source code files in the working directory
+- DO NOT MODIFY: Tests, configuration files (pyproject.toml, setup.cfg, etc.)
+
+## Recommended Workflow
+
+1. Analyze the codebase by finding and reading relevant files
+2. Create a script to reproduce the issue
+3. Edit the source code to resolve the issue
+4. Verify your fix works by running your script again
+5. Test edge cases to ensure your fix is robust
+
+## Command Execution Rules
+
+You are operating in an environment where
+
+1. You issue at least one command
+2. The system executes the command(s) in a subshell
+3. You see the result(s)
+4. You write your next command(s)
+
+Each response should include:
+
+1. **Reasoning text** where you explain your analysis and plan
+2. At least one tool call with your command
+
+**CRITICAL REQUIREMENTS:**
+
+- Your response SHOULD include reasoning text explaining what you're doing
+- Your response MUST include AT LEAST ONE bash tool call. You can make MULTIPLE tool calls in a single response when the commands are independent (e.g., searching multiple files, reading different parts of the codebase).
+- Directory or environment variable changes are not persistent. Every action is executed in a new subshell.
+- However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...` or write/load environment variables from files
+
+Example of a CORRECT response:
+<example_response>
+I need to understand the Builder-related code. Let me find relevant files and check the project structure.
+
+[Makes multiple bash tool calls: {"command": "ls -la"}, {"command": "find src -name '*.java' | grep -i builder"}, {"command": "cat README.md | head -50"}]
+</example_response>
+
+## Environment Details
+
+- You have a full Linux shell environment
+- Always use non-interactive flags (-y, -f) for commands
+- Avoid interactive tools like vi, nano, or any that require user input
+- You can use bash commands or invoke any tool that is available in the environment
+- You can also create new tools or scripts to help you with the task
+- If a tool isn't available, you can also install it
+
+## Submission
+
+When you've completed your work, you MUST submit your changes as a git patch.
+Follow these steps IN ORDER, with SEPARATE commands:
+
+Step 1: Create the patch file
+Run `git diff -- path/to/file1 path/to/file2 > patch.txt` listing only the source files you modified.
+Do NOT commit your changes.
+
+<IMPORTANT>
+The patch must only contain changes to the specific source files you modified to fix the issue.
+Do not submit file creations or changes to any of the following files:
+
+- test and reproduction files
+- helper scripts, tests, or tools that you created
+- installation, build, packaging, configuration, or setup scripts unless they are directly part of the issue you were fixing (you can assume that the environment is already set up for your client)
+- binary or compiled files
+</IMPORTANT>
+
+Step 2: Verify your patch
+Inspect patch.txt to confirm it only contains your intended changes and headers show `--- a/` and `+++ b/` paths.
+
+Step 3: Submit (EXACT command required)
+You MUST use this EXACT command to submit:
+
+```bash
+echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat patch.txt
+```
+
+If the command fails (nonzero exit status), it will not submit.
+
+<CRITICAL>
+- Creating/viewing the patch and submitting it MUST be separate commands (not combined with &&).
+- If you modify patch.txt after verifying, you SHOULD verify again before submitting.
+- You CANNOT continue working (reading, editing, testing) in any way on this task after submitting.
+</CRITICAL>
+</instructions>"""
 
 
 # ---------------------------------------------------------------------------
@@ -203,15 +326,34 @@ def process_request(
     # Create tools
     if tool_style == "sweagent":
         tools = create_sweagent_tools(workdir, repo=repo)
+    elif tool_style == "minisweagent":
+        tools = create_minisweagent_tools(workdir, repo=repo)
     else:
         tools = create_swebench_tools(workdir, repo=repo)
     tool_map = {t.name: t for t in tools}
-    llm_with_tools = llm.bind_tools(tools, parallel_tool_calls=False)
+    # mini-swe-agent's official config sets parallel_tool_calls=True; keep
+    # serial calls for the other styles since their tool sets weren't
+    # designed for that.
+    parallel_tool_calls = (tool_style == "minisweagent")
+    llm_with_tools = llm.bind_tools(
+        tools, parallel_tool_calls=parallel_tool_calls)
 
-    # Initialize messages
+    # Initialize messages — pick prompt template to match the active tool
+    # set. mini-swe-agent splits role (system) from task instructions
+    # (instance template wrapped around the PR description).
+    if tool_style == "minisweagent":
+        sys_prompt = MINISWEAGENT_SYSTEM_PROMPT
+        # Use replace, not str.format — the template contains JSON-like
+        # examples (e.g. {"command": "ls"}) that would otherwise be parsed
+        # as format placeholders.
+        first_user = MINISWEAGENT_INSTANCE_TEMPLATE.replace(
+            "{task}", str(request["turns"][0]))
+    else:
+        sys_prompt = SYSTEM_PROMPT
+        first_user = request["turns"][0]
     messages = [
-        SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content=request["turns"][0]),
+        SystemMessage(content=sys_prompt),
+        HumanMessage(content=first_user),
     ]
 
     t_start = time.perf_counter()
@@ -266,24 +408,49 @@ def process_request(
                 "response": ai_msg.content or "",
             })
 
-            # Check for completion
+            # Termination logic:
+            #  * tool_styles with a `submit` tool (full / sweagent): no
+            #    tool_calls is treated as a parser misconfiguration → nudge
+            #    the model. Explicit `submit` call breaks the loop.
+            #  * mini-swe-agent style: no `submit` tool exists, and the
+            #    system prompt says "produce a final assistant message with
+            #    no further tool calls" to submit. Empty tool_calls is the
+            #    intended termination signal — break.
+            has_submit_tool = "submit" in tool_map
             if not ai_msg.tool_calls:
-                break
-            if any(tc["name"] == "submit" for tc in ai_msg.tool_calls):
+                if not has_submit_tool:
+                    break  # mini-swe-agent style: empty tool_calls = submit
+                messages.append(HumanMessage(
+                    content=(
+                        "Your previous response did not call any tool. You "
+                        "must respond with a tool call. Use the `submit` "
+                        "tool when the task is complete; otherwise call one "
+                        "of the available tools to continue."
+                    )
+                ))
+                continue
+            if has_submit_tool and any(
+                    tc["name"] == "submit" for tc in ai_msg.tool_calls):
                 break
 
-            # Limit to single tool call (Llama 3.1 compat)
-            if len(ai_msg.tool_calls) > 1:
+            # Limit to single tool call (Llama 3.1 compat). mini-swe-agent's
+            # official config enables parallel_tool_calls — preserve that
+            # by skipping the truncation for that style.
+            if tool_style != "minisweagent" and len(ai_msg.tool_calls) > 1:
                 ai_msg = AIMessage(
                     content=ai_msg.content,
                     tool_calls=[ai_msg.tool_calls[0]],
                 )
                 messages[-1] = ai_msg
 
-            # Execute tools
+            # Execute tools. mini-swe-agent's submission protocol asks the
+            # model to run ``echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT &&
+            # cat patch.txt`` as the final command. We honour that
+            # sentinel: append the tool result as usual, then break out of
+            # the loop without scheduling another LLM turn.
+            submit_signal = False
             for tc in ai_msg.tool_calls:
                 tool_name = tc["name"]
-                t_tool = time.perf_counter()
                 try:
                     if tool_name in tool_map:
                         result = tool_map[tool_name].invoke(tc["args"])
@@ -295,6 +462,15 @@ def process_request(
                 messages.append(
                     ToolMessage(content=str(result), tool_call_id=tc["id"])
                 )
+
+                if (tool_style == "minisweagent"
+                        and tool_name == "bash"
+                        and "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
+                        in str(tc["args"].get("command", ""))):
+                    submit_signal = True
+
+            if submit_signal:
+                break
 
     except Exception as e:
         return {
@@ -442,6 +618,7 @@ def run_benchmark(
     tool_style: str = "full",
     num_workers: int = 1,
     replay: str | None = None,
+    resume: bool = False,
 ) -> None:
     """Run SWE-Bench benchmark with oracle collection."""
     collect_oracle = is_oracle_enabled()
@@ -451,7 +628,8 @@ def run_benchmark(
     else:
         print("Oracle collection disabled (set SGLANG_ORACLE_VANILLA=1 to enable)")
 
-    dataset = load_swebench_dataset(input_file, num_requests)
+    # Load full dataset; --num-requests applies AFTER resume filter.
+    dataset = load_swebench_dataset(input_file, None)
 
     # Load Round 1 results for replay mode
     round1_by_id = {}
@@ -464,8 +642,34 @@ def run_benchmark(
         print(f"REPLAY mode: following trajectory from {replay}")
         print(f"  Round 1 questions: {len(round1_by_id)}")
 
+    # Resume: skip instances already in checkpoint partial.
+    from simulation.pipeline.save_results import (
+        load_checkpoint, append_to_checkpoint, save_agent_results,
+        checkpoint_path,
+    )
+    cp = load_checkpoint(output_file) if resume else None
+    done = set()
+    questions: list = []
+    total_oracle = 0
+    total_steps = 0
+    if cp:
+        questions = list(cp.get("questions", []))
+        for q in questions:
+            done.add(str(q.get("instance_id", "")))
+            for s in q.get("agent_metrics", {}).get("steps", []):
+                total_steps += 1
+                total_oracle += len(
+                    s.get("spec_decode", {}).get("oracle_vanilla_entries", []))
+        print(f"RESUME: {len(done)} instances already done; skipping them")
+
+    pending = [r for r in dataset
+               if str(r.get("instance_id", "")) not in done]
+    if num_requests is not None:
+        pending = pending[:num_requests]
+
     mode_str = "replay" if replay else "normal"
-    print(f"Running {len(dataset)} SWE-Bench instances ({mode_str}) against {url}")
+    print(f"Running {len(pending)}/{len(dataset)} SWE-Bench instances "
+          f"({mode_str}) against {url}")
 
     llm = ChatOpenAI(
         base_url=url,
@@ -475,21 +679,17 @@ def run_benchmark(
         max_tokens=4096,
     )
 
-    # Collect base_commits for cleanup
+    # Collect base_commits for cleanup (only for what we'll touch this run)
     base_commits = {
         r["instance_id"]: r["base_commit"]
-        for r in dataset
+        for r in pending
         if r.get("instance_id") and r.get("base_commit")
     }
 
     # Initialize repos (skip in replay mode — no tool execution)
-    if not replay:
+    if not replay and pending:
         print("Initializing repositories...")
         _cleanup_repos(repos_dir, base_commits)
-
-    questions = []
-    total_oracle = 0
-    total_steps = 0
 
     if replay:
         def _process(request):
@@ -505,28 +705,14 @@ def run_benchmark(
                 collect_oracle, tool_style)
 
     if num_workers <= 1:
-        results_iter = (_process(r) for r in dataset)
+        results_iter = (_process(r) for r in pending)
     else:
         from concurrent.futures import ThreadPoolExecutor
         executor = ThreadPoolExecutor(max_workers=num_workers)
-        results_iter = executor.map(_process, dataset)
+        results_iter = executor.map(_process, pending)
 
-    for result in tqdm(results_iter, total=len(dataset), desc="SWE-Bench"):
-        if result is None:
-            continue
-        questions.append(result)
-        for s in result.get("agent_metrics", {}).get("steps", []):
-            total_steps += 1
-            total_oracle += len(
-                s.get("spec_decode", {}).get("oracle_vanilla_entries", []))
-
-    # Cleanup repos after all instances
-    print("Cleaning up repositories...")
-    _cleanup_repos(repos_dir, base_commits)
-
-    # Save results
-    output = {
-        "metadata": {
+    def _meta():
+        return {
             "model": model,
             "url": url,
             "benchmark": "swebench",
@@ -535,12 +721,29 @@ def run_benchmark(
             "total_steps": total_steps,
             "max_iterations": max_iterations,
             "oracle_enabled": collect_oracle,
-        },
-        "questions": questions,
-    }
+        }
 
-    from simulation.pipeline.save_results import save_agent_results
+    for result in tqdm(results_iter, total=len(pending), desc="SWE-Bench"):
+        if result is None:
+            continue
+        questions.append(result)
+        for s in result.get("agent_metrics", {}).get("steps", []):
+            total_steps += 1
+            total_oracle += len(
+                s.get("spec_decode", {}).get("oracle_vanilla_entries", []))
+        append_to_checkpoint(output_file, result, _meta())
+
+    # Cleanup repos after this batch
+    if not replay and pending:
+        print("Cleaning up repositories...")
+        _cleanup_repos(repos_dir, base_commits)
+
+    output = {"metadata": _meta(), "questions": questions}
     save_agent_results(output, output_file)
+    try:
+        checkpoint_path(output_file).unlink()
+    except FileNotFoundError:
+        pass
 
     print(f"\nResults saved to {output_file}")
     print(f"  Instances: {len(questions)}")
@@ -588,12 +791,14 @@ def main():
     parser.add_argument("--max-iterations", type=int, default=15)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--tool-style", default="full",
-                        choices=["full", "sweagent"],
+                        choices=["full", "sweagent", "minisweagent"],
                         help="Tool style: full (6 tools) or sweagent (3 tools)")
     parser.add_argument("--num-workers", type=int, default=1,
                         help="Concurrent requests (caution: SWE-bench repos may conflict)")
     parser.add_argument("--replay", default=None,
                         help="Path to Round 1 agent_results.json for replay mode")
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip instances already saved in <output>.partial")
     args = parser.parse_args()
 
     run_benchmark(
@@ -608,6 +813,7 @@ def main():
         tool_style=args.tool_style,
         num_workers=args.num_workers,
         replay=args.replay,
+        resume=args.resume,
     )
 
 

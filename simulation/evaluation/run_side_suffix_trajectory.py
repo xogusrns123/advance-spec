@@ -264,7 +264,7 @@ def main():
         "and at every base-tree node.",
         file=sys.stderr)
 
-    from simulation.pipeline.collect_union_trie import (
+    from simulation.pipeline.assemble_records import (
         assemble_records_from_artifacts,
     )
 
@@ -278,7 +278,6 @@ def main():
         model=args.model,
         dataset_path=args.dataset,
         responses_path=args.responses,
-        include_union_trie=False,
     )
     print(f"Assembled {len(records)} step records in "
           f"{time.time() - t0:.2f}s", file=sys.stderr)

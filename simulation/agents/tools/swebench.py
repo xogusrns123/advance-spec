@@ -618,3 +618,98 @@ def create_sweagent_tools(workdir: str, repo: str = "") -> list:
         return "Submission successful."
 
     return [bash, str_replace_editor, submit]
+
+
+# ── mini-swe-agent compatible: bash-only ────────────────────────────
+
+
+_MSWA_LONG_OUTPUT_WARNING = (
+    "The output of your last command was too long.\n"
+    "Please try a different command that produces less output.\n"
+    "If you're looking at a file you can try use head, tail or sed to view a smaller number of lines selectively.\n"
+    "If you're using grep or find and it produced too much output, you can use a more selective search pattern.\n"
+    "If you really need to see something from the full command's output, you can redirect output to a file and then search in that file."
+)
+
+
+def _format_minisweagent_observation(
+    output: str, returncode: int, exception_info: str = "",
+) -> str:
+    """Render mini-swe-agent's official observation_template (default.yaml).
+
+    Threshold: 10000 chars on the *bash output* (stdout+stderr). Below it,
+    the model sees the full output; above, head[:5000] + elided count +
+    tail[-5000:]. Thinking tokens in the model's own response are NOT
+    affected — only this tool result is bounded.
+    """
+    parts: list[str] = []
+    if exception_info:
+        parts.append(f"<exception>{exception_info}</exception>")
+    parts.append(f"<returncode>{returncode}</returncode>")
+    if len(output) < 10000:
+        parts.append(f"<output>\n{output}\n</output>")
+    else:
+        elided = len(output) - 10000
+        parts.append(f"<warning>\n{_MSWA_LONG_OUTPUT_WARNING}\n</warning>")
+        parts.append(f"<output_head>\n{output[:5000]}\n</output_head>")
+        parts.append(
+            f"<elided_chars>\n{elided} characters elided\n</elided_chars>")
+        parts.append(f"<output_tail>\n{output[-5000:]}\n</output_tail>")
+    return "\n".join(parts)
+
+
+def create_minisweagent_tools(workdir: str, repo: str = "") -> list:
+    """Create a bash-only tool set matching mini-swe-agent's official
+    SWE-Bench config (``benchmarks/swebench.yaml`` + ``default.yaml``).
+
+    Mini-swe-agent's reference setup gives the model a single shell
+    interpreter (``bash -c``) and lets it submit by running a sentinel
+    echo. We expose only ``bash`` here; submission is handled by the
+    agent loop's marker detection on the issued command.
+
+    Tool output is rendered with the official observation_template:
+      • ``<returncode>`` always present
+      • output < 10000 chars → ``<output>...</output>`` verbatim
+      • output ≥ 10000 chars → warning + head[:5000] + elided count + tail[-5000:]
+
+    Args:
+        workdir: Absolute path to the repository root directory.
+        repo:    GitHub repo identifier (unused, kept for API parity).
+
+    Returns:
+        Single-element list containing the bash tool.
+    """
+    workdir = os.path.abspath(workdir)
+
+    @tool
+    def bash(command: str) -> str:
+        """Execute a shell command in the repository directory.
+
+        Args:
+            command: The shell command to execute.
+
+        Returns:
+            Output rendered with mini-swe-agent's observation_template
+            (head/tail truncation when long; full text otherwise).
+        """
+        try:
+            python_exe = shutil.which("python3") or shutil.which("python") or "python3"
+            if command.startswith("python "):
+                command = python_exe + " " + command[7:]
+            env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+            result = subprocess.run(
+                command, shell=True, cwd=workdir,
+                capture_output=True, text=True, timeout=60, env=env,
+            )
+            output = (result.stdout or "") + (result.stderr or "")
+            return _format_minisweagent_observation(
+                output, result.returncode)
+        except subprocess.TimeoutExpired:
+            return _format_minisweagent_observation(
+                "", -1,
+                exception_info="Command timed out after 60 seconds.")
+        except Exception as e:
+            return _format_minisweagent_observation(
+                "", -1, exception_info=str(e))
+
+    return [bash]

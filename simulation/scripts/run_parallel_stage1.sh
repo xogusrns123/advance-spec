@@ -49,7 +49,7 @@ echo "======================================"
 export SGLANG_ORACLE_VANILLA=1
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 export TORCHINDUCTOR_COMPILE_THREADS=1
-unset SGLANG_ORACLE_REPLAY SGLANG_ORACLE_VERIFY_TRIES
+unset SGLANG_ORACLE_REPLAY
 
 python3 -m simulation.oracle.install_hook
 
@@ -125,33 +125,43 @@ import json, sys
 output_dir = '$OUTPUT_DIR'
 num_gpus = $NUM_GPUS
 merged_questions = []
-total_tokens = 0
-total_oracle = 0
+
+# Use the first successful shard's metadata as the baseline so per-agent
+# fields (url, benchmark, total_tool_calls, etc.) are not silently dropped.
+# Then sum the additive fields across all shards.
+SUMMABLE = {'total_tokens', 'total_oracle_entries', 'total_tool_calls'}
+base_meta = None
+sums = {k: 0 for k in SUMMABLE}
 
 for shard_idx in range(num_gpus):
     shard_path = f'{output_dir}/_stage1_shard{shard_idx}/agent_results.json'
     try:
         d = json.load(open(shard_path))
-        merged_questions.extend(d.get('questions', []))
-        m = d.get('metadata', {})
-        total_tokens += m.get('total_tokens', 0)
-        total_oracle += m.get('total_oracle_entries', 0)
     except Exception as e:
         print(f'WARN: shard {shard_idx} failed: {e}', file=sys.stderr)
+        continue
+    merged_questions.extend(d.get('questions', []))
+    m = d.get('metadata', {})
+    if base_meta is None:
+        base_meta = dict(m)
+    for k in SUMMABLE:
+        if k in m:
+            sums[k] += m.get(k, 0)
 
-output = {
-    'metadata': {
-        'model': '$MODEL',
-        'num_requests': len(merged_questions),
-        'total_tokens': total_tokens,
-        'total_oracle_entries': total_oracle,
-        'oracle_enabled': True,
-    },
-    'questions': merged_questions,
-}
+output_meta = base_meta or {}
+output_meta['model'] = '$MODEL'
+output_meta['num_requests'] = len(merged_questions)
+for k, v in sums.items():
+    if k in output_meta or v > 0:
+        output_meta[k] = v
+output_meta.setdefault('oracle_enabled', True)
+
+output = {'metadata': output_meta, 'questions': merged_questions}
 with open(f'{output_dir}/agent_results_eagle3.json', 'w') as f:
     json.dump(output, f)
-print(f'Merged: {len(merged_questions)} requests, {total_tokens} tokens, {total_oracle} oracle')
+print(f'Merged: {len(merged_questions)} requests, '
+      f'{sums[\"total_tokens\"]} tokens, '
+      f'{sums[\"total_oracle_entries\"]} oracle')
 "
 
 # Cleanup shard dirs only if all shards succeeded (preserve server.log / agent.log

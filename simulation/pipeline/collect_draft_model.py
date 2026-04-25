@@ -1,9 +1,10 @@
-"""Collect per-step draft-model proposals (Stage 3b).
+"""Collect per-step draft-model proposals (Stage 2).
 
 For each decoding step in agent_results_eagle3.json, call a small draft LM
 (e.g. Qwen/Qwen3-0.6B) on the per-step context and record its flat
-autoregressive draft chain. Stage 4 (collect_union_trie) consumes this file
-to merge draft-model proposals into the union trie.
+autoregressive draft chain. Stage 3 (run_tree_oracle_sim) reads this file
+via simulation.pipeline.assemble_records.assemble_records_from_artifacts
+and attaches each per-step record's draft-model tree to per_proposer.
 
 Two backends are supported:
   --server-url <url>   → SGLang server (preferred, uses prefix caching)

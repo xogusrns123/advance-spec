@@ -1,0 +1,56 @@
+{
+  "vanilla_step_ms": 15.8242,
+  "target_forward_ms": {
+    "16": 15.8242,
+    "64": 20.646
+  },
+  "eagle3_draft_ms": {
+    "16": 3.105,
+    "64": 3.073
+  },
+  "eagle3_draft_ms_by_steps": {
+    "2": {
+      "16": 1.476,
+      "64": 1.496
+    },
+    "4": {
+      "16": 3.105,
+      "64": 3.073
+    }
+  },
+  "draft_lm_tpot_ms": 11.328,
+  "suffix_speculate_ms": 0.013,
+  "_metadata": {
+    "target_model": "Qwen/Qwen3-8B",
+    "draft_model": "Tengyunw/qwen3_8b_eagle3",
+    "draft_lm": "Qwen/Qwen3-0.6B",
+    "canonical_steps": 4,
+    "draft_ref_n": 3,
+    "available_steps": [
+      2,
+      4
+    ],
+    "available_budgets": [
+      16,
+      64
+    ],
+    "aggregation": "median across workloads (+steps for target_forward_ms)",
+    "source_files": {
+      "eagle3_cost": "/workspace/simulation/results/latency/qwen3_8b/smoke/eagle3_cost.json",
+      "draft_model_cost": "/workspace/simulation/results/latency/qwen3_8b/draft_model_cost.json",
+      "suffix_cost": "/workspace/simulation/results/latency/qwen3_8b/suffix_cost.json"
+    }
+  },
+  "_detailed": {
+    "draft_lm_tpot_ms_by_n": {
+      "1": 32.227,
+      "3": 11.328,
+      "5": 9.769
+    },
+    "suffix_speculate_ms_by_workload": {
+      "specbench": 0.0095,
+      "bfcl_v4": 0.013,
+      "swebench": 0.0132
+    }
+  }
+}

@@ -1,21 +1,28 @@
 #!/usr/bin/env bash
-# Run Stage 6 (oracle sim) by sharding the budget list into parallel processes.
+# Rerun Stage 3 (oracle simulation) on an existing pipeline output dir,
+# sharding the budget list into parallel processes so the large budgets
+# (which dominate wall time) can run alongside the small-budget shard.
 # Merges partial outputs into a single tree_oracle_sim.json.
 #
 # Usage: bash simulation/scripts/rerun_stage6_sharded.sh <output_dir>
 set -euo pipefail
 D=${1:?Usage: $0 <output_dir>}
 
-# Pick the freshest available union-trie artifact
-if [ -f "$D/union_trie_data_with_pt.jsonl" ]; then
-  UNION_TRIE="$D/union_trie_data_with_pt.jsonl"
-elif [ -f "$D/union_trie_data.jsonl" ]; then
-  UNION_TRIE="$D/union_trie_data.jsonl"
-else
-  echo "ERROR: no union_trie_data*.jsonl found in $D"
+AGENT_RESULTS="$D/agent_results_eagle3.json"
+if [ ! -f "$AGENT_RESULTS" ]; then
+  echo "ERROR: $AGENT_RESULTS not found"
   exit 1
 fi
-echo "Using union trie: $UNION_TRIE"
+
+DM_FLAG=""
+if [ -f "$D/draft_model_drafts.jsonl" ]; then
+  DM_FLAG="--draft-model-drafts $D/draft_model_drafts.jsonl"
+fi
+
+LATENCY_FLAG=""
+if [ -f "$D/latency_config.json" ]; then
+  LATENCY_FLAG="--latency-config $D/latency_config.json"
+fi
 
 # Budget shards: small group together, large each get own shard
 BUDGETS_A="1,2,4,8,16,32,64"
@@ -35,12 +42,12 @@ for SH in A B C D; do
   esac
   (
     python3 -m simulation.evaluation.run_tree_oracle_sim \
-      --union-trie-data "$UNION_TRIE" \
+      --agent-results "$AGENT_RESULTS" \
+      $DM_FLAG \
       --budgets "$B" \
-      --p-t-key p_t \
       --output "$D/tree_oracle_sim_part_${SH}.json" \
-      --latency-config "$D/latency_config.json" \
-      --print-summary > "/tmp/stage6_${SAFE_D}_${SH}.log" 2>&1
+      $LATENCY_FLAG \
+      --print-summary > "/tmp/stage3_${SAFE_D}_${SH}.log" 2>&1
   ) &
   PIDS+=($!)
 done

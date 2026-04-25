@@ -101,8 +101,13 @@ def simulate_decoding(
     for sk in sequences:
         sequences[sk].sort()
 
-    # Determine if this method has draft cost.
-    is_hybrid = method.startswith("hybrid_e3:") or method.startswith("hybrid_dm:")
+    # Determine if this method has draft cost. Methods that pick suffix vs
+    # eagle3 per-step (= hybrid family) need conditional draft accounting.
+    # extension_hybrid* fall in the same bucket: they pick suffix-only or
+    # extension fallback per step based on a score threshold.
+    is_hybrid = (method.startswith("hybrid_e3:")
+                 or method.startswith("hybrid_dm:")
+                 or method.startswith("extension_hybrid"))
     # ``no_draft`` is used ONLY by the ratio-based cost model to represent
     # "this method has zero draft overhead" (single:suffix's draft is
     # CPU-side, overlapped with target forward). The real-cost accumulator
@@ -229,6 +234,21 @@ def simulate_decoding(
                     base_proposer="draft_model")
                 ext_size = (_extension_step._last_base_size
                             + _extension_step._last_accepted_suffix)
+            elif method == "extension_oracle_path":
+                # Stricter oracle: only the accepted path is charged —
+                # base nodes that aren't on the accepted path are pruned
+                # too (not just non-accepted suffix extensions).
+                accepted, _ = _extension_step(
+                    rec, budget, local_cache, cache_req_id,
+                    base_proposer="eagle3")
+                ext_size = (_extension_step._last_accepted_base
+                            + _extension_step._last_accepted_suffix)
+            elif method == "extension_dmsfx_oracle_path":
+                accepted, _ = _extension_step(
+                    rec, budget, local_cache, cache_req_id,
+                    base_proposer="draft_model")
+                ext_size = (_extension_step._last_accepted_base
+                            + _extension_step._last_accepted_suffix)
             elif method.startswith("extension_by_count:"):
                 # Count cap = B × count_ratio (ratio > 1). Base tree stays
                 # at budget B; suffix extensions fill up to C = B × ratio.
@@ -284,8 +304,47 @@ def simulate_decoding(
                 accepted, ext_size = _extension_step(
                     rec, budget, local_cache, cache_req_id,
                     base_proposer="eagle3", pt_threshold=t)
+            elif method.startswith("extension_prune_pt:"):
+                # Prune backbone itself where path_p_t < t.
+                t = float(method.split(":", 1)[1])
+                accepted, ext_size = _extension_step(
+                    rec, budget, local_cache, cache_req_id,
+                    base_proposer="eagle3", backbone_pt_threshold=t)
+            elif method.startswith("extension_prune_pt_oracle:"):
+                # Backbone pruned + accepted-only suffix cost accounting.
+                t = float(method.split(":", 1)[1])
+                accepted, _ = _extension_step(
+                    rec, budget, local_cache, cache_req_id,
+                    base_proposer="eagle3", backbone_pt_threshold=t)
+                ext_size = (_extension_step._last_base_size
+                            + _extension_step._last_accepted_suffix)
             elif is_hybrid:
-                if method.startswith("hybrid_e3:"):
+                if method.startswith("extension_hybrid_prune_pt_oracle:"):
+                    # extension_hybrid_prune_pt_oracle:t_prune:t_thresh
+                    parts = method.split(":")
+                    backbone_t = float(parts[1])
+                    threshold = float(parts[2])
+                    accepted, ext_size, used_suffix = _extension_hybrid_step(
+                        rec, budget, threshold, local_cache, cache_req_id,
+                        backbone_pt_threshold=backbone_t, oracle=True)
+                elif method.startswith("extension_hybrid_prune_pt:"):
+                    parts = method.split(":")
+                    backbone_t = float(parts[1])
+                    threshold = float(parts[2])
+                    accepted, ext_size, used_suffix = _extension_hybrid_step(
+                        rec, budget, threshold, local_cache, cache_req_id,
+                        backbone_pt_threshold=backbone_t, oracle=False)
+                elif method.startswith("extension_hybrid_oracle:"):
+                    threshold = float(method.split(":", 1)[1])
+                    accepted, ext_size, used_suffix = _extension_hybrid_step(
+                        rec, budget, threshold, local_cache, cache_req_id,
+                        oracle=True)
+                elif method.startswith("extension_hybrid:"):
+                    threshold = float(method.split(":", 1)[1])
+                    accepted, ext_size, used_suffix = _extension_hybrid_step(
+                        rec, budget, threshold, local_cache, cache_req_id,
+                        oracle=False)
+                elif method.startswith("hybrid_e3:"):
                     threshold = float(method.split(":", 1)[1])
                     accepted, used_suffix = _hybrid_step(
                         rec, budget, threshold, fallback="eagle3",
@@ -534,12 +593,59 @@ def _hybrid_step(rec: dict, budget: int, threshold: float,
     return 0, False
 
 
+def _extension_hybrid_step(
+    rec: dict, budget: int, threshold: float,
+    suffix_cache, cache_req_id: str,
+    backbone_pt_threshold: Optional[float] = None,
+    oracle: bool = False,
+) -> tuple:
+    """Extension-hybrid: per-step pick between suffix-only and an extension fallback.
+
+    * If live suffix score ≥ threshold: use suffix tree alone (cheap; no
+      eagle3 draft cost; verify size = len(suffix tree)).
+    * Otherwise: fall back to the extension method (eagle3 backbone, optionally
+      pruned by ``backbone_pt_threshold``, with suffix attached at every base
+      node). Returned ext_size depends on ``oracle``:
+        - oracle=False: full extended tree size (deployable)
+        - oracle=True:  base_size_after_prune + accepted_suffix
+                        ("intermediate" oracle — only suffix-side oracle)
+
+    Returns (accepted, ext_size, used_suffix).
+    """
+    gt = rec.get("ground_truth_future", [])
+    if not gt:
+        return 0, 0, False
+
+    base_context = rec.get("context_token_ids") or []
+    sfx_tids, sfx_pids, sfx_score = _live_suffix_draft(
+        suffix_cache, cache_req_id, base_context)
+    use_suffix = (sfx_tids is not None and sfx_score >= threshold)
+
+    if use_suffix:
+        accepted = greedy_tree_walk(sfx_tids, sfx_pids, gt)
+        return accepted, max(1, len(sfx_tids)), True
+
+    # Extension fallback (deployable or oracle-accounting)
+    accepted, ext_size_full = _extension_step(
+        rec, budget, suffix_cache, cache_req_id,
+        base_proposer="eagle3",
+        backbone_pt_threshold=backbone_pt_threshold,
+    )
+    if oracle:
+        ext_size = (_extension_step._last_base_size
+                    + _extension_step._last_accepted_suffix)
+    else:
+        ext_size = ext_size_full
+    return accepted, max(1, ext_size), False
+
+
 def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str,
                     base_proposer: str = "eagle3",
                     score_threshold: Optional[float] = None,
                     max_count: Optional[int] = None,
                     pathprob_threshold: Optional[float] = None,
-                    pt_threshold: Optional[float] = None):
+                    pt_threshold: Optional[float] = None,
+                    backbone_pt_threshold: Optional[float] = None):
     """Extension: base proposer's tree (truncated to budget) + suffix extension
     at every node.
 
@@ -558,6 +664,13 @@ def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str,
                          ``product(p_t along root→node) × draft.score >= t``
                          (weights deeper nodes less since reaching them
                          requires all ancestors to also be accepted).
+      pt_threshold — skip suffix anchoring at base nodes whose path_p_t
+                         is below t. Base node itself is kept.
+      backbone_pt_threshold — prune base tree itself: remove base nodes
+                         with path_p_t < t (and their subtrees). Suffix
+                         extension then only attaches at surviving base
+                         nodes. Since path_p_t is monotone non-increasing
+                         along paths, filter keeps a valid subtree.
     max_count: overall extended-tree size cap (stops extending once
         len(ext_tids) >= max_count). Combines with any filter above.
     """
@@ -625,6 +738,41 @@ def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str,
                 node_p_t[i] = path_p_t[i] / parent_path
             else:
                 node_p_t[i] = 0.0
+
+    # Backbone prune: drop base nodes whose cumulative draft probability
+    # falls below the threshold. path_p_t is monotone non-increasing along
+    # each root→leaf path (each step multiplies by node_p_t ≤ 1), so the
+    # keep-mask defines a valid subtree (no orphan fixup needed). If
+    # path_p_t is unavailable, the filter silently no-ops.
+    if backbone_pt_threshold is not None and path_p_t is not None:
+        keep = [path_p_t[i] >= backbone_pt_threshold for i in range(n)]
+        if not all(keep):
+            old_to_new: Dict[int, int] = {}
+            new_tids: List[int] = []
+            new_pids: List[int] = []
+            new_paths: List[List[int]] = []
+            new_path_p_t: List[float] = []
+            new_node_p_t: List[float] = [] if node_p_t is not None else None
+            for i in range(n):
+                if not keep[i]:
+                    continue
+                po = pids[i]
+                pn = old_to_new.get(po, -1) if po >= 0 else -1
+                old_to_new[i] = len(new_tids)
+                new_tids.append(tids[i])
+                new_pids.append(pn)
+                new_paths.append(paths[i])
+                new_path_p_t.append(path_p_t[i])
+                if new_node_p_t is not None:
+                    new_node_p_t.append(node_p_t[i])
+            tids = new_tids
+            pids = new_pids
+            ext_tids = list(new_tids)
+            ext_pids = list(new_pids)
+            paths = new_paths
+            path_p_t = new_path_p_t
+            node_p_t = new_node_p_t
+            n = len(ext_tids)
 
     allowed_nodes = None
 
@@ -844,6 +992,7 @@ def compute_latency_speedup(
     latency_config: dict,
     topk: Optional[int] = None,
     steps: Optional[int] = None,
+    method_filter: Optional[set] = None,
 ) -> dict:
     """Run step-by-step simulation for each budget with measured latencies.
 
@@ -1082,8 +1231,26 @@ def compute_latency_speedup(
             if k in sim:
                 entry[f"{prefix}_{k}"] = sim[k]
 
+    def _method_allowed(method_key: str) -> bool:
+        if method_filter is None:
+            return True
+        # Matching rules:
+        #   exact:                  "extension" matches only "extension"
+        #   trailing colon prefix:  "hybrid_e3:" matches all hybrid_e3:* variants
+        #   trailing asterisk:      "extension*" matches all extension_* variants
+        for pat in method_filter:
+            if method_key == pat:
+                return True
+            if pat.endswith(":") and method_key.startswith(pat):
+                return True
+            if pat.endswith("*") and method_key.startswith(pat[:-1]):
+                return True
+        return False
+
     def _run(method_key, sim_fn_kwargs, prefix):
         """Run one simulation and log timing. sim_fn_kwargs is kwargs dict for simulate_decoding."""
+        if not _method_allowed(method_key):
+            return
         t0 = time.time()
         sim = simulate_decoding(**sim_fn_kwargs)
         dt = time.time() - t0
@@ -1218,6 +1385,15 @@ def compute_latency_speedup(
                   "real_step_target_fn": _target_forward,
                   "real_step_draft_only_ms": ext_draft_only},
                  "extension_oracle")
+            # Stricter oracle: prune base nodes outside the accepted path
+            # in addition to unaccepted suffix extensions.
+            _run("extension_oracle_path",
+                 {**common, "method": "extension_oracle_path",
+                  "suffix_cache": _SUFFIX_ENABLED,
+                  "real_step_cost_ms": ext_cost_fallback,
+                  "real_step_target_fn": _target_forward,
+                  "real_step_draft_only_ms": ext_draft_only},
+                 "extension_oracle_path")
             # Extension by count cap. Base tree stays at budget B; total
             # tree (base + suffix extensions) capped at C = B × ratio.
             # ratio must be > 1 to leave room for suffix beyond the base
@@ -1292,6 +1468,67 @@ def compute_latency_speedup(
                           "real_step_target_fn": _target_forward,
                           "real_step_draft_only_ms": ext_draft_only},
                          f"extension_by_pt_t{t}")
+            # prune_pt: actually remove base nodes with path_p_t < t
+            # (not just skip their suffix anchor). Cuts verify cost.
+            if has_draft_p_t:
+                for t in [0.001, 0.005, 0.01, 0.05, 0.1, 0.3]:
+                    _run(f"extension_prune_pt:{t}",
+                         {**common, "method": f"extension_prune_pt:{t}",
+                          "suffix_cache": _SUFFIX_ENABLED,
+                          "real_step_cost_ms": ext_cost_fallback,
+                          "real_step_target_fn": _target_forward,
+                          "real_step_draft_only_ms": ext_draft_only},
+                         f"extension_prune_pt_t{t}")
+                    _run(f"extension_prune_pt_oracle:{t}",
+                         {**common, "method": f"extension_prune_pt_oracle:{t}",
+                          "suffix_cache": _SUFFIX_ENABLED,
+                          "real_step_cost_ms": ext_cost_fallback,
+                          "real_step_target_fn": _target_forward,
+                          "real_step_draft_only_ms": ext_draft_only},
+                         f"extension_prune_pt_oracle_t{t}")
+
+            # Extension-Hybrid: per-step pick between suffix-only (when
+            # suffix.score ≥ threshold; cheap, no eagle3 draft) and an
+            # extension fallback (eagle3 backbone + suffix attached at every
+            # node; full draft + per-tree-size verify cost). Combines
+            # hybrid's threshold-based switching with extension's chain
+            # capability.
+            for t in [0.1, 1.0, 5.0]:
+                _run(f"extension_hybrid:{t}",
+                     {**common, "method": f"extension_hybrid:{t}",
+                      "suffix_cache": _SUFFIX_ENABLED,
+                      "real_step_cost_ms": ext_cost_fallback,
+                      "real_step_cost_suffix_ms": suffix_only_cost,
+                      "real_step_target_fn": _target_forward,
+                      "real_step_draft_only_ms": ext_draft_only},
+                     f"extension_hybrid_t{t}")
+                _run(f"extension_hybrid_oracle:{t}",
+                     {**common, "method": f"extension_hybrid_oracle:{t}",
+                      "suffix_cache": _SUFFIX_ENABLED,
+                      "real_step_cost_ms": ext_cost_fallback,
+                      "real_step_cost_suffix_ms": suffix_only_cost,
+                      "real_step_target_fn": _target_forward,
+                      "real_step_draft_only_ms": ext_draft_only},
+                     f"extension_hybrid_oracle_t{t}")
+                for pt in [0.001, 0.01, 0.1]:
+                    _run(f"extension_hybrid_prune_pt:{pt}:{t}",
+                         {**common,
+                          "method": f"extension_hybrid_prune_pt:{pt}:{t}",
+                          "suffix_cache": _SUFFIX_ENABLED,
+                          "real_step_cost_ms": ext_cost_fallback,
+                          "real_step_cost_suffix_ms": suffix_only_cost,
+                          "real_step_target_fn": _target_forward,
+                          "real_step_draft_only_ms": ext_draft_only},
+                         f"extension_hybrid_prune_pt_p{pt}_t{t}")
+                    _run(f"extension_hybrid_prune_pt_oracle:{pt}:{t}",
+                         {**common,
+                          "method": f"extension_hybrid_prune_pt_oracle:{pt}:{t}",
+                          "suffix_cache": _SUFFIX_ENABLED,
+                          "real_step_cost_ms": ext_cost_fallback,
+                          "real_step_cost_suffix_ms": suffix_only_cost,
+                          "real_step_target_fn": _target_forward,
+                          "real_step_draft_only_ms": ext_draft_only},
+                         f"extension_hybrid_prune_pt_oracle_p{pt}_t{t}")
 
         # Extension with draft_model base + suffix extensions
         if "suffix" in proposers and "draft_model" in proposers:
@@ -1319,6 +1556,13 @@ def compute_latency_speedup(
                   "real_step_target_fn": _target_forward,
                   "real_step_draft_only_ms": ext_dm_draft_only},
                  "extension_dmsfx_oracle")
+            _run("extension_dmsfx_oracle_path",
+                 {**common, "method": "extension_dmsfx_oracle_path",
+                  "suffix_cache": _SUFFIX_ENABLED,
+                  "real_step_cost_ms": ext_dm_cost_fallback,
+                  "real_step_target_fn": _target_forward,
+                  "real_step_draft_only_ms": ext_dm_draft_only},
+                 "extension_dmsfx_oracle_path")
             for r in [2, 4, 8]:
                 _run(f"extension_dmsfx_by_count:{r}",
                      {**common, "method": f"extension_dmsfx_by_count:{r}",
@@ -1469,14 +1713,43 @@ def main():
                              "Used together with --topk to pick the right "
                              "eagle3_draft_ms table.")
     parser.add_argument("--print-summary", action="store_true")
+    parser.add_argument("--reslice-steps", type=int, default=None,
+                        help="When set together with --reslice-topk, the per-step "
+                             "EAGLE3 tree is rebuilt from the captured full pool "
+                             "(SGLANG_CAPTURE_FULL_POOL=1) at this depth (s'). "
+                             "Requires --capture-steps and --capture-topk to "
+                             "describe the original (S, K) used at capture time.")
+    parser.add_argument("--reslice-topk", type=int, default=None,
+                        help="Per-parent topk (k') for the resliced tree.")
+    parser.add_argument("--capture-steps", type=int, default=None,
+                        help="Original S used during Stage 1 capture (e.g. 8). "
+                             "Required when --reslice-steps is set.")
+    parser.add_argument("--capture-topk", type=int, default=None,
+                        help="Original K used during Stage 1 capture (e.g. 16). "
+                             "Required when --reslice-steps is set.")
+    parser.add_argument("--methods", default=None,
+                        help="Comma-separated method names/prefixes to run; "
+                             "omit to run all. Examples: "
+                             "'single:eagle3,single:suffix,hybrid_e3:1.0,"
+                             "extension,extension_oracle'. Use a bare prefix "
+                             "like 'extension' to match all extension_* variants.")
     args = parser.parse_args()
 
     if not args.output and not args.print_summary:
         parser.error("At least one of --output or --print-summary required")
 
+    eagle3_reslice = None
+    if args.reslice_steps is not None or args.reslice_topk is not None:
+        if not (args.reslice_steps and args.reslice_topk
+                and args.capture_steps and args.capture_topk):
+            parser.error("--reslice-steps, --reslice-topk, --capture-steps, "
+                         "--capture-topk must all be set together.")
+        eagle3_reslice = (args.capture_steps, args.capture_topk,
+                          args.reslice_steps, args.reslice_topk)
+
     budgets = [int(b) for b in args.budgets.split(",")]
 
-    from simulation.pipeline.collect_union_trie import (
+    from simulation.pipeline.assemble_records import (
         assemble_records_from_artifacts,
     )
     records = assemble_records_from_artifacts(
@@ -1488,7 +1761,7 @@ def main():
         model=args.model,
         dataset_path=args.dataset,
         responses_path=args.responses,
-        include_union_trie=False,
+        eagle3_reslice=eagle3_reslice,
     )
     input_source = args.agent_results
 
@@ -1510,9 +1783,15 @@ def main():
             "draft_lm_tpot_ms": 0.0,
         }
 
+    method_filter = None
+    if args.methods:
+        method_filter = set(m.strip() for m in args.methods.split(",")
+                            if m.strip())
+
     latency_results = compute_latency_speedup(
         records, budgets, latency_config,
-        topk=args.topk, steps=args.steps)
+        topk=args.topk, steps=args.steps,
+        method_filter=method_filter)
 
     if args.print_summary:
         print_summary(budgets)
