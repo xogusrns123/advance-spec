@@ -418,6 +418,7 @@ def run_benchmark(
     num_workers: int = 1,
     replay: str | None = None,
     resume: bool = False,
+    include_category: str | None = None,
 ) -> None:
     """Run BFCLv4 agentic benchmark."""
     collect_oracle = is_oracle_enabled()
@@ -430,6 +431,14 @@ def run_benchmark(
     # round-robin coordinator that calls with --num-requests 1 --resume
     # advances by one new request each invocation.
     dataset = load_bfcl_v4_dataset(input_file, None)
+
+    # Optional category filter (substring match, e.g. "web_search" to skip
+    # memory_* prereq dependencies which dominate the priority queue when
+    # round-robin batch=1).
+    if include_category:
+        before = len(dataset)
+        dataset = [r for r in dataset if include_category in (r.get("category") or "")]
+        print(f"--include-category {include_category!r}: kept {len(dataset)}/{before}")
 
     # Load Round 1 results for replay mode
     round1_by_id = {}
@@ -558,6 +567,11 @@ def main():
                         help="Path to Round 1 agent_results.json for replay mode")
     parser.add_argument("--resume", action="store_true",
                         help="Skip requests already saved in <output>.partial")
+    parser.add_argument("--include-category", default=None,
+                        help="Substring filter on entry['category']; "
+                             "e.g. 'web_search' to skip memory_* (which "
+                             "have prereq dependencies that block "
+                             "round-robin --num-requests 1)")
     args = parser.parse_args()
 
     run_benchmark(
@@ -570,6 +584,7 @@ def main():
         num_workers=args.num_workers,
         replay=args.replay,
         resume=args.resume,
+        include_category=args.include_category,
     )
 
 

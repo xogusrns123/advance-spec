@@ -173,7 +173,11 @@ step 별 옵션 필드:
 
 ### 1.9 Top-level metadata
 
-`bfcl_agent.py:509-520` 의 `run_benchmark` 가 작성한 후 shard merger 가 **덮어쓴다** (`docs/01_stage1_overview.md` §2.7 참조). 머지에서 살아남지 못하는 per-shard 필드: `url`, `total_tool_calls`.
+`bfcl_agent.py:528-539` 의 `_meta()` closure 가 작성. shard merger 의 metadata 보존은 `01_stage1_overview.md` §2.7 참조 — 첫 샤드 metadata 가 베이스로 채택되고 합산 가능 필드 (`total_tokens`/`total_oracle_entries`/`total_tool_calls`) 만 합쳐진다.
+
+### 1.10 Resume / per-request checkpoint
+
+`--resume` flag (`bfcl_agent.py:581-582`). `bfcl_v4_agent.py:573-574` 와 동일 패턴. 활성화되면 `simulation.pipeline.save_results.load_checkpoint(output_file)` 가 `<output>.partial` (없으면 finalized `<output>`) 을 읽어 done set 을 만들고 입력 dataset 에서 제외 (`:464-484`). `--num-requests` 는 resume 필터 **이후** 적용. 매 result 후 `append_to_checkpoint(...)` (`:553`), 종료 시 `finalize_checkpoint(...)` (`:557`) 로 partial → final rename. **Replay 경로는 resume 미지원** (`:483-487` 의 코멘트) — Round 1 trajectory 와 1:1 짝짓기가 필요해서.
 
 ---
 
@@ -560,7 +564,7 @@ mini-swe-agent 는 **submit tool 이 없다.** 대신:
 
 매 result 후 `append_to_checkpoint(output_file, result, _meta())` (`:559`) 가 partial JSONL 을 atomic write (tmpfile + `os.replace`) 로 다시 쓴다 — 중단/재개 안전하지만 N 개 request 처리 시 매 step 마다 전체 partial 을 rewrite 하므로 IO 가 O(N²) 누적 (`save_results.py:88` 주석에서 "수십 MB 까진 OK").
 
-`bfcl_v4_agent.py:417-579`, `specbench_agent.py:215-360` 도 동일 패턴으로 resume 지원. `bfcl_agent.py` (BFCLv3) 는 미지원.
+`bfcl_v4_agent.py:417-579`, `specbench_agent.py:215-360`, `bfcl_agent.py:428-595` 모두 동일 패턴으로 resume 지원. 네 agent 모두 일관됨.
 
 ---
 

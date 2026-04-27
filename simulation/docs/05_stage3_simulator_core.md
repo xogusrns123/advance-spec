@@ -78,12 +78,28 @@ return _proposer_tree_walk(rec.per_proposer, proposer_name, gt, budget)
 ### 4.2 `hybrid_e3:{t}` / `hybrid_dm:{t}` — `_hybrid_step` (line 537)
 
 ```python
-sfx_tids, sfx_pids, sfx_score = _live_suffix_draft(...)
+sfx_tids, sfx_pids, sfx_score = _live_suffix_draft(..., paper_faithful=True)
 use_suffix = (sfx_tids is not None and sfx_score >= threshold)
 if use_suffix:
     return greedy_tree_walk(sfx_tids, sfx_pids, gt), True
 return _proposer_tree_walk(per_proposer, fallback, gt, budget), False
 ```
+
+이 게이팅 로직은 SuffixDecoding 논문 (NeurIPS 2025 spotlight, [arxiv 2411.04975](https://arxiv.org/abs/2411.04975)) 의 hybrid baseline 정의 그대로 — *"use SuffixDecoding's fast speculation whenever the confidence score exceeds a threshold, falling back to model-based speculation otherwise"* (CMU CSD blog). `score = sum of estimated probabilities of speculated tokens` (ArcticInference docstring).
+
+**Suffix 호출 hyperparameter — 두 regime 분리** (`_live_suffix_draft:653`):
+
+| 인자 | `paper_faithful=True` (hybrid 게이팅) | `paper_faithful=False` default (single:suffix / extension* / side trajectory) |
+|---|---|---|
+| `max_spec_factor` | 1.0 (논문 default) | 4.0 |
+| `min_token_prob` | 0.1 (논문 default) | 0.0 |
+| `max_spec_tokens` | None (논문 default, factor·match_len 만 적용) | 256 |
+| `use_tree_spec` | True | True |
+| `max_spec_offset` | 0.0 (default) | 0.0 (default) |
+
+`use_tree_spec=True` 만 두 regime 모두 강제 — 우리 tree-기반 method 들과 candidate 모양을 동등하게 비교하기 위함. 논문 hybrid 가 chain-mode 가 default 지만 tree↔chain 선택은 score 게이팅과 직교적이라 tree 로 통일.
+
+`hybrid_*` / `extension_hybrid_*` 분기 (`is_hybrid=True`) 의 ext_size 측정용 재호출 (`run_tree_oracle_sim.py:467`) 도 `paper_faithful=True` 로 — 게이팅 호출과 같은 트리 size 가 나와야 verify cost 회계가 정합. `single:suffix` (`:482`) 와 `_single_proposer_step` 의 suffix 분기 (`:1390`) 는 우리 ceiling 측정이므로 default (aggressive) 유지.
 
 `af92e9f` 의 fix — `compute_latency_speedup` 호출부에서 `suffix_cache=_SUFFIX_ENABLED` 를 hybrid kwargs 에 명시적으로 설정 (lines 1226–1253). 누락되면 `_live_suffix_draft` 가 `(None, None, 0.0)` 을 반환해서 영원히 fallback 만 선택되고, 그 결과 `hybrid_e3_t*_mat == eagle3_mat` 가 되는 silent bug 였다.
 
@@ -107,6 +123,20 @@ return _proposer_tree_walk(per_proposer, fallback, gt, budget), False
 `*_by_count:r` 는 `cap = max(1, round(B*r))` 로 전체 ext tree 크기를 제한, `*_by_score:t` / `*_by_pathprob:t` / `*_by_pt:t` 는 anchor 필터 (suffix anchor 만 skip, base node 는 유지). `*_prune_pt:t` / `*_prune_pt_oracle:t` 는 base tree 자체를 prune — `_extension_step` 의 `backbone_pt_threshold` 인자 (lines 633-668) 가 `path_p_t < t` 인 base node 와 그 subtree 를 제거. `path_p_t` 가 path 따라 monotone non-increasing 이므로 keep-mask 가 valid subtree 를 만든다 (orphan fixup 불필요). 두 변종의 차이는 oracle cost: `*_oracle` 은 accepted suffix 만 verify cost 로 청구.
 
 `extension_oracle_path` / `extension_dmsfx_oracle_path` (lines 232-244) 는 가장 strict 한 lower bound — base node 도 accepted path 만 cost 로 친다 (`ext_size = base_accepted + suffix_accepted`).
+
+### 4.4 `extension_nlevel*` 시리즈 — `_extension_nlevel_step` (commit `20fb84d`)
+
+`_extension_step` 의 1-level suffix graft 를 **N 레벨 재귀 graft** 로 확장. eagle3 backbone + virtual-root suffix + 모든 base node 의 1차 suffix 까지는 동일하지만, 그 다음 level 2..N 에서는 직전 round 의 fringe (in-tree leaf) 마다 추가 `suffix_cache.speculate(context = base_context + leaf_path)` 호출. `extension_oracle` 의 ceiling 을 깨는 게 의도.
+
+| Method | 의도 |
+|---|---|
+| `extension_nlevel_oracle:N` | N-level 재귀 graft + accepted-suffix-only cost |
+| `extension_nlevel_capped:N:max_size` | N-level + 전체 ext tree 노드 수 hard cap. deployable budget 가드 |
+| `extension_nlevel_capped_oracle:N:max_size` | 위 + oracle cost accounting |
+
+`_extension_nlevel_step` 의 `max_count` 가드는 root_draft / per-base-node graft / per-leaf graft 각 단계의 outer loop break + inner `ext_tids.append` 루프 break 양쪽에 모두 들어가 있어 하나도 누락 없이 cap 을 강제한다 (`run_tree_oracle_sim.py:724, 743, 762, 794, 807, 828, 860`). `score_threshold` 도 root / per-node / per-leaf 세 분기 모두에 적용 (`:723-725, 778-780, 844-846`); `getattr(draft, "score", 0.0)` fallback 이 있어 score attribute 누락 시 0.0 으로 처리 → threshold > 0 이면 silent skip.
+
+`compute_latency_speedup` 에서 자동 enroll: `n_lvl ∈ {2, 3} × max_size ∈ {B*2, B*4, B*8}` (capped), 각각 oracle/non-oracle 변종.
 
 ## 5. Acceptance 계산
 

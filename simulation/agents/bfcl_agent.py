@@ -428,6 +428,7 @@ def run_benchmark(
     temperature: float = 0.0,
     replay: str | None = None,
     num_workers: int = 1,
+    resume: bool = False,
 ) -> dict:
     """Run full BFCL benchmark and save results.
 
@@ -435,9 +436,15 @@ def run_benchmark(
         replay: Path to Round 1 agent_results.json for replay mode.
                 If set, replays the exact message history from Round 1
                 to collect MTP drafts on the same trajectory.
+        resume: When True, skip requests already present in the
+                output file's checkpoint partial; ``--num-requests`` then
+                applies AFTER the resume filter (round-robin coordinator
+                pattern).
     """
     client = OpenAI(base_url=url, api_key="dummy")
-    dataset = load_bfcl_dataset(input_file, num_requests)
+    # Load full dataset; --num-requests applied AFTER resume filter so the
+    # round-robin coordinator can advance one new request per invocation.
+    dataset = load_bfcl_dataset(input_file, None)
     dataset = preprocess_bfcl_requests(dataset)
     collect_oracle = is_oracle_enabled()
 
@@ -454,15 +461,38 @@ def run_benchmark(
     else:
         print("Oracle collection disabled (set SGLANG_ORACLE_VANILLA=1 to enable)")
 
-    print(f"Running {len(dataset)} BFCL requests against {url}"
-          f" (workers={num_workers})")
-
-    results = []
+    # Resume support: skip requests already in the checkpoint partial.
+    from simulation.pipeline.save_results import (
+        load_checkpoint, append_to_checkpoint, finalize_checkpoint,
+    )
+    cp = load_checkpoint(output_file) if resume else None
+    done = set()
+    results: list = []
     total_oracle_entries = 0
     total_tokens = 0
     total_tool_calls = 0
+    if cp:
+        results = list(cp.get("questions", []))
+        for q in results:
+            done.add(str(q.get("bfcl_id", q.get("id", ""))))
+            for s in q.get("agent_metrics", {}).get("steps", []):
+                total_tokens += s.get("completion_tokens", 0)
+                total_oracle_entries += len(
+                    s.get("spec_decode", {}).get("oracle_vanilla_entries", []))
+                if s.get("has_tool_calls"):
+                    total_tool_calls += 1
+        print(f"RESUME: {len(done)} requests already done; skipping them")
+
+    pending = [r for r in dataset
+               if str(r.get("bfcl_id", r.get("id", ""))) not in done]
+    if num_requests is not None:
+        pending = pending[:num_requests]
+    print(f"Running {len(pending)}/{len(dataset)} BFCL requests against {url}"
+          f" (workers={num_workers})")
 
     if replay and round1_data:
+        # Replay path doesn't get resume support (single-shot trajectory
+        # follow); use the full dataset paired with Round 1 results.
         pairs = list(zip(dataset, round1_data["questions"]))
 
         def _process_replay(pair):
@@ -477,6 +507,7 @@ def run_benchmark(
             from concurrent.futures import ThreadPoolExecutor
             executor = ThreadPoolExecutor(max_workers=num_workers)
             results_iter = executor.map(_process_replay, pairs)
+        iter_total = len(pairs)
     else:
         def _process_normal(item):
             return run_single_request(
@@ -485,13 +516,28 @@ def run_benchmark(
                 collect_oracle=collect_oracle)
 
         if num_workers <= 1:
-            results_iter = (_process_normal(item) for item in dataset)
+            results_iter = (_process_normal(item) for item in pending)
         else:
             from concurrent.futures import ThreadPoolExecutor
             executor = ThreadPoolExecutor(max_workers=num_workers)
-            results_iter = executor.map(_process_normal, dataset)
+            results_iter = executor.map(_process_normal, pending)
+        iter_total = len(pending)
 
-    for result in tqdm(results_iter, total=len(dataset), desc="BFCL"):
+    output_path = Path(output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _meta():
+        return {
+            "model": model,
+            "url": url,
+            "num_requests": len(results),
+            "total_oracle_entries": total_oracle_entries,
+            "total_tokens": total_tokens,
+            "total_tool_calls": total_tool_calls,
+            "oracle_enabled": collect_oracle,
+        }
+
+    for result in tqdm(results_iter, total=iter_total, desc="BFCL"):
         results.append(result)
 
         for step in result["agent_metrics"]["steps"]:
@@ -502,25 +548,11 @@ def run_benchmark(
             if step.get("has_tool_calls"):
                 total_tool_calls += 1
 
-    # Save results
-    output_path = Path(output_file)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+        # Per-question checkpoint append (rr coordinator can resume from here)
+        append_to_checkpoint(output_path, result, _meta())
 
-    output = {
-        "metadata": {
-            "model": model,
-            "url": url,
-            "num_requests": len(results),
-            "total_oracle_entries": total_oracle_entries,
-            "total_tokens": total_tokens,
-            "total_tool_calls": total_tool_calls,
-            "oracle_enabled": collect_oracle,
-        },
-        "questions": results,
-    }
-
-    from simulation.pipeline.save_results import save_agent_results
-    save_agent_results(output, output_path)
+    # Finalize: rename .partial → final
+    finalize_checkpoint(output_path, _meta())
 
     print(f"\nResults saved to {output_file}")
     print(f"  Requests: {len(results)}")
@@ -528,7 +560,7 @@ def run_benchmark(
     print(f"  Total tokens: {total_tokens}")
     print(f"  Tool calls: {total_tool_calls}")
 
-    return output
+    return {"metadata": _meta(), "questions": results}
 
 
 def main():
@@ -546,6 +578,8 @@ def main():
                         help="Path to Round 1 agent_results.json for replay mode")
     parser.add_argument("--num-workers", type=int, default=1,
                         help="Concurrent requests to SGLang server")
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip requests already in the checkpoint partial.")
     args = parser.parse_args()
 
     run_benchmark(
@@ -558,6 +592,7 @@ def main():
         temperature=args.temperature,
         replay=args.replay,
         num_workers=args.num_workers,
+        resume=args.resume,
     )
 
 

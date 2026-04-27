@@ -1,0 +1,62 @@
+# ============================================================
+# Round-Robin Stage 1 collection — qwen3_14b
+#
+# Single SGLang server boots once with (steps=8, topk=16, b=2 + full pool
+# capture). All workloads share the server; each gets `batch` new requests
+# per iteration via --resume. The simulator can later reslice the captured
+# pool to any (s'≤8, k'≤16) sub-tree.
+#
+# Run with:
+#   docker exec -u root -d sglang-bench bash -c \
+#     "cd /workspace && python3 simulation/scripts/run_experiment.py \
+#       simulation/config/rr_qwen3_14b.yaml > /tmp/rr_stage1.log 2>&1"
+# ============================================================
+name: rr_qwen3_14b
+
+model_preset: qwen3_14b
+
+# Single (steps, topk, num_draft_tokens) — RR mode requires exactly one.
+stage1_steps: 8
+stage1_configs:
+  - topk: 16
+    num_draft_tokens: 2     # tiny — full pool capture below makes target
+                             # verify cost negligible at draft-time.
+
+round_robin:
+  enabled: true
+  capture_full_pool: true   # SGLANG_CAPTURE_FULL_POOL=1 → eagle3_pool_full
+                            # captured per oracle entry; reslice offline.
+  batch: 1                  # --num-requests per agent invocation
+  resume: true
+
+# Workloads sharing the server. Order matters — each iter visits in order.
+workloads:
+  - specbench
+  - bfcl_v4
+  - swebench_verified
+  - longbench_lcc
+  - longbench_repobench
+
+# Per-workload runtime overrides (no dataset slicing on disk).
+workload_overrides:
+  specbench:
+    max_tokens_override: 1024
+  bfcl_v4:
+    max_iterations: 20
+    include_category: web_search   # skip memory_* (prereq dependency would
+                                    # block round-robin batch=1)
+  swebench_verified:
+    max_iterations: 250
+    tool_style: minisweagent
+    repos_dir: data/swebench_verified/repos
+  longbench_lcc:
+    max_tokens: 256
+  longbench_repobench:
+    max_tokens: 256
+
+infra:
+  port: 30000
+  gpu_ids: [0]              # RR runs on a single GPU.
+
+output:
+  root: simulation/results

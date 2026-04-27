@@ -1,0 +1,100 @@
+# ============================================================
+# Round-Robin Stage 1 collection — qwen3_8b (mango1, 4-GPU sharded)
+#
+# Mirror of `rr_qwen3_14b.yaml` (running on mango3 with 1 GPU) but with
+# qwen3_8b as target and 4 SGLang servers across 4 GPUs in parallel.
+# Each shard owns a disjoint subset of workloads; output dirs do not
+# collide because each workload is served by exactly one shard.
+#
+# Single (steps=8, topk=16, b=2 + full pool capture). Simulator can
+# later reslice the captured pool to any (s'≤8, k'≤16) sub-tree.
+#
+# Output dir: simulation/results/qwen3_8b/<workload>_steps8_topk16_capture/
+# (no collision with mango3's qwen3_14b/ tree).
+#
+# Run with:
+#   docker exec -u root -d sglang-bench bash -c \
+#     "cd /workspace && python3 simulation/scripts/run_experiment.py \
+#       simulation/config/mango1.yaml > /tmp/rr_stage1.log 2>&1"
+# ============================================================
+name: rr_qwen3_8b_mango1
+
+model_preset: qwen3_8b
+
+# EAGLE3 draft model for qwen3_8b.
+models:
+  draft_model: AngelSlim/Qwen3-8B_eagle3
+
+# Single (steps, topk, num_draft_tokens) — RR mode requires exactly one.
+stage1_steps: 8
+stage1_configs:
+  - topk: 16
+    num_draft_tokens: 2     # tiny — full pool capture below makes target
+                             # verify cost negligible at draft-time.
+
+round_robin:
+  enabled: true
+  capture_full_pool: true   # SGLANG_CAPTURE_FULL_POOL=1 → eagle3_pool_full
+                            # captured per oracle entry; reslice offline.
+  batch: 1                  # --num-requests per agent invocation
+  resume: true
+
+# Workloads sharing the experiment. Order in this list defines round-robin
+# rotation order WITHIN a shard.
+workloads:
+  - specbench
+  - bfcl_v4
+  - swebench_verified
+  - longbench_lcc
+  - longbench_repobench
+
+# Per-workload runtime overrides (no dataset slicing on disk).
+workload_overrides:
+  specbench:
+    max_tokens_override: 1024
+  bfcl_v4:
+    max_iterations: 20
+    include_category: web_search   # skip memory_* (prereq dependency would
+                                    # block round-robin batch=1)
+  swebench_verified:
+    max_iterations: 250
+    tool_style: minisweagent
+    repos_dir: data/swebench_verified/repos
+  longbench_lcc:
+    max_tokens: 256
+  longbench_repobench:
+    max_tokens: 256
+
+# 4-shard data-parallel: one SGLang server per GPU, each shard owns a
+# disjoint workload subset. With 5 workloads on 4 GPUs the heaviest are
+# split alone and the two lightest share one shard:
+#   shard 0  GPU 0  swebench_verified       (heaviest, alone)
+#   shard 1  GPU 1  longbench_lcc           (medium)
+#   shard 2  GPU 2  longbench_repobench     (medium)
+#   shard 3  GPU 3  bfcl_v4 + specbench     (small + small)
+# Each shard runs an independent RR loop; --resume picks up where its
+# workloads left off across restarts.
+shards:
+  - id: 0
+    gpu_ids: [0]
+    port: 30000
+    workloads: [swebench_verified]
+  - id: 1
+    gpu_ids: [1]
+    port: 30001
+    workloads: [longbench_lcc]
+  - id: 2
+    gpu_ids: [2]
+    port: 30002
+    workloads: [longbench_repobench]
+  - id: 3
+    gpu_ids: [3]
+    port: 30003
+    workloads: [bfcl_v4, specbench]
+
+infra:
+  port: 30000               # default port (used only if no `shards:` block)
+  gpu_ids: [0, 1, 2, 3]     # documents host GPUs; shards override per-server
+
+output:
+  root: simulation/results

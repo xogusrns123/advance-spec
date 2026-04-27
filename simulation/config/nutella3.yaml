@@ -45,7 +45,7 @@ defaults:
   req_start: 0
   req_end: 2
   max_tokens_override: null    # specbench only
-  max_iterations: null         # bfcl_v3 / bfcl_v4 / swebench
+  max_iterations: null         # bfcl_v4 / swebench
   input_file: null             # bfcl_v4 only (BFCL_V4_INPUT)
 
 # ============================================================
@@ -69,17 +69,9 @@ workload_overrides:
     max_iterations: 30
 
 # ============================================================
-# Stage toggles.
+# Stage 2 (draft model) settings.
 # ============================================================
-stages:
-  union_trie: false   # Stage 4 (collect_union_trie)
-  eu_oracle: false    # Stage 5 (collect p_t) + EU oracle in Stage 6
-                      # — requires union_trie: true.
-
-# ============================================================
-# Stage 3b (draft model) settings.
-# ============================================================
-stage3b:
+stage2:
   max_draft_tokens: 16
 
 # ============================================================
