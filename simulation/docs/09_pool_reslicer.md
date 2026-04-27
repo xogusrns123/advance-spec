@@ -6,7 +6,7 @@
 
 원래 sweep 방식: 각 `(S, K)` 마다 Stage 1 EAGLE3 run 을 다시 돌려야 했음 (`run_tree_oracle_sim.py` 는 Stage 1 에서 만들어진 truncated tree 를 그대로 소비). GPU 시간이 K · S grid 에 비례.
 
-Reslicer 는 한 번의 Stage 1 capture (가장 큰 `(S=S_max, K=K_max)` 로) 만 돌리고, 그 안에 들어 있는 **full pool** (truncate 전 score pool 전체) 로부터 임의의 `(s' ≤ S_max, k' ≤ K_max)` 의 tree 를 simulator-time 에 재구성한다. `_sweep_sk.sh` 가 한 capture artifact 로 9 개의 `(s, k)` 조합 (8/4/2 × 16/8/4) 을 직렬로 돌리는 것이 typical use.
+Reslicer 는 한 번의 RR Stage 1 capture (가장 큰 `(S=S_max, K=K_max)` 로) 만 돌리고, 그 안에 들어 있는 **full pool** (truncate 전 score pool 전체) 로부터 임의의 `(s' ≤ S_max, k' ≤ K_max)` 의 tree 를 simulator-time 에 재구성한다. `simulation/scripts/experiments/run_reslice_sweep.py` 가 한 capture artifact 위에서 여러 `(s, k)` 조합을 직렬로 돌리는 것이 typical use.
 
 핵심 가정: SGLang 의 `organize_draft_results` 가 path-prob 기준 top-k truncation 으로 tree 를 잘라낸다는 점 — 따라서 `(s', k')` 가 `(S, K)` 의 prefix-and-narrow 이면 같은 path_prob 랭킹을 reslicer 가 재현한다.
 
@@ -171,4 +171,4 @@ Fallback 동작:
 | `simulation/pipeline/assemble_records.py:139–164`      | per-step reslice 분기 + fallback warn |
 | `simulation/oracle/oracle_patch.py:341–396`            | full pool capture (`SGLANG_CAPTURE_FULL_POOL=1`) |
 | `simulation/evaluation/run_tree_oracle_sim.py:1578–1604` | `--reslice-steps/topk + --capture-steps/topk` flags |
-| `_sweep_sk.sh`                                          | 한 capture artifact → 9 (s, k) 조합 직렬 sweep |
+| `simulation/scripts/experiments/run_reslice_sweep.py`   | 한 capture artifact 위에서 여러 (s, k) 조합 sweep orchestrator |

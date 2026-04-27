@@ -232,9 +232,8 @@ step_real = real_step_target_fn(ext_size) + real_step_draft_only_ms
 | `measure_eagle3_cost.py` | `target_forward_ms_by_topk[K][B]`, `eagle3_draft_ms_by_topk_steps[K][S][B]` (실제 SGLang EAGLE3 oracle latency 모드) |
 | `measure_draft_model_cost.py` | `draft_lm_tpot_ms_by_n` → `draft_lm_tpot_ms` (canonical n=3) |
 | `measure_suffix_cost.py` | `suffix_speculate_ms_by_workload` → median |
-| `measure_step_latency.py` / `measure_verify_latency.py` / `measure_latency.py` | 옛 prototype 측정. 현재는 `compile_latency_config.py` 가 위 3 개를 결합 |
-| `bench_eagle3_configs.py` | end-to-end speedup 검증 (config compile 의 결과 검증용) |
 | `compile_latency_config.py` | 위 3 개 cost JSON → 단일 `latency_config.json` 합성 |
+| `simulation/scripts/experiments/remeasure_latency.sh` | 위 4개 wrapper |
 | `calibrate_latency.py` | ad-hoc TPOT 측정 (vanilla baseline 만) — production pipeline 과는 별도 |
 
 ### 8.2 Topk-aware 조회 (lines 949–993)

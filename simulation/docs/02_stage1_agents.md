@@ -35,7 +35,9 @@ if oracle_entries:
 
 ### 1.1 입력 데이터셋 포맷
 
-`data/bfcl_multi_turn/dataset.jsonl`, `prepare_bfcl_data.py:_load_bfcl_categories` 로 생성. 한 question 당 한 record.
+`data/bfcl_multi_turn/dataset_stratified_interleaved.jsonl`, `simulation/scripts/experiments/data_prep/` 의 prep 스크립트로 생성. 한 question 당 한 record.
+
+> **Note**: `bfcl_v3` 는 active workload 에서 제외됨 (`feedback_drop_bfcl_v3` 메모리). agent 코드는 참조용으로 유지.
 
 ```json
 {
@@ -114,7 +116,7 @@ Outer: `for turn_idx, turn_messages in enumerate(question)`
 (`bfcl_agent.py:177`).
 Inner: `for step in range(max_iterations)`
 (`bfcl_agent.py:187`).
-`max_iterations` 는 함수 시그니처상 default 20 이지만 `run_pipeline.sh` dispatch 에서는 5 (`run_pipeline.sh:83`). turn 내부의 stop 조건:
+`max_iterations` 는 함수 시그니처상 default 20. RR config (`workload_overrides.bfcl_v3.max_iterations`) 로 override. turn 내부의 stop 조건:
 
 - API call 예외 → `error` 기록, break.
 - Decode 예외 → `decode_error` 기록, break.
@@ -185,10 +187,10 @@ step 별 옵션 필드:
 
 ### 2.1 입력 데이터셋 포맷
 
-`data/bfcl_agent/dataset.jsonl`, `prepare_bfcl_data.py:135-212` 로 생성. BFCLv3 record 와 같지만 옵션으로 `depends_on` 추가. 카테고리는 `AGENTIC_CATEGORY` 아래 (web_search, memory, …) 위치. Loader: `load_bfcl_v4_dataset`
+`data/bfcl_agent/dataset_stratified_interleaved.jsonl`, `simulation/scripts/experiments/data_prep/` 의 prep 스크립트로 생성. BFCLv3 record 와 같지만 옵션으로 `depends_on` 추가. 카테고리는 `AGENTIC_CATEGORY` 아래 (web_search, memory, …) 위치. Loader: `load_bfcl_v4_dataset`
 (`bfcl_v4_agent.py:99-136`). `--num-requests N` 이 설정되면 loader 가 카테고리별로 stratify 하여 카테고리당 `N//len(cats)` 개를 취하고 N 으로 cap 한 뒤, 누락된 prereq dependency 를 다시 추가한다. `bfcl_eval.utils.sort_key` 로 정렬.
 
-`BFCL_V4_INPUT` 환경변수는 (`run_pipeline.sh:90` 에서 소비) 호출자가 사전 필터링된 데이터셋 (예: `web_search`-only) 으로 대체할 수 있게 해주어 prereq 확장이 요청 수를 부풀리지 않게 한다.
+RR config 의 `workload_overrides.bfcl_v4.include_category` (예: `web_search`) 로 카테고리 필터링 가능 — prereq 확장이 요청 수를 부풀리지 않게 한다.
 
 ### 2.2 프롬프트 구성
 
@@ -257,7 +259,7 @@ is_evaL_run=False)` (`bfcl_v4_agent.py:281-285`).
 ### 2.6 Iteration loop
 
 단일 loop: `for step in range(max_iterations)`
-(`bfcl_v4_agent.py:218`). `max_iterations` 는 함수 시그니처상 default 10 이지만 `run_pipeline.sh:92` 가 `${BFCL_MAX_ITER:-5}` 를 전달한다. cap 도달은 silent (마커 없음).
+(`bfcl_v4_agent.py:218`). `max_iterations` 는 함수 시그니처상 default 10. RR config 의 `workload_overrides.bfcl_v4.max_iterations` 로 override. cap 도달은 silent (마커 없음).
 
 ### 2.7 Resume / checkpoint 동작
 
@@ -326,7 +328,7 @@ response = client.chat.completions.create(
 )
 ```
 
-`specbench_agent.py:88-94`. `--max-tokens` CLI flag 를 노출하는 **유일한** agent. `run_pipeline.sh:195-197` 은 `BENCHMARK=specbench` 일 때만 `MAX_TOKENS_OVERRIDE` env 를 `--max-tokens` 로 전파.
+`specbench_agent.py:88-94`. `--max-tokens` CLI flag 를 노출하는 **유일한** agent. RR config 의 `workload_overrides.specbench.max_tokens_override` (또는 longbench_* 의 `max_tokens`) 가 `--max-tokens` 로 변환되어 전달.
 
 ### 3.4 Tool 파싱
 
@@ -468,7 +470,7 @@ for tc in ai_msg.tool_calls:
 ### 4.8 Iteration loop
 
 `for iteration in range(max_iterations)`
-(`swebench_agent.py:222`). `max_iterations` 는 함수상 default 15, `run_pipeline.sh:109` 에서 **30** (`SWE_MAX_ITER`).
+(`swebench_agent.py:222`). `max_iterations` 는 함수상 default 15. RR config 의 `workload_overrides.swebench_verified.max_iterations` 로 override (현재 mango3/mango1 RR 에서는 250).
 
 Stop 조건:
 - `not ai_msg.tool_calls` (`:270-271`) — 모델이 text-only 응답을 생성.
