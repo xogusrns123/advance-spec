@@ -23,7 +23,7 @@ Usage:
         --server-url http://localhost:31000 \\
         --max-draft-tokens 16
 
-    # Sharded parallel (see run_parallel_draft_model.sh)
+    # Sharded parallel (split workload across N processes by request id)
     ... --shard 0/4
 """
 
