@@ -91,6 +91,10 @@ WORKLOAD_REGISTRY: dict[str, dict] = {
         "agent_module": "simulation.agents.specbench_agent",
         "dataset": "data/longbench_repobench/dataset_interleaved.jsonl",
     },
+    "spider2_dbt": {
+        "agent_module": "simulation.agents.spider2_dbt_agent",
+        "dataset": "data/spider2_dbt/spider2-dbt.jsonl",
+    },
 }
 
 def as_list(v: Any) -> list:
@@ -184,6 +188,9 @@ def execute_round_robin(cfg: dict, dry_run: bool = False) -> int:
     capture_full_pool = bool(rr.get("capture_full_pool", True))
     batch = int(rr.get("batch", 1))
     resume = bool(rr.get("resume", True))
+    context_length = rr.get("context_length")
+    if context_length is not None:
+        context_length = int(context_length)
 
     # cfg_tag goes into the output dir suffix.
     cfg_tag = (rr.get("cfg_tag")
@@ -287,6 +294,7 @@ def execute_round_robin(cfg: dict, dry_run: bool = False) -> int:
         capture_full_pool=capture_full_pool,
         batch=batch, resume=resume,
         out_base=out_base, base_env=base_env,
+        context_length=context_length,
     )
 
     if len(shard_specs) == 1:
@@ -328,6 +336,7 @@ def _run_rr_shard(
     target_model: str, draft_model: str, tool_call_parser: str,
     steps: int, topk: int, ndt: int, capture_full_pool: bool,
     batch: int, resume: bool, out_base, base_env: dict,
+    context_length: int | None = None,
 ) -> int:
     """Boot one SGLang server on (gpu_ids, port) and run RR over `plan`."""
     rr_env = base_env.copy()
@@ -352,10 +361,15 @@ def _run_rr_shard(
         "--speculative-num-draft-tokens", str(ndt),
         "--tool-call-parser", tool_call_parser,
         "--mem-fraction-static", "0.85",
+        "--max-running-requests", "1",
+        "--max-prefill-tokens", "8192",
+        "--kv-cache-dtype", "fp8_e5m2",
         "--disable-cuda-graph",
         "--watchdog-timeout", "600",
         "--host", "0.0.0.0", "--port", str(port),
     ]
+    if context_length is not None:
+        cmd += ["--context-length", str(context_length)]
     print(f"[shard {shard_id}] Launching SGLang on port {port} "
           f"GPU={gpu_ids} (log: {srv_log})…")
     log_fh = open(srv_log, "w")
@@ -427,6 +441,13 @@ def _build_agent_extra_flags(workload: str, merged: dict) -> list[str]:
         elif workload == "swebench_verified":
             # default repo cache path used by rr
             flags += ["--repos-dir", "data/swebench_verified/repos"]
+    elif workload == "spider2_dbt":
+        if merged.get("max_iterations") is not None:
+            flags += ["--max-iterations", str(merged["max_iterations"])]
+        if merged.get("instances_dir"):
+            flags += ["--instances-dir", str(merged["instances_dir"])]
+        else:
+            flags += ["--instances-dir", "data/spider2_dbt/instances"]
     return flags
 
 

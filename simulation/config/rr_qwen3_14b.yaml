@@ -28,11 +28,17 @@ round_robin:
                             # captured per oracle entry; reslice offline.
   batch: 1                  # --num-requests per agent invocation
   resume: true
+  context_length: 131072    # Qwen3-14B w/ YaRN: 40960 native → 131072 max.
+                            # SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+                            # already set so SGLang accepts the override.
 
 # Workloads sharing the server. Order matters — each iter visits in order.
+# longbench restored 2026-04-28 per user direction (mango3 only — mango1
+# stays workload-filtered).
 workloads:
   - specbench
   - bfcl_v4
+  - spider2_dbt
   - swebench_verified
   - longbench_lcc
   - longbench_repobench
@@ -53,6 +59,9 @@ workload_overrides:
     max_tokens: 256
   longbench_repobench:
     max_tokens: 256
+  spider2_dbt:
+    max_iterations: 30
+    instances_dir: data/spider2_dbt/instances
 
 infra:
   port: 30000

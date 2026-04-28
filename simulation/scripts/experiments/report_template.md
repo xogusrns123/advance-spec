@@ -45,5 +45,4 @@ TBD — based on data, recommend: ...
 
 1. Run `_remeasure_latency.sh` with extended budgets (1024, 2048) once GPU free.
 2. Re-run sim with refreshed latency config.
-3. Try `extension_nlevel_sfx:N:F:T:M` parametric variant on best (F,T,N) found.
 4. Test on rr captures (steps8/topk16/full pool) for swebench_verified, longbench.

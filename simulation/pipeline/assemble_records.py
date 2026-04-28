@@ -25,6 +25,20 @@ from simulation.pipeline._agent_io import (
 )
 
 
+# Per-step context_token_ids and ground_truth_future were stored as full lists,
+# which creates O(N^2) memory blowup on long-trajectory workloads (swebench
+# instances with N~20k tokens × 17 reqs = ~95GB just for ground_truth_future).
+# The simulator only consumes:
+#   * full prompt: only on the FIRST record per (req, call) — for cache.start_request
+#   * context_token_ids: last max_tree_depth=64 tokens — for cache.speculate
+#   * ground_truth_future: first ≤budget tokens (for greedy_tree_walk and
+#     gt[:advance] commit) + an actual length (for seq_len computation)
+# So we trim non-first context to a tail (>= max_tree_depth) and gt to a head
+# (>= max budget seen in production) and store gt_len separately.
+_CONTEXT_KEEP_TAIL = 128  # > max_tree_depth=64
+_GT_FUTURE_KEEP = 1024    # > typical max budget 512
+
+
 # ---------------------------------------------------------------------------
 # Per-step draft loaders (Stage 2 outputs)
 # ---------------------------------------------------------------------------
@@ -116,6 +130,7 @@ def collect_step_records(
             else:
                 prompt = np.array([], dtype=np.int32)
             decoded: List[int] = []
+            first_in_call = True
 
             for pos in range(N):
                 future = tokens[pos:]
@@ -250,15 +265,30 @@ def collect_step_records(
                         entry["score"] = suffix_score
                     per_proposer[name] = entry
 
+                gt_full_len = len(future)
+                if gt_full_len > _GT_FUTURE_KEEP:
+                    gt_stored = list(future[:_GT_FUTURE_KEEP])
+                else:
+                    gt_stored = list(future)
+
+                if first_in_call:
+                    ctx_stored = context.tolist()
+                elif len(context) > _CONTEXT_KEEP_TAIL:
+                    ctx_stored = context[-_CONTEXT_KEEP_TAIL:].tolist()
+                else:
+                    ctx_stored = context.tolist()
+
                 record = {
                     "request_id": bfcl_id,
                     "call_idx": call_idx,
                     "step_idx": pos,
                     "per_proposer": per_proposer,
-                    "ground_truth_future": list(future),
-                    "context_token_ids": context.tolist(),
+                    "ground_truth_future": gt_stored,
+                    "gt_len": gt_full_len,
+                    "context_token_ids": ctx_stored,
                 }
                 records.append(record)
+                first_in_call = False
 
                 decoded.append(tokens[pos])
 
@@ -279,18 +309,21 @@ def assemble_records_from_artifacts(
     dataset_path: Optional[str] = None,
     responses_path: Optional[str] = None,
     eagle3_reslice: Optional[Tuple[int, int, int, int]] = None,
+    streaming: bool = True,
 ) -> List[dict]:
     """End-to-end loader: read Stage 1/2 artifacts, return per-step records.
 
     Mirrors the side effects of ``main()`` (tokenizer load, BFCL/SpecBench
     prompt reconstruction, per-step JSONL loading, MTP extraction) and
     produces the per-step record list that Stage 3 consumes directly.
+
+    streaming=True (default): use ijson to parse `questions[]` one item at a
+    time, run extract+collect per question, then release the parsed dict
+    before reading the next. Avoids the multi-tens-of-GB peak from holding
+    the full agent_results dict + all_requests + records simultaneously.
+    streaming=False falls back to ``json.load`` (legacy path).
     """
     exclude_ids = load_exclude_ids(exclude_path) if exclude_path else set()
-
-    print(f"Loading: {agent_results_path}", file=sys.stderr)
-    with open(agent_results_path) as f:
-        data = json.load(f)
 
     tokenizer = None
     if model:
@@ -329,11 +362,6 @@ def assemble_records_from_artifacts(
             print(f"WARN: SpecBench dataset load failed: {e}",
                   file=sys.stderr)
 
-    all_requests = extract_requests(
-        data, exclude_ids, None,
-        tokenizer, bfcl_dataset, resp_by_id, specbench_dataset)
-    print(f"Requests: {len(all_requests)}", file=sys.stderr)
-
     suffix_by_key: Dict[Tuple[str, int, int], dict] = {}
     if suffix_drafts_path:
         print(f"Loading suffix drafts: {suffix_drafts_path}", file=sys.stderr)
@@ -348,24 +376,80 @@ def assemble_records_from_artifacts(
         print(f"  {len(dm_by_key)} draft-model drafts", file=sys.stderr)
 
     mtp_all_requests = None
+    mtp_by_id: Optional[Dict[str, dict]] = None
     if mtp_agent_results_path:
+        # MTP path retains json.load for now (rarely used; keeps simple).
         print(f"Loading MTP data: {mtp_agent_results_path}", file=sys.stderr)
         with open(mtp_agent_results_path) as f:
             mtp_data = json.load(f)
         mtp_all_requests = extract_requests(mtp_data, exclude_ids)
         print(f"MTP requests: {len(mtp_all_requests)}", file=sys.stderr)
+        mtp_by_id = {mr["bfcl_id"]: mr for mr in mtp_all_requests}
 
+    if not streaming:
+        # Legacy: load full JSON at once.
+        print(f"Loading: {agent_results_path}", file=sys.stderr)
+        with open(agent_results_path) as f:
+            data = json.load(f)
+        all_requests = extract_requests(
+            data, exclude_ids, None,
+            tokenizer, bfcl_dataset, resp_by_id, specbench_dataset)
+        print(f"Requests: {len(all_requests)}", file=sys.stderr)
+        t0 = time.time()
+        print(f"Assembling per-step records for {len(all_requests)} "
+              f"requests...", file=sys.stderr)
+        records = collect_step_records(
+            all_requests,
+            suffix_by_key=suffix_by_key,
+            dm_by_key=dm_by_key,
+            mtp_requests=mtp_all_requests,
+            eagle3_reslice=eagle3_reslice,
+        )
+        elapsed = time.time() - t0
+        print(f"  assembled {len(records)} step records in {elapsed:.1f}s",
+              file=sys.stderr)
+        return records
+
+    # Streaming: parse questions[] one at a time via ijson, run extract +
+    # collect per question, then release. Peak memory is bounded by single
+    # question + accumulated records (small after reslice/truncation).
+    import ijson
+
+    print(f"Streaming: {agent_results_path}", file=sys.stderr)
+    records: List[dict] = []
     t0 = time.time()
-    print(f"Assembling per-step records for {len(all_requests)} requests...",
-          file=sys.stderr)
-    records = collect_step_records(
-        all_requests,
-        suffix_by_key=suffix_by_key,
-        dm_by_key=dm_by_key,
-        mtp_requests=mtp_all_requests,
-        eagle3_reslice=eagle3_reslice,
-    )
+    n_questions = 0
+    n_requests = 0
+    with open(agent_results_path, "rb") as f:
+        for q in ijson.items(f, "questions.item"):
+            n_questions += 1
+            single_data = {"questions": [q], "per_request": []}
+            reqs = extract_requests(
+                single_data, exclude_ids, None,
+                tokenizer, bfcl_dataset, resp_by_id, specbench_dataset)
+            if not reqs:
+                continue
+            # Per-question MTP attachment (look up by bfcl_id).
+            per_q_mtp = None
+            if mtp_by_id:
+                per_q_mtp = [mtp_by_id[r["bfcl_id"]] for r in reqs
+                             if r["bfcl_id"] in mtp_by_id]
+            partial = collect_step_records(
+                reqs,
+                suffix_by_key=suffix_by_key,
+                dm_by_key=dm_by_key,
+                mtp_requests=per_q_mtp,
+                eagle3_reslice=eagle3_reslice,
+            )
+            records.extend(partial)
+            n_requests += len(reqs)
+            if n_questions % 5 == 0:
+                print(f"  streamed {n_questions} questions, "
+                      f"{n_requests} reqs, {len(records)} steps",
+                      file=sys.stderr)
+            # q, reqs, single_data, partial(source) all out of scope after
+            # next iteration → resliced records survive, raw pool data freed.
     elapsed = time.time() - t0
-    print(f"  assembled {len(records)} step records in {elapsed:.1f}s",
-          file=sys.stderr)
+    print(f"  streamed {n_questions} questions → {n_requests} reqs → "
+          f"{len(records)} step records in {elapsed:.1f}s", file=sys.stderr)
     return records

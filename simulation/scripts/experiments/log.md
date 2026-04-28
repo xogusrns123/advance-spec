@@ -26,10 +26,6 @@
 | `extension_by_pt:t` | adaptive anchor — skip suffix at base nodes with path_p_t < t |
 | `extension_prune_pt:t` | backbone prune — drop low-pt base nodes entirely |
 | `extension_by_pathprob:t` | combined pt × suffix_score filter |
-| `extension_nlevel:N` | recursive suffix grafts at leaves, N levels deep |
-| `extension_nlevel_capped:N:M` | nlevel + tree size cap at M nodes |
-| `extension_nlevel_msf:N:F` | nlevel + adaptive max_spec_factor |
-| `extension_nlevel_prune_pt:N:t` | nlevel + backbone prune |
 | `extension_hybrid:t` | per-step gate: suffix-only if score≥t else extension fallback |
 | `extension_hybrid_perfect_oracle` | per-step ORACLE picks better of {suffix-only, ext} |
 | `extension_dmsfx*` | draft-LM base + suffix grafts (deferred) |
@@ -46,9 +42,7 @@
 | bfcl_v3 | 15 | TBD | TBD | TBD | v2 sim timed out (3000s); needs re-sim with smaller scope |
 | specbench | 65 (rr, growing) | not run yet | not run yet | — | rr collecting |
 
-**Pattern**: ALL workloads hit a ceiling around +20-27% real gap (when nlevel oracle is included). Structural reason: ext step_cost (~50ms) > hybrid step_cost (~41ms, vanilla floor) due to eagle3_draft + larger verify tree. Mat advantage (1.5-2x) gets eaten by cost penalty (1.2x).
 
-**Allowed oracle methods only (no nlevel — user explicitly disqualified as unrealistic, 2026-04-26):**
 
 | Workload | best ext_or (1-level only) | spd_real | hybrid_e3 spd_real | gap |
 |---|---|---|---|---|
@@ -56,7 +50,6 @@
 | longbench_repobench | `extension_oracle` | 1.55 | 1.46 | +5.9% |
 | **swebench_verified** | **`extension_hybrid_perfect_oracle`** | **3.73** | 3.14 | **+18.7%** ★ |
 
-**True ceiling without nlevel = +18.7%**. 50% gap requires +31.3% more — much harder than previously thought. nlevel-inflated +27% on swebench was over-optimistic.
 
 ### 🎯 2026-04-26 19:30 — swebench_verified s=2 k=16 reslice: +43.9% real gap (1-level only) ★
 
@@ -206,7 +199,6 @@ Each method picked its own (s, k, B, threshold). No same-reslice constraint.
 ### LCC structural ceiling = +23% under fair cost
 
 - per-token floor ≈ 20ms (target_forward(small_B) = 40ms, mat = 1.49 gives 40/2.49 ≈ 16ms, plus overhead 4ms)
-- Tested: extension_sfx sweep, by_pt, by_pathprob, prune_pt, nlevel_capped, nlevel_msf, nlevel_prune_pt, pure_sfx, eagle3 reslicing, perfect_hybrid_oracle
 - All converge to spd 1.95-2.06 oracle, gap 17-25%
 
 ### Reslice doesn't widen gap
@@ -222,7 +214,6 @@ Reslicing makes BOTH methods absolutely faster but doesn't widen gap.
 
 ### swebench_verified 🔥 promising signal
 
-In-progress sim shows `extension_nlevel_capped_oracle:2:32` at **mat 3.53, spd 4.53x**. If hybrid baseline ≤ 3.0x, gap ≥ 50%! single:eagle3 mat = 0.28 (very weak), single:suffix mat = 2.79 (very strong).
 
 ---
 
@@ -231,7 +222,6 @@ In-progress sim shows `extension_nlevel_capped_oracle:2:32` at **mat 3.53, spd 4
 1. **swebench_verified v3 sim** — finishing B=128 now. Will give first FAIR real-cost numbers on this workload.
 2. **New methods to test**:
    - ✅ `extension_hybrid_perfect_oracle` (per-step ORACLE pick of suffix-only or ext) — tested on LCC, +16.8% (no win)
-   - 🔄 `extension_hybrid_perfect_oracle_nlevel:N:M` — perfect oracle with nlevel-recursive fallback, just added. Sim running on longbench captures.
    - ✅ `extension_pure_sfx:N:F:T:M` — pure suffix recursive (skips eagle3); tested on LCC: pure_sfx mat 0.96 vs ext mat 1.49 — pure_sfx loses.
 3. **Workload search (web search 2026-04-26)**:
    - **AgenticSQL** is THE workload where SuffixDecoding paper claims 9.85x/10.41x speedup. PROPRIETARY (Snowflake). Not downloadable.

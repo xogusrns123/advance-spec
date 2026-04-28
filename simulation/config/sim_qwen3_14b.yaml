@@ -1,0 +1,81 @@
+# ============================================================
+# Sim sweep — full grid (qwen3_14b)
+# 작성: 2026-04-29 KST. 이전 컨피그는 simulation/config/legacy_260429/ 로 이동.
+#
+# 시뮬레이터(`run_tree_oracle_sim.py`)는 외부 (steps, topk, budget) 차원만
+# orchestrator yaml 에서 받고, 메소드 내부 sweep (FT, τ, score, count, pt)
+# 은 코드 안에서 자체 sweep 한다 — 본 yaml 은 외부 차원만 명시.
+#
+# Run with:
+#   python3 simulation/scripts/experiments/run_sim_sweeps.py \
+#       simulation/config/sim_qwen3_14b.yaml
+# ============================================================
+name: sim_qwen3_14b
+preset: qwen3_14b
+
+# Stage 1 capture pool config (must match the on-disk capture).
+# Pool reslicer downsizes (8, 16) → any (s ≤ 8, k ≤ 16) sub-tree.
+capture_steps: 8
+capture_topk: 16
+
+# ----- EAGLE3 base config (외부 sweep 차원) -----
+# steps: eagle3 draft tree max depth                  → 4 values
+# topk:  eagle3 draft tree branching factor per node  → 3 values
+# budgets: eagle3 draft tree max size (verify budget) → 8 values
+# 12 reslices × 8 budgets = 96 simulator entries per workload.
+reslices:
+  - s2k4
+  - s2k8
+  - s2k16
+  - s4k4
+  - s4k8
+  - s4k16
+  - s6k4
+  - s6k8
+  - s6k16
+  - s8k4
+  - s8k8
+  - s8k16
+budgets: [1, 2, 4, 8, 16, 32, 64, 128]
+
+# ----- 메소드 내부 sweep (run_tree_oracle_sim.py 안에서 자체 sweep) -----
+# 참고용 — yaml 에서 변경 안 됨. 변경하려면 sim 코드 직접 수정.
+#
+# Suffix decoding params:
+#   F (max_spec_factor):    [1.0, 2.0, 4.0]
+#   T (min_token_prob):     [0.0, 0.1]                (FT 6 pairs)
+#
+# Hybrid score threshold:
+#   τ:                      [1, 2, 3, 5, 10, 20]      (6 values)
+#
+# Extension variants:
+#   score filter (s):       [1.0, 2.0, 3.0, 5.0, 10.0, 20.0]   (6 values)
+#   count cap (r):          [1.0, 2.0, 4.0]                     (3 values)
+#   prune backbone (pt):    [0.001, 0.01, 0.1]                  (3 values)
+#
+# 메소드 enroll (단순):
+#   single:eagle3, single:suffix
+#   extension       (FT × per-budget)
+#   extension_oracle (v2: FT × per-step picker; budget 무관, last B 만 enroll)
+#   extension_by_score, extension_by_count, extension_prune_pt
+#   hybrid_e3       (FT × τ × per-budget)
+#   hybrid_oracle   (v2: FT × τ × per-budget; accept-only verify)
+
+# Execution
+timeout_sec: 0           # no limit
+max_parallel: 1          # reslices 안에서 직렬 (메모리 안전)
+in_docker: true
+out_dir: simulation/results/explorations
+
+# 메소드 필터 (선택). 비워두면 sim 의 default enroll 전체 (`DEFAULT_METHODS`)
+# 가 사용됨. 특정 메소드만 돌릴 때 명시.
+# methods: "single:eagle3,single:suffix,extension:,extension_oracle:,hybrid_e3:,hybrid_oracle:,extension_by_score:,extension_by_count:,extension_prune_pt:"
+
+# Workloads — 캡처가 있는 베이스라인 5종 + spider2_dbt
+workloads:
+  - bfcl_v4
+  - specbench
+  - swebench_verified
+  - longbench_lcc
+  - longbench_repobench
+  - spider2_dbt

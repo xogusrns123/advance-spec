@@ -124,20 +124,6 @@ return _proposer_tree_walk(per_proposer, fallback, gt, budget), False
 
 `extension_oracle_path` / `extension_dmsfx_oracle_path` (lines 232-244) 는 가장 strict 한 lower bound — base node 도 accepted path 만 cost 로 친다 (`ext_size = base_accepted + suffix_accepted`).
 
-### 4.4 `extension_nlevel*` 시리즈 — `_extension_nlevel_step` (commit `20fb84d`)
-
-`_extension_step` 의 1-level suffix graft 를 **N 레벨 재귀 graft** 로 확장. eagle3 backbone + virtual-root suffix + 모든 base node 의 1차 suffix 까지는 동일하지만, 그 다음 level 2..N 에서는 직전 round 의 fringe (in-tree leaf) 마다 추가 `suffix_cache.speculate(context = base_context + leaf_path)` 호출. `extension_oracle` 의 ceiling 을 깨는 게 의도.
-
-| Method | 의도 |
-|---|---|
-| `extension_nlevel_oracle:N` | N-level 재귀 graft + accepted-suffix-only cost |
-| `extension_nlevel_capped:N:max_size` | N-level + 전체 ext tree 노드 수 hard cap. deployable budget 가드 |
-| `extension_nlevel_capped_oracle:N:max_size` | 위 + oracle cost accounting |
-
-`_extension_nlevel_step` 의 `max_count` 가드는 root_draft / per-base-node graft / per-leaf graft 각 단계의 outer loop break + inner `ext_tids.append` 루프 break 양쪽에 모두 들어가 있어 하나도 누락 없이 cap 을 강제한다 (`run_tree_oracle_sim.py:724, 743, 762, 794, 807, 828, 860`). `score_threshold` 도 root / per-node / per-leaf 세 분기 모두에 적용 (`:723-725, 778-780, 844-846`); `getattr(draft, "score", 0.0)` fallback 이 있어 score attribute 누락 시 0.0 으로 처리 → threshold > 0 이면 silent skip.
-
-`compute_latency_speedup` 에서 자동 enroll: `n_lvl ∈ {2, 3} × max_size ∈ {B*2, B*4, B*8}` (capped), 각각 oracle/non-oracle 변종.
-
 ## 5. Acceptance 계산
 
 핵심 primitive는 `greedy_tree_walk(token_ids, parents, ground_truth)` (`tree_knapsack.py:6`):

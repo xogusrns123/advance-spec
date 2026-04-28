@@ -41,15 +41,13 @@ DATASET_MAP = {  # workload → dataset path RELATIVE to project root
     "longbench_repobench": Path("data/longbench_repobench/dataset_interleaved.jsonl"),
 }
 
-# Default method set: all allowed (per project_50pct_gap_goal.md)
+# Default method set (current spec — see simulation/config/sim_qwen3_14b.yaml).
 DEFAULT_METHODS = ",".join([
     "single:eagle3", "single:suffix",
-    "hybrid_e3:", "hybrid_e3_sfx:", "hybrid_dm:",
-    "extension", "extension_oracle",
-    "extension_sfx:", "extension_sfx_oracle:",
-    "extension_prune_pt:", "extension_prune_pt_oracle:",
-    "extension_hybrid:", "extension_hybrid_oracle:",
-    "extension_by_count:", "extension_by_score:", "extension_by_count_score:",
+    "hybrid_e3:",      "hybrid_oracle:",
+    "extension:",      "extension_oracle:",
+    "extension_by_count:", "extension_by_score:",
+    "extension_prune_pt:",
 ])
 
 
@@ -95,10 +93,17 @@ def main():
                 sys.exit(f"missing on host: {HOST_ROOT / rel}")
 
     out_root = HOST_ROOT  # output JSONs always written to host (shared mount)
-    out_dir = Path(args.out_dir) if args.out_dir else (out_root / OUT_DIR_REL)
+    if args.out_dir:
+        out_dir = Path(args.out_dir)
+        if not out_dir.is_absolute():
+            out_dir = HOST_ROOT / out_dir
+        out_dir_rel = out_dir.relative_to(HOST_ROOT)
+    else:
+        out_dir = out_root / OUT_DIR_REL
+        out_dir_rel = OUT_DIR_REL
     out_dir.mkdir(parents=True, exist_ok=True)
     # When running inside docker, the simulator must write to /workspace path
-    out_dir_docker = DOCKER_ROOT / OUT_DIR_REL  # mirror of host path
+    out_dir_docker = DOCKER_ROOT / out_dir_rel  # mirror of host path
 
     reslices = [parse_reslice(s) for s in args.reslices.split(",")]
     print(f"Sweep: workload={args.workload}, reslices={reslices}, "
@@ -114,7 +119,7 @@ def main():
         # Pick paths based on runner (host vs docker)
         if args.in_docker:
             base = DOCKER_ROOT
-            out_json = base / OUT_DIR_REL / out_json_host.name
+            out_json = out_dir_docker / out_json_host.name
         else:
             base = HOST_ROOT
             out_json = out_json_host

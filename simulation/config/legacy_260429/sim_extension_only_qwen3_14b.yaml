@@ -1,0 +1,41 @@
+# ============================================================
+# Sim sweep — plain extension/extension_oracle 비교용
+#
+# 오늘 (2026-04-28) 실행했던 3-reslice × 4-budget grid 와 동일 조건:
+# - reslices: s2k16, s4k16, s6k16 (steps × topk=16)
+# - budgets: [8, 16, 32, 64]
+# 메소드: hybrid_e3 (baseline) + plain extension/extension_oracle (FT sweep)
+# 만 enroll. 다른 변형 (extension_hybrid, extension_prune_pt, extension_by_count
+# 등) 제외 → 동등 비교 가능.
+#
+# 출력: simulation/results/explorations_extonly/  (기존 explorations/ 와 분리)
+#
+# Run with:
+#   python3 simulation/scripts/experiments/run_sim_sweeps.py \
+#       simulation/config/sim_extension_only_qwen3_14b.yaml
+# ============================================================
+name: sim_extension_only_qwen3_14b
+preset: qwen3_14b
+
+capture_steps: 8
+capture_topk: 16
+
+# 오늘 grid와 동일 (3 reslices, 4 budgets)
+reslices: [s2k16, s4k16, s6k16]
+budgets: [8, 16, 32, 64]
+
+# Execution
+timeout_sec: 0
+max_parallel: 1
+in_docker: true
+out_dir: simulation/results/explorations_extonly
+
+# 메소드 명시: baseline + plain extension/extension_oracle (FT sweep)
+methods: "extension:,extension_oracle:,hybrid_e3:"
+
+# Baseline workloads (specbench/spider2_dbt 제외 — 별도 처리 필요)
+workloads:
+  - bfcl_v4
+  - longbench_lcc
+  - longbench_repobench
+  - swebench_verified

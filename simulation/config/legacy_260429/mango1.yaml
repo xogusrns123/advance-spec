@@ -38,15 +38,18 @@ round_robin:
                             # captured per oracle entry; reslice offline.
   batch: 1                  # --num-requests per agent invocation
   resume: true
+  context_length: 131072    # Qwen3-8B w/ YaRN: 40960 native → 131072 max.
+                            # Avoid swebench long-trajectory ctx overflow crashes.
 
 # Workloads sharing the experiment. Order in this list defines round-robin
 # rotation order WITHIN a shard.
+# longbench_lcc/repobench dropped 2026-04-28 (gap << swebench, see
+# feedback_workload_gap_filter memory). Spider2_dbt added 2026-04-28.
 workloads:
   - specbench
   - bfcl_v4
   - swebench_verified
-  - longbench_lcc
-  - longbench_repobench
+  - spider2_dbt
 
 # Per-workload runtime overrides (no dataset slicing on disk).
 workload_overrides:
@@ -60,18 +63,17 @@ workload_overrides:
     max_iterations: 250
     tool_style: minisweagent
     repos_dir: data/swebench_verified/repos
-  longbench_lcc:
-    max_tokens: 256
-  longbench_repobench:
-    max_tokens: 256
+  spider2_dbt:
+    max_iterations: 30
+    instances_dir: data/spider2_dbt/instances
 
 # 4-shard data-parallel: one SGLang server per GPU, each shard owns a
-# disjoint workload subset. With 5 workloads on 4 GPUs the heaviest are
-# split alone and the two lightest share one shard:
-#   shard 0  GPU 0  swebench_verified       (heaviest, alone)
-#   shard 1  GPU 1  longbench_lcc           (medium)
-#   shard 2  GPU 2  longbench_repobench     (medium)
-#   shard 3  GPU 3  bfcl_v4 + specbench     (small + small)
+# disjoint workload subset. With 4 workloads on 4 GPUs (1 per shard
+# is cleanest):
+#   shard 0  GPU 0  swebench_verified       (heaviest, agent loops)
+#   shard 1  GPU 1  spider2_dbt             (NEW, agent + dbt loops)
+#   shard 2  GPU 2  bfcl_v4                 (smaller agent)
+#   shard 3  GPU 3  specbench               (exhausted; idle skip)
 # Each shard runs an independent RR loop; --resume picks up where its
 # workloads left off across restarts.
 shards:
@@ -82,15 +84,15 @@ shards:
   - id: 1
     gpu_ids: [1]
     port: 30001
-    workloads: [longbench_lcc]
+    workloads: [spider2_dbt]
   - id: 2
     gpu_ids: [2]
     port: 30002
-    workloads: [longbench_repobench]
+    workloads: [bfcl_v4]
   - id: 3
     gpu_ids: [3]
     port: 30003
-    workloads: [bfcl_v4, specbench]
+    workloads: [specbench]
 
 infra:
   port: 30000               # default port (used only if no `shards:` block)

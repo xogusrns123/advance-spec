@@ -1,0 +1,57 @@
+# ============================================================
+# Sim sweep config — qwen3_14b full grid
+#
+# Drives `simulation/scripts/experiments/run_sim_sweeps.py`, which
+# launches `run_reslice_sweep.py` per workload sequentially.
+#
+# Run with:
+#   python3 simulation/scripts/experiments/run_sim_sweeps.py \
+#     simulation/config/sim_full_sweep_qwen3_14b.yaml
+# ============================================================
+name: sim_full_sweep_qwen3_14b
+preset: qwen3_14b
+
+# Capture (must match RR Stage 1 yaml's stage1_steps/stage1_configs).
+capture_steps: 8
+capture_topk: 16
+
+# Reslice grid — captures with full pool can be sliced offline.
+# Steps ∈ {2, 4, 6, 8} × topK ∈ {4, 8, 16} = 12 reslices. All ≤ capture
+# (S=8, K=16) so reslicer can produce them.
+reslices:
+  - s2k4
+  - s2k8
+  - s2k16
+  - s4k4
+  - s4k8
+  - s4k16
+  - s6k4
+  - s6k8
+  - s6k16
+  - s8k4
+  - s8k8
+  - s8k16
+
+# Budget grid (verify-batch sizes).
+budgets: [1, 2, 4, 8, 16, 32, 64, 128]
+
+# Execution
+timeout_sec: 0          # 0 = no timeout (per feedback_no_sim_scope_reduction)
+max_parallel: 1         # serial — avoids RAM saturation with big captures
+in_docker: true         # delegate per-sim to docker exec
+out_dir: simulation/results/explorations
+
+# Workloads to sim — order matters (sequential). Heavy first so failure
+# modes appear early.
+workloads:
+  - swebench_verified
+  - specbench
+  - bfcl_v4
+  - longbench_lcc
+  - longbench_repobench
+  - spider2_dbt
+
+# (optional) per-workload override
+# workload_overrides:
+#   specbench:
+#     methods: "single:eagle3,single:suffix,..."  # override DEFAULT_METHODS
