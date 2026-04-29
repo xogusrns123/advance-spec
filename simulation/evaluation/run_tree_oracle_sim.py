@@ -681,7 +681,15 @@ def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str,
                     backbone_pt_threshold: Optional[float] = None,
                     suffix_max_spec_factor: float = 4.0,
                     suffix_min_token_prob: float = 0.0,
-                    suffix_max_spec_tokens: int = 256):
+                    suffix_max_spec_tokens: int = 0):
+    # NOTE: suffix_max_spec_tokens=0 → "unbounded" (don't pass max_spec_tokens
+    # to ArcticInference). This matches the explicit value used by the bare
+    # ``extension`` method dispatch, so filter variants (extension_by_count,
+    # _by_score, _prune_pt) build per-graft suffix trees of the SAME size as
+    # base extension. Previously the default was 256, which made filtered
+    # trees not strict subsets of the base tree and produced MAT values that
+    # exceeded the unfiltered base — physically impossible if the only effect
+    # of filtering is to drop nodes.
     """Extension: base proposer's tree (truncated to budget) + suffix extension
     at every node.
 
