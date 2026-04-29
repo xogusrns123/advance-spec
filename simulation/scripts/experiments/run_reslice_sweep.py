@@ -43,7 +43,7 @@ DATASET_MAP = {  # workload → dataset path RELATIVE to project root
 
 # Default method set (current spec — see simulation/config/sim_qwen3_14b.yaml).
 DEFAULT_METHODS = ",".join([
-    "single:eagle3", "single:suffix",
+    "single:eagle3", "single:suffix", "single:draft_model",
     "hybrid_e3:",      "hybrid_oracle:",
     "extension:",      "extension_oracle:",
     "extension_by_count:", "extension_by_score:",
@@ -138,6 +138,19 @@ def main():
             "--output", str(out_json),
             "--print-summary",
         ]
+        # Auto-attach Stage-2 draft-model drafts when present so single:draft_model
+        # (and any extension variant that consults per_proposer["draft_model"])
+        # has data to read. Sites that don't want draft_model can pass
+        # --methods explicitly to suppress its dispatch.
+        dm_rel = cap_rel / "draft_model_drafts.jsonl"
+        dm_partial_rel = cap_rel / "draft_model_drafts_partial.jsonl"
+        dm_pick = None
+        if (HOST_ROOT / dm_rel).exists():
+            dm_pick = dm_rel
+        elif (HOST_ROOT / dm_partial_rel).exists():
+            dm_pick = dm_partial_rel
+        if dm_pick is not None:
+            cmd_inner += ["--draft-model-drafts", str(base / dm_pick)]
         if args.in_docker:
             inner = " ".join(shlex.quote(a) for a in cmd_inner)
             sim_par = os.environ.get("SIM_PARALLEL", "1")
