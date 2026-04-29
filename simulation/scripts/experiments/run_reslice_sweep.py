@@ -48,6 +48,9 @@ DEFAULT_METHODS = ",".join([
     "extension:",      "extension_oracle:",
     "extension_by_count:", "extension_by_score:",
     "extension_prune_pt:",
+    # Draft-model-backbone extension family (parallel to eagle3-base):
+    "extension_dm:",   "extension_dm_oracle:",
+    "extension_dm_by_count:", "extension_dm_by_score:",
 ])
 
 

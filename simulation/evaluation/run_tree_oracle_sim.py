@@ -336,6 +336,53 @@ def simulate_decoding(
                 accepted, ext_size = _extension_step(
                     rec, budget, local_cache, cache_req_id,
                     base_proposer="eagle3", backbone_pt_threshold=t)
+            # ----- draft_model-backbone extension family (parallel to eagle3) -----
+            elif method == "extension_dm" or (method.startswith("extension_dm:")
+                                              and not method.startswith("extension_dm_")):
+                F, T = 4.0, 0.0
+                if ":" in method:
+                    parts = method.split(":")
+                    if len(parts) >= 3:
+                        F = float(parts[1]); T = float(parts[2])
+                accepted, ext_size = _extension_step(
+                    rec, budget, local_cache, cache_req_id,
+                    base_proposer="draft_model",
+                    suffix_max_spec_factor=F,
+                    suffix_min_token_prob=T,
+                    suffix_max_spec_tokens=0)
+            elif method == "extension_dm_oracle" or method.startswith("extension_dm_oracle:"):
+                F, T = 4.0, 0.0
+                if ":" in method:
+                    parts = method.split(":")
+                    if len(parts) >= 3:
+                        F = float(parts[1]); T = float(parts[2])
+                _BUDGET_GRID = (1, 2, 4, 8, 16, 32, 64, 128)
+                _per_b_acc: Dict[int, int] = {}
+                for _b in _BUDGET_GRID:
+                    _a, _ = _extension_step(
+                        rec, _b, local_cache, cache_req_id,
+                        base_proposer="draft_model",
+                        suffix_max_spec_factor=F,
+                        suffix_min_token_prob=T,
+                        suffix_max_spec_tokens=0)
+                    _per_b_acc[_b] = _a
+                _best_b = max(_BUDGET_GRID,
+                              key=lambda b: (_per_b_acc[b], -b))
+                accepted = _per_b_acc[_best_b]
+                ext_size = accepted + 1
+                if real_step_draft_fn is not None:
+                    _step_draft_ms = real_step_draft_fn(_best_b)
+            elif method.startswith("extension_dm_by_count:"):
+                ratio = float(method.split(":", 1)[1])
+                cap = max(1, int(round(budget * ratio)))
+                accepted, ext_size = _extension_step(
+                    rec, budget, local_cache, cache_req_id,
+                    base_proposer="draft_model", max_count=cap)
+            elif method.startswith("extension_dm_by_score:"):
+                threshold = float(method.split(":", 1)[1])
+                accepted, ext_size = _extension_step(
+                    rec, budget, local_cache, cache_req_id,
+                    base_proposer="draft_model", score_threshold=threshold)
             elif is_hybrid:
                 if method.startswith("hybrid_oracle:"):
                     # hybrid_oracle:F:T:τ — hybrid_e3 gating + accept-only
@@ -1608,7 +1655,52 @@ def compute_latency_speedup(
                           "real_step_draft_only_ms": ext_draft_only},
                          f"extension_prune_pt_t{t}")
 
-        # Extension with draft_model base + suffix extensions
+        # ----- Extension family with draft_model backbone -----
+        # Mirrors the eagle3-base extension family but uses the draft_model
+        # linear chain (capped at MAX_DRAFT_MODEL_N=16) as the base tree.
+        # prune_pt is omitted — draft_model has no path_draft_p_t signal.
+        if "suffix" in proposers and "draft_model" in proposers:
+            dm_k = min(B, MAX_DRAFT_MODEL_N)  # base chain length
+            # draft-only cost: HF/server forwards for dm chain + per-node suffix
+            # speculate (overlapped → max).
+            dm_draft_only = max(dm_k * draft_lm_tpot,
+                                dm_k * suffix_speculate_ms)
+            dm_cost_fallback = _target_forward(B) + dm_draft_only
+            for F, T in FT_GRID:
+                tag = f"f{F}_t{T}"
+                _run(f"extension_dm:{F}:{T}",
+                     {**common, "method": f"extension_dm:{F}:{T}",
+                      "suffix_cache": _SUFFIX_ENABLED,
+                      "real_step_cost_ms": dm_cost_fallback,
+                      "real_step_target_fn": _target_forward,
+                      "real_step_draft_only_ms": dm_draft_only},
+                     f"extension_dm_{tag}")
+                if B == budgets[-1]:
+                    _run(f"extension_dm_oracle:{F}:{T}",
+                         {**common, "method": f"extension_dm_oracle:{F}:{T}",
+                          "suffix_cache": _SUFFIX_ENABLED,
+                          "real_step_cost_ms": dm_cost_fallback,
+                          "real_step_target_fn": _target_forward,
+                          "real_step_draft_fn": _eagle3_draft,  # dm-oracle still uses target-only verify; draft cost ≈ draft_lm_tpot × picked_B
+                          "real_step_draft_only_ms": dm_draft_only},
+                         f"extension_dm_oracle_{tag}")
+            for r in [1.0, 2.0, 4.0]:
+                _run(f"extension_dm_by_count:{r}",
+                     {**common, "method": f"extension_dm_by_count:{r}",
+                      "suffix_cache": _SUFFIX_ENABLED,
+                      "real_step_cost_ms": dm_cost_fallback,
+                      "real_step_target_fn": _target_forward,
+                      "real_step_draft_only_ms": dm_draft_only},
+                     f"extension_dm_by_count_r{r}")
+            for t in [1.0, 2.0, 3.0, 5.0, 10.0, 20.0]:
+                _run(f"extension_dm_by_score:{t}",
+                     {**common, "method": f"extension_dm_by_score:{t}",
+                      "suffix_cache": _SUFFIX_ENABLED,
+                      "real_step_cost_ms": dm_cost_fallback,
+                      "real_step_target_fn": _target_forward,
+                      "real_step_draft_only_ms": dm_draft_only},
+                     f"extension_dm_by_score_t{t:.1f}")
+
         # Parallel mode: dispatch all queued (method, budget) pairs
         _flush_pending()
 
