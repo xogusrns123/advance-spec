@@ -1770,6 +1770,120 @@ def main():
     )
     input_source = args.agent_results
 
+    # Per-position accept rates per proposer. Independent of method/budget —
+    # purely a property of the draft tree vs ground-truth future.
+    # Aggregated once over all records; consumed via the output JSON's
+    # "position_accepts" field. Accept rate at position d:
+    #   seq_accept[d-1] / depth_ge[d-1]   (sequential — requires positions
+    #                                       1..d to all match in greedy walk)
+    #   ind_accept[d-1] / depth_ge[d-1]   (independent — any node at depth d
+    #                                       matches gt[d-1] regardless of
+    #                                       ancestors)
+    # Cap of 64 covers eagle3 (≤8 reslice depth), draft_model (≤16 chain) and
+    # the SuffixDecodingCache's max_tree_depth=64 (live-suffix pre-pass below).
+    # extension is NOT measured here — it's a per-step synthesis from
+    # eagle3+suffix at sim time, not a single tree.
+    POSITION_ACCEPT_MAX = 64
+    from simulation.evaluation.tree_knapsack import position_accept_rates
+    position_accepts: dict[str, dict[str, list[int]]] = {}
+
+    def _accumulate(prop_name: str, tids, pids, gt):
+        if not tids or not gt:
+            return
+        seq, ind, applicable = position_accept_rates(
+            tids, pids, gt, POSITION_ACCEPT_MAX)
+        if applicable <= 0:
+            return
+        stats = position_accepts.setdefault(prop_name, {
+            "seq_accept": [0] * POSITION_ACCEPT_MAX,
+            "ind_accept": [0] * POSITION_ACCEPT_MAX,
+            "depth_ge": [0] * POSITION_ACCEPT_MAX,
+        })
+        for d in range(applicable):
+            stats["depth_ge"][d] += 1
+            stats["seq_accept"][d] += seq[d]
+            stats["ind_accept"][d] += ind[d]
+
+    # Pre-pass A: stored proposers in records["per_proposer"]. Restricted to
+    # the canonical basic set {eagle3, draft_model}. mtp is skipped per
+    # current spec; suffix always comes from live pre-pass B below to ensure
+    # uniform method-independent measurement (ground-truth-fed cache).
+    _PA_PROPOSERS = {"eagle3", "draft_model"}
+    for rec in records:
+        gt = rec.get("ground_truth_future") or []
+        if not gt:
+            continue
+        for prop_name, prop in (rec.get("per_proposer") or {}).items():
+            if prop_name not in _PA_PROPOSERS:
+                continue
+            _accumulate(prop_name, prop.get("token_ids"),
+                        prop.get("parents"), gt)
+
+    # Pre-pass B: live suffix. Suffix tree is generated at sim time from a
+    # SuffixDecodingCache fed with ground-truth tokens (method-independent
+    # ceiling). Mirrors the cache feed pattern simulate_decoding uses.
+    try:
+        import numpy as _np
+        from hybrid_spec_decoding.suffix_decoding.suffix_tree import (
+            SuffixDecodingCache as _PA_Cache,
+        )
+        _suffix_cache = _PA_Cache(
+            max_tree_depth=POSITION_ACCEPT_MAX,
+            max_cached_requests=100000,
+        )
+
+        # Group records by (request_id, call_idx) and order by step_idx.
+        from collections import defaultdict as _dd
+        _by_seq: dict = _dd(list)
+        for rec in records:
+            _by_seq[(rec["request_id"], rec.get("call_idx", 0))].append(rec)
+        for _k in _by_seq:
+            _by_seq[_k].sort(key=lambda r: r.get("step_idx", 0))
+
+        for (_rid, _cid), _seq in _by_seq.items():
+            if not _seq:
+                continue
+            _cache_req_id = f"{_rid}_{_cid}"
+            _prompt = _seq[0].get("context_token_ids") or []
+            _suffix_cache.start_request(
+                _cache_req_id, _np.asarray(_prompt, dtype=_np.int32))
+            for _i, rec in enumerate(_seq):
+                _ctx = rec.get("context_token_ids") or []
+                _gt = rec.get("ground_truth_future") or []
+                if _ctx and _gt:
+                    try:
+                        _draft = _suffix_cache.speculate(
+                            _cache_req_id,
+                            _np.asarray(_ctx, dtype=_np.int32),
+                            max_spec_factor=4.0,
+                            min_token_prob=0.0,
+                            max_spec_tokens=256,
+                            use_tree_spec=True,
+                        )
+                        if _draft.token_ids:
+                            _accumulate(
+                                "suffix",
+                                list(_draft.token_ids),
+                                list(_draft.parents),
+                                _gt,
+                            )
+                    except Exception:
+                        pass
+                # Advance: feed gt tokens up to the next step's offset.
+                if _i < len(_seq) - 1:
+                    _adv = (_seq[_i + 1].get("step_idx", 0)
+                            - rec.get("step_idx", 0))
+                else:
+                    _adv = 1
+                if _gt and _adv > 0:
+                    _suffix_cache.add_active_response(
+                        _cache_req_id, list(_gt[:_adv]))
+            _suffix_cache.stop_request(_cache_req_id)
+    except Exception as _e:
+        import sys as _sys
+        print(f"WARN: suffix position-accept pre-pass skipped: {_e}",
+              file=_sys.stderr)
+
     # Latency-aware simulation. When --latency-config is missing, feed a
     # stub config (vanilla_step_ms=1.0, empty per-budget tables); speedup
     # numbers become placeholders but MAT is unaffected.
@@ -1816,6 +1930,23 @@ def main():
                 "input_source": input_source,
                 "n_steps": len(records),
                 "budgets": budgets,
+            },
+            "position_accepts": {
+                "max_position": POSITION_ACCEPT_MAX,
+                "by_proposer": position_accepts,
+                "_doc": (
+                    "Per-position draft-token accept counts (depth=position). "
+                    "seq_accept[d-1] = #steps where position d accepted via "
+                    "greedy walk (requires positions 1..d all match). "
+                    "ind_accept[d-1] = #steps where ANY node at depth d "
+                    "matches ground_truth[d-1] regardless of ancestors. "
+                    "depth_ge[d-1] = denominator: #steps where the draft tree "
+                    "has depth ≥ d AND ground_truth has length ≥ d. "
+                    "Coverage: eagle3 + draft_model from records, plus "
+                    "suffix from a live SuffixDecodingCache fed with the "
+                    "ground-truth trajectory (method-independent ceiling). "
+                    "mtp + extension are NOT measured."
+                ),
             },
         }
 
