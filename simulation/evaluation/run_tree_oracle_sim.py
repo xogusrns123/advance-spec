@@ -1179,6 +1179,16 @@ def compute_latency_speedup(
                 v_hi = float(table[str(k_hi)])
                 v_lo = float(table[str(k_lo)])
                 slope = (v_hi - v_lo) / (k_hi - k_lo) if k_hi != k_lo else 0.0
+                # Clamp the extrapolation slope to be non-negative. The
+                # measurement at the last two keys can be noisy enough to
+                # produce a negative slope (e.g., qwen3_14b topk=4 has
+                # B=32→64 dipping from 48.19→44.40 ms). Extrapolating that
+                # downward beyond the table gives nonsensical negative
+                # latency at large B (e.g., extension trees ≥ ~370 nodes),
+                # which produced spurious 17–19× speedups in 2026-04-29
+                # bfcl_v4 sweeps. Target latency MUST grow (or stay flat)
+                # with verify-tree size; clamp here enforces that.
+                slope = max(0.0, slope)
                 return v_hi + slope * (B - k_hi)
             return float(table[str(keys[-1])])
         lo = max(k for k in keys if k <= B)
