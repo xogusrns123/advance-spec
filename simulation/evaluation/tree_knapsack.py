@@ -40,19 +40,24 @@ def position_accept_rates(
     direct children of the virtual root, i.e. the first draft token after
     the verified prefix).
 
-    Returns ``(seq, ind, applicable_depth)``:
+    Returns ``(seq, ind, denom_depth)``:
       * ``seq[d-1] = 1`` iff position d is *sequentially* accepted, i.e. the
         greedy tree walk reached depth d (so all of positions 1..d matched).
       * ``ind[d-1] = 1`` iff there exists *some* node at depth d whose
         token matches ``ground_truth[d-1]``, regardless of whether earlier
         positions were accepted.
-      * ``applicable_depth = min(tree_max_depth, len(ground_truth), max_position)``
-        — the largest position at which the indicator is meaningful (positions
-        beyond this are not measurable for this step and the caller should
-        skip them when accumulating denominators).
+      * ``denom_depth = min(len(ground_truth), max_position)`` — the
+        denominator cap. Caller MUST increment ``depth_ge[d]`` for every
+        ``d`` in ``[0, denom_depth)`` regardless of tree depth, because
+        positions where the tree has no nodes are still "could have drafted
+        but didn't / didn't match" — counting them as not-accepted is the
+        right per-step rate. Skipping them would bias deep-position accept
+        rates upward (only deep-tree steps would contribute to the deep
+        denominator). Variable-depth proposers (suffix / EAGLE3 with
+        reslice-shorter-than-budget) need this treatment.
 
-    Both lists have length ``max_position``; positions ≥ ``applicable_depth``
-    stay 0.
+    Both lists have length ``max_position``; positions where the tree has no
+    matching node, or beyond ``min(tree_max, gt_len)``, stay 0.
 
     Linear chains (e.g. draft_model output) are a special case where
     ``parents[i] == i - 1``; the function treats them uniformly with branchy
@@ -61,8 +66,12 @@ def position_accept_rates(
     n = len(token_ids)
     seq = [0] * max_position
     ind = [0] * max_position
-    if n == 0 or not ground_truth or max_position <= 0:
+    if max_position <= 0 or not ground_truth:
         return seq, ind, 0
+
+    denom_depth = min(len(ground_truth), max_position)
+    if n == 0:
+        return seq, ind, denom_depth
 
     # Compute depth per node. The capture is stored in BFS order (parents
     # always have lower index than children), so a single forward pass works.
@@ -73,14 +82,14 @@ def position_accept_rates(
             depths[i] = depths[parents[i]] + 1
         if depths[i] > tree_max:
             tree_max = depths[i]
-    cap = min(tree_max, len(ground_truth), max_position)
-    if cap <= 0:
-        return seq, ind, 0
+    match_cap = min(tree_max, denom_depth)
+    if match_cap <= 0:
+        return seq, ind, denom_depth
 
     # Sequential greedy walk (mirror of greedy_tree_walk, but record per-depth).
     node = -1
     accepted = 0
-    for gt_token in ground_truth[:cap]:
+    for gt_token in ground_truth[:match_cap]:
         matched = False
         for i in range(n):
             if parents[i] == node and token_ids[i] == gt_token:
@@ -94,11 +103,11 @@ def position_accept_rates(
 
     # Independent per-depth match: at each depth d, scan all nodes at that
     # depth for one whose token equals ground_truth[d-1]. O(N) per depth.
-    for d in range(1, cap + 1):
+    for d in range(1, match_cap + 1):
         gt_token = ground_truth[d - 1]
         for i in range(n):
             if depths[i] == d and token_ids[i] == gt_token:
                 ind[d - 1] = 1
                 break
 
-    return seq, ind, cap
+    return seq, ind, denom_depth

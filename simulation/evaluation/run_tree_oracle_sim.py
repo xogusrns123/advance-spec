@@ -1788,18 +1788,23 @@ def main():
     position_accepts: dict[str, dict[str, list[int]]] = {}
 
     def _accumulate(prop_name: str, tids, pids, gt):
-        if not tids or not gt:
+        if not gt:
             return
-        seq, ind, applicable = position_accept_rates(
-            tids, pids, gt, POSITION_ACCEPT_MAX)
-        if applicable <= 0:
+        seq, ind, denom_depth = position_accept_rates(
+            tids or [], pids or [], gt, POSITION_ACCEPT_MAX)
+        if denom_depth <= 0:
             return
         stats = position_accepts.setdefault(prop_name, {
             "seq_accept": [0] * POSITION_ACCEPT_MAX,
             "ind_accept": [0] * POSITION_ACCEPT_MAX,
             "depth_ge": [0] * POSITION_ACCEPT_MAX,
         })
-        for d in range(applicable):
+        # depth_ge counts ALL positions up to denom_depth, regardless of
+        # whether this step's tree was deep enough to draft at position d.
+        # This avoids the "deep-tree steps inflate deep-position accept rate"
+        # bias that variable-depth proposers (suffix / EAGLE3 with reslice
+        # shorter than tree) would otherwise introduce.
+        for d in range(denom_depth):
             stats["depth_ge"][d] += 1
             stats["seq_accept"][d] += seq[d]
             stats["ind_accept"][d] += ind[d]
