@@ -45,6 +45,7 @@ DATASET_MAP = {  # workload → dataset path RELATIVE to project root
 DEFAULT_METHODS = ",".join([
     "single:eagle3", "single:suffix", "single:draft_model",
     "hybrid_e3:",      "hybrid_oracle:",
+    "hybrid_dm:",      "hybrid_dm_oracle:",
     "extension:",      "extension_oracle:",
     "extension_by_count:", "extension_by_score:",
     "extension_prune_pt:",

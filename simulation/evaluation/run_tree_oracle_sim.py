@@ -160,7 +160,9 @@ def simulate_decoding(
     # extension_hybrid* fall in the same bucket: they pick suffix-only or
     # extension fallback per step based on a score threshold.
     is_hybrid = (method.startswith("hybrid_e3:")
-                 or method.startswith("hybrid_oracle:"))
+                 or method.startswith("hybrid_oracle:")
+                 or method.startswith("hybrid_dm:")
+                 or method.startswith("hybrid_dm_oracle:"))
     # ``no_draft`` is used ONLY by the ratio-based cost model to represent
     # "this method has zero draft overhead" (single:suffix's draft is
     # CPU-side, overlapped with target forward). The real-cost accumulator
@@ -414,6 +416,34 @@ def simulate_decoding(
                     else:
                         accepted = 0
                     ext_size = accepted + 1  # accept-only verify
+                elif method.startswith("hybrid_dm_oracle:"):
+                    # hybrid_dm_oracle:F:T:τ — like hybrid_oracle but
+                    # falls back to draft_model chain (capped at MAX_DRAFT_MODEL_N).
+                    parts = method.split(":")
+                    F = float(parts[1]); T = float(parts[2])
+                    tau = float(parts[3])
+                    gt = rec.get("ground_truth_future") or []
+                    if gt:
+                        ctx = rec.get("context_token_ids") or []
+                        sfx_tids, sfx_pids, sfx_score = _live_suffix_draft(
+                            local_cache, cache_req_id, ctx,
+                            max_spec_factor=F, min_token_prob=T)
+                        if sfx_tids is not None and sfx_score >= tau:
+                            accepted = greedy_tree_walk(
+                                sfx_tids, sfx_pids, gt)
+                            used_suffix = True
+                            _step_draft_ms = suffix_speculate_ms_param
+                        else:
+                            accepted = _proposer_tree_walk(
+                                rec.get("per_proposer", {}) or {},
+                                "draft_model", gt, budget)
+                            used_suffix = False
+                            # draft_model fallback: cost = draft_lm_tpot × min(B, MAX)
+                            if real_step_draft_fn is not None:
+                                _step_draft_ms = real_step_draft_fn(budget)
+                    else:
+                        accepted = 0
+                    ext_size = accepted + 1  # accept-only verify
                 elif method.startswith("hybrid_e3:"):
                     # hybrid_e3:F:T:t — parametric (F, T, threshold)
                     # Or legacy hybrid_e3:t — defaults F=1.0, T=0.1 (paper-faithful)
@@ -430,6 +460,23 @@ def simulate_decoding(
                         threshold = float(parts[1])
                         accepted, used_suffix = _hybrid_step(
                             rec, budget, threshold, fallback="eagle3",
+                            suffix_cache=local_cache,
+                            cache_req_id=cache_req_id)
+                elif method.startswith("hybrid_dm:"):
+                    # hybrid_dm:F:T:t — gate suffix vs draft_model fallback
+                    parts = method.split(":")
+                    if len(parts) == 4:
+                        F = float(parts[1]); T = float(parts[2]); threshold = float(parts[3])
+                        accepted, used_suffix = _hybrid_step(
+                            rec, budget, threshold, fallback="draft_model",
+                            suffix_cache=local_cache,
+                            cache_req_id=cache_req_id,
+                            max_spec_factor=F, min_token_prob=T,
+                            max_spec_tokens=None)
+                    else:
+                        threshold = float(parts[1])
+                        accepted, used_suffix = _hybrid_step(
+                            rec, budget, threshold, fallback="draft_model",
                             suffix_cache=local_cache,
                             cache_req_id=cache_req_id)
                 else:
@@ -1555,6 +1602,42 @@ def compute_latency_speedup(
                           "real_step_cost_suffix_ms": suffix_only_cost,
                           "real_step_target_fn": _target_forward,
                           "real_step_draft_fn": _eagle3_draft,
+                          "suffix_speculate_ms_param": suffix_speculate_ms},
+                         tag_o)
+
+        # ----- Hybrid family with draft_model fallback (parallel to eagle3) -----
+        if "suffix" in proposers and "draft_model" in proposers:
+            dm_cost = _real_cost(["draft_model"], B)
+            suffix_only_cost = _target_forward(B) + suffix_speculate_ms
+            FT_GRID = [
+                (1.0, 0.0), (1.0, 0.1),
+                (2.0, 0.0), (2.0, 0.1),
+                (4.0, 0.0), (4.0, 0.1),
+            ]
+            def _dm_draft_cost(b):
+                # draft_model fallback cost = TPOT × min(B, MAX)
+                return min(b, MAX_DRAFT_MODEL_N) * draft_lm_tpot
+            for F, T in FT_GRID:
+                for t in hybrid_thresholds:
+                    nm = f"hybrid_dm:{F}:{T}:{t}"
+                    tag = f"hybrid_dm_f{F}_t{T}_th{t:.1f}"
+                    _run(nm,
+                         {**common, "method": nm,
+                          "suffix_cache": _SUFFIX_ENABLED,
+                          "real_step_cost_ms": dm_cost,
+                          "real_step_cost_suffix_ms": suffix_only_cost,
+                          "real_step_target_fn": _target_forward,
+                          "real_step_draft_only_ms": suffix_speculate_ms},
+                         tag)
+                    nm_o = f"hybrid_dm_oracle:{F}:{T}:{t}"
+                    tag_o = f"hybrid_dm_oracle_f{F}_t{T}_th{t:.1f}"
+                    _run(nm_o,
+                         {**common, "method": nm_o,
+                          "suffix_cache": _SUFFIX_ENABLED,
+                          "real_step_cost_ms": dm_cost,
+                          "real_step_cost_suffix_ms": suffix_only_cost,
+                          "real_step_target_fn": _target_forward,
+                          "real_step_draft_fn": _dm_draft_cost,
                           "suffix_speculate_ms_param": suffix_speculate_ms},
                          tag_o)
 
