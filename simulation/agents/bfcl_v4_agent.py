@@ -229,7 +229,7 @@ def process_request(
                 model=model,
                 messages=messages,
                 temperature=0.0,
-                max_tokens=4096,
+                max_tokens=32768,
             )
         except Exception as e:
             all_steps.append({"type": "llm", "step": step, "error": str(e)})
@@ -374,7 +374,7 @@ def replay_request(
                 model=model,
                 messages=messages,
                 temperature=0.0,
-                max_tokens=4096,
+                max_tokens=32768,
             )
         except Exception as e:
             step_data["error"] = str(e)
@@ -491,7 +491,7 @@ def run_benchmark(
     print(f"Running {len(pending)}/{len(dataset)} BFCLv4 requests "
           f"({mode_str}) against {url} (workers={num_workers})")
 
-    client = OpenAI(base_url=url, api_key="dummy")
+    client = OpenAI(base_url=url, api_key="dummy", timeout=14400.0)
 
     if replay:
         def _process(request):

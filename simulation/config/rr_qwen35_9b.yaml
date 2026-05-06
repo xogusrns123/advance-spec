@@ -1,0 +1,98 @@
+# ============================================================
+# Round-Robin Stage 1 collection — Qwen3.5-9B + MTP draft
+#
+# Two SGLang shards (TP=2 each) on 4×24GB cards:
+#   shard 0 — GPU 0,1 — port 30000 — specbench + bfcl_v4
+#   shard 1 — GPU 2,3 — port 30001 — swebench_verified (largest set)
+#
+# Each shard captures (steps=8, topk=8, budget=128) + full pool. The
+# simulator can later reslice the captured pool to any (s'≤8, k'≤8)
+# sub-tree.
+#
+# Speculative decoding via SGLang's `--speculative-algorithm EAGLE` +
+# `--speculative-draft-model-path = target` triggers the model_config
+# arch swap to `Qwen3_5ForCausalLMMTP` (built-in MTP head).
+# Captured oracle entries keep the legacy `eagle3_*` field naming and
+# `proposer="eagle3"` label — for Qwen3.5 these fields are MTP data
+# (see project_eagle_label_means_mtp memory).
+#
+# Memory budget on RTX 4090 24GB × TP=2 (per-GPU after sanity test):
+#   target weights 8.85 GB + draft (MTP) 2.15 GB + tree buffers (steps=8,
+#   topk=8, budget=128) ≈ 6 GB + KV pool ~7 GB → fits 24 GB with
+#   ~1 GB headroom. Going to budget=256 OOMs; tested.
+#
+# Run with:
+#   docker exec -u root -d sglang-bench bash -c \
+#     "cd /workspace && python3 simulation/scripts/run_experiment.py \
+#       simulation/config/rr_qwen35_9b.yaml > /tmp/rr_qwen35_stage1.log 2>&1"
+# ============================================================
+name: rr_qwen35_9b
+
+model_preset: qwen35_9b
+
+# RR mode requires exactly one (steps, topk, num_draft_tokens).
+stage1_steps: 8
+stage1_configs:
+  - topk: 8
+    num_draft_tokens: 128         # tree budget B (capped by full-pool reslice)
+
+round_robin:
+  enabled: true
+  capture_full_pool: true         # SGLANG_CAPTURE_FULL_POOL=1 → eagle3_pool_full
+                                  # captured per oracle entry; reslice offline.
+  batch: 1                        # --num-requests per agent invocation
+  resume: true
+  context_length: 262144          # Qwen3.5-9B native max (256K). YaRN scaling
+                                  # would extend to 1M but requires extra config.
+                                  # Earlier 8K caused 100% swebench failures with
+                                  # "context length exceeded" at iter 5+.
+                                  # context_length only caps per-request token
+                                  # budget; the KV pool is fixed by mem_fraction
+                                  # so memory cost is unchanged.
+
+# 24 GB GPU × TP=2 budget (sanity-tested):
+mem_fraction_static: 0.55
+max_prefill_tokens: 4096
+
+# Active workload set (project_active_workloads memory).
+workloads:
+  - specbench
+  - bfcl_v4
+  - swebench_verified
+
+workload_overrides:
+  specbench:
+    max_tokens_override: 32768   # Qwen3.5-9B native cap per Qwen recommendation
+                                 # (model can produce up to context_length=262144
+                                 # but 32K is the typical thinking-mode cap).
+  bfcl_v4:
+    max_iterations: 20
+    include_category: web_search    # 40 web_search items only; skip memory_*
+  swebench_verified:
+    max_iterations: 250
+    tool_style: minisweagent
+    repos_dir: data/swebench_verified/repos
+
+shards:
+  - id: 0
+    gpu_ids: [0, 1]
+    port: 30000
+    workloads: [specbench, bfcl_v4]      # short/medium — RR cycles fast
+    # specbench: no tool calls (just chat)
+    # bfcl_v4: model emits `[func(arg=val)]` Python-list format — qwen25 parses it
+    tool_call_parser: qwen25
+  - id: 1
+    gpu_ids: [2, 3]
+    port: 30001
+    workloads: [swebench_verified]       # long single workload — dedicated GPUs
+    # swebench (minisweagent): model emits `<tool_call><function=...>` XML —
+    # only qwen3_coder parses it. qwen25 misses these so the agent loop
+    # treats step 0 as a final submit and exits with no tool calls.
+    tool_call_parser: qwen3_coder
+
+infra:
+  port: 30000                            # fallback only when shards: empty
+  gpu_ids: [0, 1]
+
+output:
+  root: simulation/results

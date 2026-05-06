@@ -32,30 +32,47 @@ MODEL_PRESETS: dict[str, dict] = {
         "draft_model": "thoughtworks/GLM-4.7-Flash-Eagle3",
         "draft_lm": None,
         "tool_call_parser": "qwen25",
+        "speculative_algorithm": "EAGLE3",
     },
     "qwen3_8b": {
         "model": "Qwen/Qwen3-8B",
         "draft_model": "AngelSlim/Qwen3-8B_eagle3",
         "draft_lm": "Qwen/Qwen3-0.6B",
         "tool_call_parser": "qwen25",
+        "speculative_algorithm": "EAGLE3",
     },
     "qwen3_14b": {
         "model": "Qwen/Qwen3-14B",
         "draft_model": "AngelSlim/Qwen3-14B_eagle3",
         "draft_lm": "Qwen/Qwen3-0.6B",
         "tool_call_parser": "qwen25",
+        "speculative_algorithm": "EAGLE3",
     },
     "qwen3_32b": {
         "model": "Qwen/Qwen3-32B",
         "draft_model": "Zhihu-ai/Zhi-Create-Qwen3-32B-Eagle3",
         "draft_lm": "Qwen/Qwen3-0.6B",
         "tool_call_parser": "qwen25",
+        "speculative_algorithm": "EAGLE3",
     },
     "llama3_8b": {
         "model": "meta-llama/Llama-3.1-8B-Instruct",
         "draft_model": "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
         "draft_lm": "meta-llama/Llama-3.2-1B-Instruct",
         "tool_call_parser": "llama3",
+        "speculative_algorithm": "EAGLE3",
+    },
+    # Qwen3.5-9B uses built-in MTP head (no separate EAGLE3 draft model).
+    # speculative_algorithm="EAGLE" + draft_model=same path triggers SGLang
+    # to swap the draft arch to Qwen3_5ForCausalLMMTP (model_config.py:325).
+    # Captured oracle entries keep `proposer="eagle3"` / `eagle3_*` field
+    # names — they are MTP data despite the label (project_eagle_label_means_mtp).
+    "qwen35_9b": {
+        "model": "Qwen/Qwen3.5-9B",
+        "draft_model": "Qwen/Qwen3.5-9B",
+        "draft_lm": "Qwen/Qwen3-0.6B",
+        "tool_call_parser": "qwen25",
+        "speculative_algorithm": "EAGLE",
     },
 }
 
@@ -161,6 +178,7 @@ def execute_round_robin(cfg: dict, dry_run: bool = False) -> int:
     target_model = models.get("target_model") or preset["model"]
     draft_model = models.get("draft_model") or preset["draft_model"]
     tool_call_parser = preset["tool_call_parser"]
+    spec_algorithm = preset.get("speculative_algorithm", "EAGLE3")
 
     # RR uses a single (steps, topk, num_draft_tokens). If stage1_configs
     # has multiple entries (sweep mode), reject — RR is single-config.
@@ -249,6 +267,13 @@ def execute_round_robin(cfg: dict, dry_run: bool = False) -> int:
                 "gpu_ids": list(sh.get("gpu_ids") or [i]),
                 "port": int(sh.get("port", default_port + i)),
                 "plan": [s for s in plan if s["workload"] in sh_wls],
+                # Per-shard tool_call_parser override (defaults to preset).
+                # Needed for Qwen3.5: bfcl_v4 emits Python-list calls
+                # (qwen25 parser), but minisweagent (swebench) emits
+                # `<tool_call><function=...>` XML which only qwen3_coder
+                # parses. With both workloads on the same SGLang server you
+                # can pick only one — split shards by tool format.
+                "tool_call_parser": sh.get("tool_call_parser", tool_call_parser),
             })
     else:
         shard_specs = [{
@@ -256,6 +281,7 @@ def execute_round_robin(cfg: dict, dry_run: bool = False) -> int:
             "gpu_ids": default_gpu_ids,
             "port": default_port,
             "plan": plan,
+            "tool_call_parser": tool_call_parser,
         }]
 
     print(f"Experiment: {cfg.get('name', '(unnamed)')} (round-robin)")
@@ -268,7 +294,8 @@ def execute_round_robin(cfg: dict, dry_run: bool = False) -> int:
     for ss in shard_specs:
         ss_wls = [s["workload"] for s in ss["plan"]]
         print(f"  [shard {ss['id']}] gpu_ids={ss['gpu_ids']}  "
-              f"port={ss['port']}  workloads={ss_wls}")
+              f"port={ss['port']}  workloads={ss_wls}  "
+              f"tool_call_parser={ss['tool_call_parser']}")
     for s in plan:
         print(f"  [{s['workload']:<22}] dataset={s['dataset']}")
         print(f"  {' ' * 24}  out={s['out_file']}")
@@ -282,26 +309,41 @@ def execute_round_robin(cfg: dict, dry_run: bool = False) -> int:
         s["out_dir"].mkdir(parents=True, exist_ok=True)
 
     # Install hook once (idempotent, host-wide).
+    # IMPORTANT: install_hook.py:install_oracle_patch() early-returns unless
+    # SGLANG_ORACLE_VANILLA=1 is in its OWN env. Without setting this, the
+    # patch never lands in eagle_worker.py / multi_layer_eagle_worker.py and
+    # captures end up with `total_oracle_entries: 0` (no spec_decode data).
+    # This also matters after an SGLang upgrade in the venv — the freshly-
+    # reinstalled worker files lose the Dockerfile's build-time sed patch.
     base_env = os.environ.copy()
+    install_env = base_env.copy()
+    install_env["SGLANG_ORACLE_VANILLA"] = "1"
     print("Installing oracle hook…")
     subprocess.run([sys.executable, "-m", "simulation.oracle.install_hook"],
-                   env=base_env, check=True, cwd=str(REPO_ROOT))
+                   env=install_env, check=True, cwd=str(REPO_ROOT))
 
+    # tool_call_parser is now per-shard (see shard_specs above), so don't
+    # bundle it into shard_kwargs.
     shard_kwargs = dict(
         target_model=target_model, draft_model=draft_model,
-        tool_call_parser=tool_call_parser,
+        spec_algorithm=spec_algorithm,
         steps=steps, topk=topk, ndt=ndt,
         capture_full_pool=capture_full_pool,
         batch=batch, resume=resume,
         out_base=out_base, base_env=base_env,
         context_length=context_length,
+        mem_fraction_static=cfg.get("mem_fraction_static"),
+        max_total_tokens=cfg.get("max_total_tokens"),
+        max_prefill_tokens=cfg.get("max_prefill_tokens"),
     )
 
     if len(shard_specs) == 1:
         ss = shard_specs[0]
         rc = _run_rr_shard(
             shard_id=ss["id"], gpu_ids=ss["gpu_ids"],
-            port=ss["port"], plan=ss["plan"], **shard_kwargs)
+            port=ss["port"], plan=ss["plan"],
+            tool_call_parser=ss["tool_call_parser"],
+            **shard_kwargs)
         print("Round-robin done.")
         return rc
 
@@ -314,6 +356,7 @@ def execute_round_robin(cfg: dict, dry_run: bool = False) -> int:
             ex.submit(_run_rr_shard,
                       shard_id=ss["id"], gpu_ids=ss["gpu_ids"],
                       port=ss["port"], plan=ss["plan"],
+                      tool_call_parser=ss["tool_call_parser"],
                       **shard_kwargs): ss
             for ss in shard_specs
         }
@@ -334,9 +377,13 @@ def execute_round_robin(cfg: dict, dry_run: bool = False) -> int:
 def _run_rr_shard(
     *, shard_id: str, gpu_ids: list, port: int, plan: list,
     target_model: str, draft_model: str, tool_call_parser: str,
+    spec_algorithm: str,
     steps: int, topk: int, ndt: int, capture_full_pool: bool,
     batch: int, resume: bool, out_base, base_env: dict,
     context_length: int | None = None,
+    mem_fraction_static: float | None = None,
+    max_total_tokens: int | None = None,
+    max_prefill_tokens: int | None = None,
 ) -> int:
     """Boot one SGLang server on (gpu_ids, port) and run RR over `plan`."""
     rr_env = base_env.copy()
@@ -346,30 +393,47 @@ def _run_rr_shard(
         rr_env["SGLANG_CAPTURE_FULL_POOL"] = "1"
     rr_env["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
     rr_env.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+    # SGLang 0.5.9 enforces a CuDNN 9.15+ check tied to a Conv3d perf bug —
+    # text-only models like Qwen3.5 don't use Conv3d, so bypass.
+    rr_env.setdefault("SGLANG_DISABLE_CUDNN_CHECK", "1")
+    # SGLang 0.5.10+ Qwen3.5 + tree-mode spec decode (topk>1) — Spec V2 path
+    # forces topk=1 (chain-only), so we take the alternate fork:
+    #   no_buffer mamba scheduler (default) + --disable-radix-cache
+    # See _handle_mamba_radix_cache in sglang/srt/server_args.py.
     for k in ("SGLANG_ORACLE_REPLAY", "SGLANG_ORACLE_VERIFY_TRIES"):
         rr_env.pop(k, None)
+
+    mem_fraction = mem_fraction_static if mem_fraction_static is not None else 0.85
+    max_prefill = max_prefill_tokens if max_prefill_tokens is not None else 8192
 
     srv_log = out_base / f"_rr_sglang_server_shard{shard_id}.log"
     cmd = [
         sys.executable, "-m", "sglang.launch_server",
         "--model-path", target_model,
         "--tp-size", str(len(gpu_ids)),
-        "--speculative-algorithm", "EAGLE3",
+        "--speculative-algorithm", spec_algorithm,
         "--speculative-draft-model-path", draft_model,
         "--speculative-num-steps", str(steps),
         "--speculative-eagle-topk", str(topk),
         "--speculative-num-draft-tokens", str(ndt),
         "--tool-call-parser", tool_call_parser,
-        "--mem-fraction-static", "0.85",
+        "--mem-fraction-static", str(mem_fraction),
         "--max-running-requests", "1",
-        "--max-prefill-tokens", "8192",
+        "--max-prefill-tokens", str(max_prefill),
         "--kv-cache-dtype", "fp8_e5m2",
         "--disable-cuda-graph",
         "--watchdog-timeout", "600",
+        # SGLang 0.5.10+ requires --disable-radix-cache for Qwen3.5 (Mamba
+        # arch) when using tree-mode speculative decoding (topk > 1). The
+        # alternative would be Spec V2 + extra_buffer mamba scheduler, but
+        # Spec V2 currently only supports topk=1 (chain mode).
+        "--disable-radix-cache",
         "--host", "0.0.0.0", "--port", str(port),
     ]
     if context_length is not None:
         cmd += ["--context-length", str(context_length)]
+    if max_total_tokens is not None:
+        cmd += ["--max-total-tokens", str(max_total_tokens)]
     print(f"[shard {shard_id}] Launching SGLang on port {port} "
           f"GPU={gpu_ids} (log: {srv_log})…")
     log_fh = open(srv_log, "w")

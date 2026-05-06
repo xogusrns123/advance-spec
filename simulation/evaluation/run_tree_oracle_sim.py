@@ -310,19 +310,31 @@ def simulate_decoding(
                     suffix_min_token_prob=T,
                     suffix_max_spec_tokens=0)
             elif method.startswith("extension_by_count:"):
-                # Total tree (base + suffix grafts) capped at C = B × ratio.
-                # Base stays at budget B; suffix fills up to cap.
-                ratio = float(method.split(":", 1)[1])
+                # extension_by_count:r[:F:T] — total tree capped at C = B × r.
+                # Optional F,T sweeps the suffix-graft size (default 4.0/0.0).
+                parts = method.split(":")
+                ratio = float(parts[1])
                 cap = max(1, int(round(budget * ratio)))
+                F, T = (4.0, 0.0)
+                if len(parts) >= 4:
+                    F, T = float(parts[2]), float(parts[3])
                 accepted, ext_size = _extension_step(
                     rec, budget, local_cache, cache_req_id,
-                    base_proposer="eagle3", max_count=cap)
+                    base_proposer="eagle3", max_count=cap,
+                    suffix_max_spec_factor=F, suffix_min_token_prob=T,
+                    suffix_max_spec_tokens=0)
             elif method.startswith("extension_by_score:"):
-                # Only attach suffix at base nodes where suffix draft.score ≥ t.
-                threshold = float(method.split(":", 1)[1])
+                # extension_by_score:t[:F:T] — score threshold + optional FT.
+                parts = method.split(":")
+                threshold = float(parts[1])
+                F, T = (4.0, 0.0)
+                if len(parts) >= 4:
+                    F, T = float(parts[2]), float(parts[3])
                 accepted, ext_size = _extension_step(
                     rec, budget, local_cache, cache_req_id,
-                    base_proposer="eagle3", score_threshold=threshold)
+                    base_proposer="eagle3", score_threshold=threshold,
+                    suffix_max_spec_factor=F, suffix_min_token_prob=T,
+                    suffix_max_spec_tokens=0)
             elif method.startswith("extension_by_count_score:"):
                 # Combined: count cap + score filter.
                 _, rest = method.split(":", 1)
@@ -333,11 +345,17 @@ def simulate_decoding(
                     base_proposer="eagle3",
                     max_count=cap, score_threshold=float(t_s))
             elif method.startswith("extension_prune_pt:"):
-                # Prune backbone itself where path_p_t < t.
-                t = float(method.split(":", 1)[1])
+                # extension_prune_pt:pt[:F:T] — prune backbone path_p_t<pt + opt FT.
+                parts = method.split(":")
+                t = float(parts[1])
+                F, T = (4.0, 0.0)
+                if len(parts) >= 4:
+                    F, T = float(parts[2]), float(parts[3])
                 accepted, ext_size = _extension_step(
                     rec, budget, local_cache, cache_req_id,
-                    base_proposer="eagle3", backbone_pt_threshold=t)
+                    base_proposer="eagle3", backbone_pt_threshold=t,
+                    suffix_max_spec_factor=F, suffix_min_token_prob=T,
+                    suffix_max_spec_tokens=0)
             # ----- draft_model-backbone extension family (parallel to eagle3) -----
             elif method == "extension_dm" or (method.startswith("extension_dm:")
                                               and not method.startswith("extension_dm_")):
@@ -375,16 +393,28 @@ def simulate_decoding(
                 if real_step_draft_fn is not None:
                     _step_draft_ms = real_step_draft_fn(_best_b)
             elif method.startswith("extension_dm_by_count:"):
-                ratio = float(method.split(":", 1)[1])
+                parts = method.split(":")
+                ratio = float(parts[1])
                 cap = max(1, int(round(budget * ratio)))
+                F, T = (4.0, 0.0)
+                if len(parts) >= 4:
+                    F, T = float(parts[2]), float(parts[3])
                 accepted, ext_size = _extension_step(
                     rec, budget, local_cache, cache_req_id,
-                    base_proposer="draft_model", max_count=cap)
+                    base_proposer="draft_model", max_count=cap,
+                    suffix_max_spec_factor=F, suffix_min_token_prob=T,
+                    suffix_max_spec_tokens=0)
             elif method.startswith("extension_dm_by_score:"):
-                threshold = float(method.split(":", 1)[1])
+                parts = method.split(":")
+                threshold = float(parts[1])
+                F, T = (4.0, 0.0)
+                if len(parts) >= 4:
+                    F, T = float(parts[2]), float(parts[3])
                 accepted, ext_size = _extension_step(
                     rec, budget, local_cache, cache_req_id,
-                    base_proposer="draft_model", score_threshold=threshold)
+                    base_proposer="draft_model", score_threshold=threshold,
+                    suffix_max_spec_factor=F, suffix_min_token_prob=T,
+                    suffix_max_spec_tokens=0)
             elif is_hybrid:
                 if method.startswith("hybrid_oracle:"):
                     # hybrid_oracle:F:T:τ — hybrid_e3 gating + accept-only
@@ -1552,9 +1582,9 @@ def compute_latency_speedup(
             # Parametric F/T sweep for single:suffix
             if pname == "suffix":
                 FT_GRID_SUFFIX = [
-                    (1.0, 0.0), (1.0, 0.1),
-                    (2.0, 0.0), (2.0, 0.1),
-                    (4.0, 0.0), (4.0, 0.1),
+                    (1.0, 0.0),
+                    (2.0, 0.0),
+                    (4.0, 0.0),
                 ]
                 for F, T in FT_GRID_SUFFIX:
                     nm = f"single:suffix:{F}:{T}"
@@ -1574,11 +1604,11 @@ def compute_latency_speedup(
             e3_cost = _real_cost(["eagle3"], B)
             suffix_only_cost = _target_forward(B) + suffix_speculate_ms
             # PARAMETRIC hybrid: F/T sweep × threshold sweep, N unbounded
-            # (6 F/T pairs × 6 thresholds = 36 variants)
+            # Reduced 3-pair grid (T=0.0 only) for speed.
             FT_GRID = [
-                (1.0, 0.0), (1.0, 0.1),
-                (2.0, 0.0), (2.0, 0.1),
-                (4.0, 0.0), (4.0, 0.1),
+                (1.0, 0.0),
+                (2.0, 0.0),
+                (4.0, 0.0),
             ]
             for F, T in FT_GRID:
                 for t in hybrid_thresholds:
@@ -1610,9 +1640,9 @@ def compute_latency_speedup(
             dm_cost = _real_cost(["draft_model"], B)
             suffix_only_cost = _target_forward(B) + suffix_speculate_ms
             FT_GRID = [
-                (1.0, 0.0), (1.0, 0.1),
-                (2.0, 0.0), (2.0, 0.1),
-                (4.0, 0.0), (4.0, 0.1),
+                (1.0, 0.0),
+                (2.0, 0.0),
+                (4.0, 0.0),
             ]
             def _dm_draft_cost(b):
                 # draft_model fallback cost = TPOT × min(B, MAX)
@@ -1663,12 +1693,22 @@ def compute_latency_speedup(
             # Fallback cost if ext_size somehow isn't observed (shouldn't happen):
             ext_cost_fallback = _target_forward(B) + ext_draft_only
             # PARAMETRIC F/T sweep for extension and extension_oracle.
-            # N is always unbounded. 5-pair F/T grid.
+            # N is always unbounded. Reduced 3-pair grid (T=0.0 only) for speed.
             FT_GRID = [
-                (1.0, 0.0), (1.0, 0.1),
-                (2.0, 0.0), (2.0, 0.1),
-                (4.0, 0.0), (4.0, 0.1),
+                (1.0, 0.0),
+                (2.0, 0.0),
+                (4.0, 0.0),
             ]
+            # path_draft_p_t availability — needed by prune_pt variant.
+            has_draft_p_t = any(
+                (rec.get("per_proposer", {})
+                    .get("eagle3", {}) or {}).get("path_draft_p_t") is not None
+                for rec in records)
+            if not has_draft_p_t:
+                print("NOTE: no path_draft_p_t available — skipping "
+                      "ptopk/product/pathprob/topp/dynsfx methods",
+                      file=sys.stderr)
+
             for F, T in FT_GRID:
                 tag = f"f{F}_t{T}"
                 _run(f"extension:{F}:{T}",
@@ -1691,52 +1731,33 @@ def compute_latency_speedup(
                           "real_step_draft_only_ms": ext_draft_only},
                          f"extension_oracle_{tag}")
 
-            # Filter variants — count cap (total tree ≤ B × ratio) and
-            # score threshold (only graft suffix at high-score base nodes).
-            # Combined too. All deployable (no oracle accounting).
-            for r in [1.0, 2.0, 4.0]:
-                _run(f"extension_by_count:{r}",
-                     {**common, "method": f"extension_by_count:{r}",
-                      "suffix_cache": _SUFFIX_ENABLED,
-                      "real_step_cost_ms": ext_cost_fallback,
-                      "real_step_target_fn": _target_forward,
-                      "real_step_draft_only_ms": ext_draft_only},
-                     f"extension_by_count_r{r}")
-            for t in [1.0, 2.0, 3.0, 5.0, 10.0, 20.0]:
-                _run(f"extension_by_score:{t}",
-                     {**common, "method": f"extension_by_score:{t}",
-                      "suffix_cache": _SUFFIX_ENABLED,
-                      "real_step_cost_ms": ext_cost_fallback,
-                      "real_step_target_fn": _target_forward,
-                      "real_step_draft_only_ms": ext_draft_only},
-                     f"extension_by_score_t{t:.1f}")
-            # extension_by_count_score (combined filter) — disabled this run
-
-            # p_t–based extension filters (eagle3 base only — require
-            # EAGLE3 draft-side path probabilities, captured at Stage 1 by
-            # the oracle_patch organize_draft_results tracer).
-            # Legacy artifacts that predate path_draft_p_t capture simply
-            # don't carry it → skip these methods.
-            has_draft_p_t = any(
-                (rec.get("per_proposer", {})
-                    .get("eagle3", {}) or {}).get("path_draft_p_t") is not None
-                for rec in records)
-            if not has_draft_p_t:
-                print("NOTE: no path_draft_p_t available — skipping "
-                      "ptopk/product/pathprob/topp/dynsfx methods",
-                      file=sys.stderr)
-
-            # prune_pt: remove base nodes with path_p_t < t
-            # (their suffix grafts also pruned). Cuts verify cost.
-            if has_draft_p_t:
-                for t in [0.001, 0.01, 0.1]:
-                    _run(f"extension_prune_pt:{t}",
-                         {**common, "method": f"extension_prune_pt:{t}",
+                # Filter variants — sweep over same FT grid as plain extension
+                # so MAT comparisons are fair (variant ⊆ extension at SAME F,T).
+                for r in [1.0, 2.0, 4.0]:
+                    _run(f"extension_by_count:{r}:{F}:{T}",
+                         {**common, "method": f"extension_by_count:{r}:{F}:{T}",
                           "suffix_cache": _SUFFIX_ENABLED,
                           "real_step_cost_ms": ext_cost_fallback,
                           "real_step_target_fn": _target_forward,
                           "real_step_draft_only_ms": ext_draft_only},
-                         f"extension_prune_pt_t{t}")
+                         f"extension_by_count_r{r}_{tag}")
+                for thresh in [1.0, 2.0, 3.0, 5.0, 10.0, 20.0]:
+                    _run(f"extension_by_score:{thresh}:{F}:{T}",
+                         {**common, "method": f"extension_by_score:{thresh}:{F}:{T}",
+                          "suffix_cache": _SUFFIX_ENABLED,
+                          "real_step_cost_ms": ext_cost_fallback,
+                          "real_step_target_fn": _target_forward,
+                          "real_step_draft_only_ms": ext_draft_only},
+                         f"extension_by_score_t{thresh:.1f}_{tag}")
+                if has_draft_p_t:
+                    for pt in [0.001, 0.01, 0.1]:
+                        _run(f"extension_prune_pt:{pt}:{F}:{T}",
+                             {**common, "method": f"extension_prune_pt:{pt}:{F}:{T}",
+                              "suffix_cache": _SUFFIX_ENABLED,
+                              "real_step_cost_ms": ext_cost_fallback,
+                              "real_step_target_fn": _target_forward,
+                              "real_step_draft_only_ms": ext_draft_only},
+                             f"extension_prune_pt_t{pt}_{tag}")
 
         # ----- Extension family with draft_model backbone -----
         # Mirrors the eagle3-base extension family but uses the draft_model
@@ -1767,22 +1788,23 @@ def compute_latency_speedup(
                           "real_step_draft_fn": _eagle3_draft,  # dm-oracle still uses target-only verify; draft cost ≈ draft_lm_tpot × picked_B
                           "real_step_draft_only_ms": dm_draft_only},
                          f"extension_dm_oracle_{tag}")
-            for r in [1.0, 2.0, 4.0]:
-                _run(f"extension_dm_by_count:{r}",
-                     {**common, "method": f"extension_dm_by_count:{r}",
-                      "suffix_cache": _SUFFIX_ENABLED,
-                      "real_step_cost_ms": dm_cost_fallback,
-                      "real_step_target_fn": _target_forward,
-                      "real_step_draft_only_ms": dm_draft_only},
-                     f"extension_dm_by_count_r{r}")
-            for t in [1.0, 2.0, 3.0, 5.0, 10.0, 20.0]:
-                _run(f"extension_dm_by_score:{t}",
-                     {**common, "method": f"extension_dm_by_score:{t}",
-                      "suffix_cache": _SUFFIX_ENABLED,
-                      "real_step_cost_ms": dm_cost_fallback,
-                      "real_step_target_fn": _target_forward,
-                      "real_step_draft_only_ms": dm_draft_only},
-                     f"extension_dm_by_score_t{t:.1f}")
+
+                for r in [1.0, 2.0, 4.0]:
+                    _run(f"extension_dm_by_count:{r}:{F}:{T}",
+                         {**common, "method": f"extension_dm_by_count:{r}:{F}:{T}",
+                          "suffix_cache": _SUFFIX_ENABLED,
+                          "real_step_cost_ms": dm_cost_fallback,
+                          "real_step_target_fn": _target_forward,
+                          "real_step_draft_only_ms": dm_draft_only},
+                         f"extension_dm_by_count_r{r}_{tag}")
+                for thresh in [1.0, 2.0, 3.0, 5.0, 10.0, 20.0]:
+                    _run(f"extension_dm_by_score:{thresh}:{F}:{T}",
+                         {**common, "method": f"extension_dm_by_score:{thresh}:{F}:{T}",
+                          "suffix_cache": _SUFFIX_ENABLED,
+                          "real_step_cost_ms": dm_cost_fallback,
+                          "real_step_target_fn": _target_forward,
+                          "real_step_draft_only_ms": dm_draft_only},
+                         f"extension_dm_by_score_t{thresh:.1f}_{tag}")
 
         # Parallel mode: dispatch all queued (method, budget) pairs
         _flush_pending()
@@ -1931,6 +1953,16 @@ def main():
                              "'single:eagle3,single:suffix,hybrid_e3:1.0,"
                              "extension,extension_oracle'. Use a bare prefix "
                              "like 'extension' to match all extension_* variants.")
+    parser.add_argument("--proposer-label", default="eagle3",
+                        choices=["eagle3", "mtp"],
+                        help="Display label for the eagle3-family proposer in "
+                             "output JSON. Use 'mtp' for Qwen3.5-9B captures "
+                             "(the proposer is actually MTP — see "
+                             "project_eagle_label_means_mtp memory). Renames "
+                             "eagle3* → label*, hybrid_e3_* → hybrid_label_*, "
+                             "hybrid_oracle_* → hybrid_oracle_label_*. Internal "
+                             "sim logic keeps using 'eagle3'; only the on-disk "
+                             "JSON keys/strings are rewritten.")
     args = parser.parse_args()
 
     if not args.output and not args.print_summary:
@@ -1983,7 +2015,7 @@ def main():
     def _accumulate(prop_name: str, tids, pids, gt):
         if not gt:
             return
-        seq, ind, denom_depth = position_accept_rates(
+        seq, ind, cond_acc, cond_dn, denom_depth = position_accept_rates(
             tids or [], pids or [], gt, POSITION_ACCEPT_MAX)
         if denom_depth <= 0:
             return
@@ -1991,16 +2023,23 @@ def main():
             "seq_accept": [0] * POSITION_ACCEPT_MAX,
             "ind_accept": [0] * POSITION_ACCEPT_MAX,
             "depth_ge": [0] * POSITION_ACCEPT_MAX,
+            "cond_accept": [0] * POSITION_ACCEPT_MAX,
+            "cond_denom": [0] * POSITION_ACCEPT_MAX,
         })
         # depth_ge counts ALL positions up to denom_depth, regardless of
         # whether this step's tree was deep enough to draft at position d.
         # This avoids the "deep-tree steps inflate deep-position accept rate"
         # bias that variable-depth proposers (suffix / EAGLE3 with reslice
         # shorter than tree) would otherwise introduce.
+        # cond_denom only increments when prev position was accepted —
+        # cond_rate[d] = cond_accept[d] / cond_denom[d] = P(accept[d] |
+        # accept[d-1]).
         for d in range(denom_depth):
             stats["depth_ge"][d] += 1
             stats["seq_accept"][d] += seq[d]
             stats["ind_accept"][d] += ind[d]
+            stats["cond_accept"][d] += cond_acc[d]
+            stats["cond_denom"][d] += cond_dn[d]
 
     # Pre-pass A: stored proposers in records["per_proposer"]. Restricted to
     # the canonical basic set {eagle3, draft_model}. mtp is skipped per
@@ -2177,11 +2216,70 @@ def main():
                 "latency_config not provided; MAT values are accurate but "
                 "speedup_* columns use stub latencies (not meaningful)")
 
+        _rename_proposer_keys_inplace(output, args.proposer_label)
+
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, "w") as f:
             json.dump(output, f, indent=2)
         print(f"Output: {args.output}", file=sys.stderr)
+
+
+def _rename_proposer_keys_inplace(output: dict, label: str) -> None:
+    """Rewrite eagle3-family keys/strings in the assembled output dict to use
+    a different proposer label (e.g. ``'mtp'``). Internal sim logic still
+    uses ``'eagle3'`` everywhere; only the on-disk JSON changes. Applied
+    once, just before ``json.dump``.
+
+    For Qwen3.5-9B captures the proposer is actually MTP (built-in head),
+    not real EAGLE3 — see project_eagle_label_means_mtp memory. Pass
+    ``--proposer-label mtp`` so the output JSON reflects that distinction.
+
+    Renames (when ``label != 'eagle3'``):
+      * ``eagle3``           → ``label``                       (proposers list, dict keys)
+      * ``eagle3_*``         → ``label_*``                     (e.g. eagle3_mat → mtp_mat)
+      * ``eagle3+...``       → ``label+...``                   (pairs entries)
+      * ``hybrid_e3``        → ``hybrid_label``
+      * ``hybrid_e3_*``      → ``hybrid_label_*``              (e.g. hybrid_e3_f1.0_t0.0_th3.0 → hybrid_mtp_f1.0_t0.0_th3.0)
+      * ``hybrid_oracle``    → ``hybrid_oracle_label``
+      * ``hybrid_oracle_*``  → ``hybrid_oracle_label_*``       (eagle3-backed variant)
+    """
+    if label == "eagle3":
+        return
+
+    EXACT = {
+        "eagle3":         label,
+        "hybrid_e3":      f"hybrid_{label}",
+        "hybrid_oracle":  f"hybrid_oracle_{label}",
+    }
+    PREFIXES = [
+        ("eagle3+",        f"{label}+"),
+        ("eagle3_",        f"{label}_"),
+        ("hybrid_e3_",     f"hybrid_{label}_"),
+        ("hybrid_oracle_", f"hybrid_oracle_{label}_"),
+    ]
+
+    def _rn(s: str) -> str:
+        if s in EXACT:
+            return EXACT[s]
+        for old, new in PREFIXES:
+            if s.startswith(old):
+                return new + s[len(old):]
+        return s
+
+    def _walk(obj):
+        # Returns a renamed copy. Strings inside dicts (values) are NOT
+        # renamed — only dict keys and items in lists-of-strings (proposers,
+        # pairs) get rewritten.
+        if isinstance(obj, dict):
+            return {_rn(k): _walk(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_rn(x) if isinstance(x, str) else _walk(x) for x in obj]
+        return obj
+
+    new = _walk(output)
+    output.clear()
+    output.update(new)
 
 
 if __name__ == "__main__":

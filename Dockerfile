@@ -28,13 +28,19 @@ RUN uv venv /opt/venv && \
     uv pip install torch --extra-index-url https://download.pytorch.org/whl/cu122
 
 # Layer 2: SGLang + sgl-kernel (SM89/RTX 4090 호환)
+# Pin to 0.5.10.post1 — 0.5.9 has Qwen3.5 chat-output bugs (degenerate
+# 1-token EOS / "multiple multiple..." loops; see project_qwen35_9b_sglang_broken
+# memory). 0.5.10.post1 fixes them. --prerelease=allow needed because
+# 0.5.10.post1 depends on flash-attn-4>=4.0.0b4 (prerelease).
 RUN . /opt/venv/bin/activate && \
-    uv pip install "sglang[all]" && \
+    uv pip install --prerelease=allow "sglang[all]==0.5.10.post1" && \
     uv pip install --force-reinstall "sgl-kernel>=0.1.0"
 
-# Layer 3: transformers 5.x (glm4_moe_lite 아키텍처 지원)
+# Layer 3: transformers (kept compatible with sglang 0.5.10.post1's pin to 5.3.0)
+# Earlier we pinned >=5.0.0 — 0.5.10.post1 brings 5.3.0 itself, so leave
+# the pip resolver to pick the compatible version.
 RUN . /opt/venv/bin/activate && \
-    uv pip install "transformers>=5.0.0"
+    uv pip install "transformers>=5.0.0,<5.4.0"
 
 # Layer 4: 프로젝트 의존성 + 유틸리티
 COPY pyproject.toml uv.lock ./

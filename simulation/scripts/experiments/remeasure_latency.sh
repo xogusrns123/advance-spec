@@ -27,14 +27,35 @@ case $PRESET in
     MODEL=${MODEL:-Qwen/Qwen3-8B}
     DRAFT_MODEL=${DRAFT_MODEL:-AngelSlim/Qwen3-8B_eagle3}
     DRAFT_LM=${DRAFT_LM:-Qwen/Qwen3-0.6B}
+    : ${ALGORITHM:=EAGLE3}
+    : ${TP_SIZE:=1}
+    : ${MEM_FRACTION:=0.85}
+    : ${EXTRA_LAUNCH_ARGS:=}
     ;;
   qwen3_14b)
     MODEL=${MODEL:-Qwen/Qwen3-14B}
     DRAFT_MODEL=${DRAFT_MODEL:-AngelSlim/Qwen3-14B_eagle3}
     DRAFT_LM=${DRAFT_LM:-Qwen/Qwen3-0.6B}
+    : ${ALGORITHM:=EAGLE3}
+    : ${TP_SIZE:=1}
+    : ${MEM_FRACTION:=0.85}
+    : ${EXTRA_LAUNCH_ARGS:=}
+    ;;
+  qwen35_9b)
+    # Qwen3.5-9B with built-in MTP head — algorithm = EAGLE, draft path = model path
+    # (triggers Qwen3_5ForCausalLMMTP arch swap). Defaults match the working
+    # rr_qwen35_9b.yaml: TP=2 across 24GB GPUs, mem_frac=0.55, ctx=8192.
+    MODEL=${MODEL:-Qwen/Qwen3.5-9B}
+    DRAFT_MODEL=${DRAFT_MODEL:-Qwen/Qwen3.5-9B}
+    DRAFT_LM=${DRAFT_LM:-Qwen/Qwen3-0.6B}
+    : ${ALGORITHM:=EAGLE}
+    : ${TP_SIZE:=2}
+    : ${MEM_FRACTION:=0.55}
+    : ${EXTRA_LAUNCH_ARGS:=--max-prefill-tokens 4096 --kv-cache-dtype fp8_e5m2 --max-running-requests 1 --context-length 8192 --tool-call-parser qwen25}
+    export SGLANG_DISABLE_CUDNN_CHECK=1
     ;;
   *)
-    echo "Unknown PRESET=$PRESET (use qwen3_8b or qwen3_14b)" >&2
+    echo "Unknown PRESET=$PRESET (use qwen3_8b, qwen3_14b, or qwen35_9b)" >&2
     exit 1
     ;;
 esac
@@ -44,9 +65,16 @@ WORKLOADS=${WORKLOADS:-"specbench,bfcl_v4,swebench"}
 
 # Sweep grid. Defaults add (1024, 2048) over the legacy table and steps=10
 # so K=16 can reach B=2048 (capacity 2321).
-BUDGETS=${BUDGETS:-"4,8,16,32,64,128,256,512,1024,2048"}
-STEPS=${STEPS:-"2,4,6,8,10"}
-TOPKS=${TOPKS:-"8,16"}
+# qwen35_9b: capture is (s=8,k=8,B=128), so we cap topks at 8 and budgets at 256.
+if [ "$PRESET" = "qwen35_9b" ]; then
+  BUDGETS=${BUDGETS:-"4,8,16,32,64,128,256"}
+  STEPS=${STEPS:-"2,4,6,8"}
+  TOPKS=${TOPKS:-"4,8"}
+else
+  BUDGETS=${BUDGETS:-"4,8,16,32,64,128,256,512,1024,2048"}
+  STEPS=${STEPS:-"2,4,6,8,10"}
+  TOPKS=${TOPKS:-"8,16"}
+fi
 
 # Draft LM TPOT samples (extension's draft_lm proposer never used at
 # inference time but kept in the config for completeness).
@@ -61,6 +89,10 @@ mkdir -p "$OUTPUT_DIR"
 
 echo "================================================================"
 echo "Re-measuring latency for preset=$PRESET on port=$PORT"
+echo "  algorithm: $ALGORITHM"
+echo "  tp-size:   $TP_SIZE"
+echo "  mem-frac:  $MEM_FRACTION"
+echo "  extra:     $EXTRA_LAUNCH_ARGS"
 echo "  budgets:   $BUDGETS"
 echo "  steps:     $STEPS"
 echo "  topks:     $TOPKS"
@@ -73,24 +105,39 @@ export TORCHINDUCTOR_COMPILE_THREADS=1
 
 if [ -f /workspace/.env ]; then set -a; source /workspace/.env; set +a; fi
 
-# 1. EAGLE3 cost (target_forward_ms + eagle3_draft_ms)
+# 1. EAGLE/EAGLE3 cost (target_forward_ms + eagle3_draft_ms)
+#    For qwen35_9b the algorithm is EAGLE (MTP) but the field naming follows
+#    the legacy eagle3_* schema (see project_eagle_label_means_mtp memory).
 echo ""
-echo "=== [1/4] EAGLE3 cost: target_forward_ms + eagle3_draft_ms ==="
+echo "=== [1/4] $ALGORITHM cost: target_forward_ms + eagle3_draft_ms ==="
+EAGLE_EXTRA_ARGS=()
+if [ -n "$EXTRA_LAUNCH_ARGS" ]; then
+  EAGLE_EXTRA_ARGS=( --extra-args $EXTRA_LAUNCH_ARGS )
+fi
 python3 simulation/scripts/measure_eagle3_cost.py \
   --model "$MODEL" --draft-model "$DRAFT_MODEL" \
+  --algorithm "$ALGORITHM" \
+  --tp-size "$TP_SIZE" \
+  --mem-fraction-static "$MEM_FRACTION" \
   --workloads "$WORKLOADS" \
   --budgets "$BUDGETS" --steps "$STEPS" --topks "$TOPKS" \
   --port "$PORT" \
-  --output "$OUTPUT_DIR/eagle3_cost.json"
+  --output "$OUTPUT_DIR/eagle3_cost.json" \
+  "${EAGLE_EXTRA_ARGS[@]}"
 
 # 2. Draft LM cost (per_token_ms by num_draft_tokens)
+#    Skip if SKIP_DRAFT_LM=1 (e.g., when running in parallel as a separate job).
 echo ""
-echo "=== [2/4] Draft-LM TPOT: $DRAFT_LM ==="
-python3 simulation/scripts/measure_draft_model_cost.py \
-  --model "$DRAFT_LM" --workloads "$WORKLOADS" \
-  --num-draft-tokens "$DRAFT_LM_NS" \
-  --port "$PORT" \
-  --output "$OUTPUT_DIR/draft_model_cost.json"
+if [ "${SKIP_DRAFT_LM:-0}" = "1" ]; then
+  echo "=== [2/4] Draft-LM TPOT: SKIPPED (SKIP_DRAFT_LM=1) ==="
+else
+  echo "=== [2/4] Draft-LM TPOT: $DRAFT_LM ==="
+  python3 simulation/scripts/measure_draft_model_cost.py \
+    --model "$DRAFT_LM" --workloads "$WORKLOADS" \
+    --num-draft-tokens "$DRAFT_LM_NS" \
+    --port "$PORT" \
+    --output "$OUTPUT_DIR/draft_model_cost.json"
+fi
 
 # 3. Suffix speculate cost (no server; reads agent_results)
 echo ""

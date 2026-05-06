@@ -186,8 +186,15 @@ def main():
                         help="Generation cap for both warmup and measurement calls")
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--mem-fraction-static", type=float, default=0.85)
+    parser.add_argument("--algorithm", default="EAGLE3",
+                        choices=["EAGLE3", "EAGLE"],
+                        help="Speculative algorithm. EAGLE3 for AngelSlim drafts; "
+                             "EAGLE for Qwen3.5-9B (built-in MTP head, draft path = model path)")
     parser.add_argument("--output", required=True)
-    parser.add_argument("--extra-args", nargs="*", default=[])
+    # REMAINDER so we can pass through SGLang flags like
+    # ``--max-prefill-tokens 4096`` without argparse mis-parsing them as our
+    # own flags. Must be the last positional/option on the command line.
+    parser.add_argument("--extra-args", nargs=argparse.REMAINDER, default=[])
     args = parser.parse_args()
 
     workloads = [w.strip() for w in args.workloads.split(",") if w.strip()]
@@ -309,7 +316,7 @@ def main():
             sys.executable, "-m", "sglang.launch_server",
             "--model-path", args.model,
             "--tp-size", str(args.tp_size),
-            "--speculative-algorithm", "EAGLE3",
+            "--speculative-algorithm", args.algorithm,
             "--speculative-draft-model-path", args.draft_model,
             "--speculative-num-steps", str(S),
             "--speculative-eagle-topk", str(K),

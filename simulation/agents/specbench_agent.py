@@ -62,7 +62,7 @@ def run_single_request(
     model: str,
     item: dict,
     temperature: float = 0.0,
-    max_tokens: int = 2048,
+    max_tokens: int = 32768,
     collect_oracle: bool = True,
 ) -> dict:
     """Run multi-turn Q&A for one SpecBench question.
@@ -144,7 +144,7 @@ def replay_single_request(
     item: dict,
     round1_question: dict,
     temperature: float = 0.0,
-    max_tokens: int = 2048,
+    max_tokens: int = 32768,
 ) -> dict:
     """Replay Round 1 message history to collect MTP drafts.
 
@@ -221,7 +221,7 @@ def run_benchmark(
     num_requests: int | None = None,
     max_iterations: int = 1,  # unused, kept for CLI compat
     temperature: float = 0.0,
-    max_tokens: int = 2048,
+    max_tokens: int = 32768,
     replay_path: str | None = None,
     num_workers: int = 1,
     resume: bool = False,
@@ -271,7 +271,7 @@ def run_benchmark(
     if num_requests is not None:
         pending = pending[:num_requests]
 
-    client = OpenAI(base_url=url, api_key="dummy")
+    client = OpenAI(base_url=url, api_key="dummy", timeout=14400.0)
     print(f"Running {len(pending)}/{len(dataset)} SpecBench requests against "
           f"{url} (workers={num_workers})")
 

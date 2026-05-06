@@ -43,16 +43,32 @@ from simulation.pipeline._agent_io import (
 )
 
 
-def _iter_steps(req: dict) -> Iterator[Tuple[int, int, List[int]]]:
+def _iter_steps(
+    req: dict,
+    call_idx_range: Optional[Tuple[int, int]] = None,
+    skip_keys: Optional[set] = None,
+    rid: Optional[str] = None,
+) -> Iterator[Tuple[int, int, List[int]]]:
     """Yield (call_idx, step_idx, context_token_ids) for every step that
     needs a draft. Context matches the definition used by Stage 3a/Stage 4:
     ``prompt + tokens[0:step_idx]``.
 
     Steps where the remaining future has ≤1 token are skipped (nothing to
     verify).
+
+    Optional filters:
+      * ``call_idx_range = (LO, HI)`` — only emit calls with LO ≤ call_idx < HI.
+      * ``skip_keys`` + ``rid`` — skip any (rid, call_idx, step_idx)
+        tuple already present in skip_keys (parallel re-shard / resume).
     """
     prompt_ids_list = req.get("per_call_prompt_ids")
+    lo = call_idx_range[0] if call_idx_range else None
+    hi = call_idx_range[1] if call_idx_range else None
     for call_idx in range(len(req["per_call_tokens"])):
+        if lo is not None and call_idx < lo:
+            continue
+        if hi is not None and call_idx >= hi:
+            continue
         tokens = req["per_call_tokens"][call_idx]
         n = len(tokens)
         if n == 0:
@@ -63,6 +79,12 @@ def _iter_steps(req: dict) -> Iterator[Tuple[int, int, List[int]]]:
         decoded: List[int] = []
         for pos in range(n):
             if n - pos <= 1:
+                decoded.append(tokens[pos])
+                continue
+            if skip_keys is not None and rid is not None and (
+                    rid, call_idx, pos) in skip_keys:
+                # Already collected — advance the decoded prefix without
+                # emitting work, so context for later positions stays right.
                 decoded.append(tokens[pos])
                 continue
             context = prompt + decoded if prompt else list(decoded)
@@ -147,6 +169,8 @@ def _generate_hf(
     max_tokens: int,
     out_fp,
     checkpoint_every: int,
+    call_idx_range: Optional[Tuple[int, int]] = None,
+    skip_keys: Optional[set] = None,
 ) -> int:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -163,7 +187,9 @@ def _generate_hf(
     try:
         for ri, req in enumerate(requests):
             rid = req["bfcl_id"]
-            for call_idx, step_idx, context in _iter_steps(req):
+            for call_idx, step_idx, context in _iter_steps(
+                    req, call_idx_range=call_idx_range,
+                    skip_keys=skip_keys, rid=rid):
                 if not context:
                     tids, pids = [], []
                 else:
@@ -254,7 +280,52 @@ def main():
                         help="BFCL/SpecBench dataset.jsonl")
     parser.add_argument("--responses", default=None,
                         help="BFCL agent_results_responses.json")
+    # Sub-sharding filters — used by the 4-way re-shard of swebench shard2.
+    parser.add_argument("--instance-id", default=None,
+                        help="Process only this instance_id "
+                             "(comma-separated for multiple).")
+    parser.add_argument("--call-idx-range", default=None,
+                        help="LO,HI — process call_idx in [LO, HI). "
+                             "Applied per request.")
+    parser.add_argument("--skip-existing-from", default=None,
+                        help="JSONL of already-collected drafts; "
+                             "(request_id, call_idx, step_idx) tuples in "
+                             "the file are skipped.")
     args = parser.parse_args()
+
+    # Build skip-existing set (cheap — one int triple per row).
+    skip_keys: set = set()
+    if args.skip_existing_from:
+        print(f"Loading skip-existing keys from "
+              f"{args.skip_existing_from}", file=sys.stderr)
+        with open(args.skip_existing_from) as fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                    skip_keys.add((r["request_id"],
+                                   int(r["call_idx"]),
+                                   int(r["step_idx"])))
+                except Exception:
+                    pass
+        print(f"  loaded {len(skip_keys)} skip keys",
+              file=sys.stderr)
+
+    # Parse call-idx-range.
+    call_idx_lo, call_idx_hi = None, None
+    if args.call_idx_range:
+        lo, hi = args.call_idx_range.split(",")
+        call_idx_lo = int(lo)
+        call_idx_hi = int(hi)
+        print(f"call-idx range: [{call_idx_lo}, {call_idx_hi})",
+              file=sys.stderr)
+
+    # Parse instance_id filter.
+    instance_id_filter: Optional[set] = None
+    if args.instance_id:
+        instance_id_filter = set(
+            iid.strip() for iid in args.instance_id.split(",") if iid.strip())
+        print(f"instance_id filter: {instance_id_filter}",
+              file=sys.stderr)
 
     exclude_ids = load_exclude_ids(args.exclude) if args.exclude else set()
 
@@ -304,12 +375,24 @@ def main():
         tokenizer, bfcl_dataset, resp_by_id, specbench_dataset)
     print(f"Requests: {len(requests_)}", file=sys.stderr)
 
+    if instance_id_filter is not None:
+        before = len(requests_)
+        requests_ = [r for r in requests_
+                     if r.get("bfcl_id") in instance_id_filter]
+        print(f"After instance_id filter: {len(requests_)} of {before}",
+              file=sys.stderr)
+
     if args.shard:
         shard_id, num_shards = map(int, args.shard.split("/"))
         requests_ = _shard_requests(requests_, shard_id, num_shards)
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    call_idx_range = (
+        (call_idx_lo, call_idx_hi)
+        if call_idx_lo is not None and call_idx_hi is not None
+        else None)
 
     with open(output_path, "w") as out_fp:
         if args.server_url:
@@ -318,7 +401,9 @@ def main():
         else:
             written = _generate_hf(
                 requests_, args.model, args.device, args.max_draft_tokens,
-                out_fp, args.checkpoint_every)
+                out_fp, args.checkpoint_every,
+                call_idx_range=call_idx_range,
+                skip_keys=skip_keys if skip_keys else None)
 
     print(f"Output: {args.output} ({written} drafts)", file=sys.stderr)
 

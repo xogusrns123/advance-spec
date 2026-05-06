@@ -1,0 +1,55 @@
+# ============================================================
+# Resume-only config: continue swebench_verified RR capture for
+# Qwen3.5-9B (specbench + bfcl_v4 already exhausted by the
+# original rr_qwen35_9b.yaml run).
+#
+# Single shard on GPUs 2,3 / port 30001 (specbench/bfcl_v4 dropped
+# from workloads to avoid an unnecessary shard 0 server boot for
+# already-complete workloads).
+#
+# Run with:
+#   docker exec -u root -d sglang-bench bash -c \
+#     "cd /workspace && python3 simulation/scripts/run_experiment.py \
+#       simulation/config/rr_qwen35_9b_swebench_resume.yaml \
+#       > /tmp/rr_qwen35_stage1_resume.log 2>&1"
+# ============================================================
+name: rr_qwen35_9b_swebench_resume
+
+model_preset: qwen35_9b
+
+stage1_steps: 8
+stage1_configs:
+  - topk: 8
+    num_draft_tokens: 128
+
+round_robin:
+  enabled: true
+  capture_full_pool: true
+  batch: 1
+  resume: true
+  context_length: 8192
+
+mem_fraction_static: 0.55
+max_prefill_tokens: 4096
+
+workloads:
+  - swebench_verified
+
+workload_overrides:
+  swebench_verified:
+    max_iterations: 250
+    tool_style: minisweagent
+    repos_dir: data/swebench_verified/repos
+
+shards:
+  - id: 1
+    gpu_ids: [2, 3]
+    port: 30001
+    workloads: [swebench_verified]
+
+infra:
+  port: 30001
+  gpu_ids: [2, 3]
+
+output:
+  root: simulation/results

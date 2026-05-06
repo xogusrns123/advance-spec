@@ -676,7 +676,8 @@ def run_benchmark(
         model=model,
         api_key="dummy",
         temperature=temperature,
-        max_tokens=4096,
+        max_tokens=32768,
+        timeout=14400.0,  # 4h — oracle mode (3 tok/s) needs long ceiling
     )
 
     # Collect base_commits for cleanup (only for what we'll touch this run)
