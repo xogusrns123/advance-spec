@@ -146,10 +146,19 @@ def main():
         # (and any extension variant that consults per_proposer["draft_model"])
         # has data to read. Sites that don't want draft_model can pass
         # --methods explicitly to suppress its dispatch.
+        # Preference order:
+        #   1. chain replay capture (qwen3_14b_chain_dm/...) — verify-level
+        #      override fix; calibration-validated 73-93% accept
+        #   2. legacy collect_draft_model.py (qwen3_14b/...) — HTTP-greedy
+        chain_dm_rel = (Path("simulation") / "results" / "qwen3_14b_chain_dm"
+                        / f"{args.workload}_steps8_topk16_capture"
+                        / "draft_model_drafts.jsonl")
         dm_rel = cap_rel / "draft_model_drafts.jsonl"
         dm_partial_rel = cap_rel / "draft_model_drafts_partial.jsonl"
         dm_pick = None
-        if (HOST_ROOT / dm_rel).exists():
+        if (HOST_ROOT / chain_dm_rel).exists():
+            dm_pick = chain_dm_rel
+        elif (HOST_ROOT / dm_rel).exists():
             dm_pick = dm_rel
         elif (HOST_ROOT / dm_partial_rel).exists():
             dm_pick = dm_partial_rel

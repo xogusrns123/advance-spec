@@ -70,6 +70,7 @@ def collect_step_records(
     suffix_by_key: Optional[Dict[Tuple[str, int, int], dict]] = None,
     dm_by_key: Optional[Dict[Tuple[str, int, int], dict]] = None,
     mtp_requests: Optional[List[dict]] = None,
+    dm_capture_requests: Optional[List[dict]] = None,
     eagle3_reslice: Optional[Tuple[int, int, int, int]] = None,
 ) -> List[dict]:
     """Assemble per-step records for all requests.
@@ -85,9 +86,18 @@ def collect_step_records(
         Primary requests (EAGLE3 round) from extract_requests.
     suffix_by_key, dm_by_key : dict, optional
         Per-step draft records keyed by (request_id, call_idx, step_idx).
+        ``dm_by_key`` is the legacy flat-chain draft-model records from
+        Stage 2 HTTP collection — used as a fallback when
+        ``dm_capture_requests`` is absent.
     mtp_requests : list[dict], optional
         MTP round requests (same bfcl_ids, same token sequences). If
-        provided, MTP drafts are attached to per_proposer.
+        provided, MTP drafts are attached to per_proposer along with
+        per-node ``path_draft_p_t`` (when present).
+    dm_capture_requests : list[dict], optional
+        STANDALONE-algorithm draft-model capture round (same agent_results
+        format as eagle3). When matched by bfcl_id, supplies the
+        tree-structured draft_model proposer with per-node
+        ``path_draft_p_t`` instead of the flat-chain ``dm_by_key`` fallback.
     eagle3_reslice : tuple, optional
         ``(S_orig, K_orig, s_prime, k_prime)`` — when set and the request
         carries ``per_call_eagle3_pool_fulls`` (= captured with
@@ -111,12 +121,18 @@ def collect_step_records(
         for mr in mtp_requests:
             mtp_by_id[mr["bfcl_id"]] = mr
 
+    dm_cap_by_id: Dict[str, dict] = {}
+    if dm_capture_requests:
+        for dr in dm_capture_requests:
+            dm_cap_by_id[dr["bfcl_id"]] = dr
+
     records = []
 
     for ri, req in enumerate(requests):
         bfcl_id = req["bfcl_id"]
         prompt_ids_list = req.get("per_call_prompt_ids")
         mtp_req = mtp_by_id.get(bfcl_id)
+        dm_cap_req = dm_cap_by_id.get(bfcl_id)
 
         for call_idx in range(len(req["per_call_tokens"])):
             tokens = req["per_call_tokens"][call_idx]
@@ -211,18 +227,75 @@ def collect_step_records(
                     )
                     suffix_score = float(suffix_rec.get("score", 0.0))
 
-                # Draft model: looked up from Stage 2 output
-                dm_rec = dm_by_key.get(key)
-                if dm_rec and dm_rec.get("token_ids"):
-                    proposer_trees["draft_model"] = (
-                        list(dm_rec["token_ids"]),
-                        list(dm_rec["parents"]),
-                    )
+                # Draft model: prefer STANDALONE capture (tree + path-probs)
+                # when present, else fall back to legacy flat-chain Stage 2.
+                #
+                # OFFSET: STANDALONE replay-vanilla mode skips logging for the
+                # first 7 decodes (spec-decoding warmup before draft stash is
+                # populated). To align dm capture's pos=0 with eagle3 trajectory
+                # pos=7, shift dm indexing by DM_LOG_OFFSET.
+                #
+                # PARITY: When eagle3 reslice is active, also reslice DM's
+                # captured pool to the same (s', k') so calibration compares
+                # like-for-like trees (1 + k' + (s'-1)*k'^2 nodes each).
+                DM_LOG_OFFSET = 7
+                dm_path_draft_p_t = None
+                dm_attached = False
+                if dm_cap_req:
+                    dm_e3_trees = dm_cap_req.get("per_call_eagle3_trees")
+                    dm_e3_draft_p_ts = dm_cap_req.get(
+                        "per_call_eagle3_tree_path_draft_p_ts")
+                    dm_e3_pool_fulls = dm_cap_req.get("per_call_eagle3_pool_fulls")
+                    dm_pos = pos - DM_LOG_OFFSET
+
+                    # Reslice DM pool when eagle3 reslice is active
+                    if (reslice_args is not None and dm_e3_pool_fulls
+                            and call_idx < len(dm_e3_pool_fulls)
+                            and 0 <= dm_pos < len(dm_e3_pool_fulls[call_idx])
+                            and dm_e3_pool_fulls[call_idx][dm_pos] is not None):
+                        dm_fp = dm_e3_pool_fulls[call_idx][dm_pos]
+                        try:
+                            (reslicer_fn, S_orig, K_orig,
+                             s_p, k_p) = reslice_args
+                            dm_sub_ids, dm_sub_par, dm_sub_pp = reslicer_fn(
+                                dm_fp["draft_tokens"], dm_fp["parent_list"],
+                                dm_fp["path_probs"], dm_fp["pool_size"],
+                                S_orig, K_orig, s_p, k_p)
+                            proposer_trees["draft_model"] = (dm_sub_ids, dm_sub_par)
+                            dm_path_draft_p_t = dm_sub_pp
+                            dm_attached = True
+                        except Exception:
+                            pass
+
+                    # Fallback: use the truncated tree if pool reslice failed
+                    if (not dm_attached and dm_e3_trees
+                            and call_idx < len(dm_e3_trees)
+                            and 0 <= dm_pos < len(dm_e3_trees[call_idx])
+                            and dm_e3_trees[call_idx][dm_pos] is not None):
+                        dt = dm_e3_trees[call_idx][dm_pos]
+                        proposer_trees["draft_model"] = (
+                            dt["token_ids"], dt["parents"])
+                        dm_attached = True
+                        if (dm_e3_draft_p_ts
+                                and call_idx < len(dm_e3_draft_p_ts)
+                                and 0 <= dm_pos < len(dm_e3_draft_p_ts[call_idx])
+                                and dm_e3_draft_p_ts[call_idx][dm_pos] is not None):
+                            dm_path_draft_p_t = dm_e3_draft_p_ts[call_idx][dm_pos]
+                if not dm_attached:
+                    dm_rec = dm_by_key.get(key)
+                    if dm_rec and dm_rec.get("token_ids"):
+                        proposer_trees["draft_model"] = (
+                            list(dm_rec["token_ids"]),
+                            list(dm_rec["parents"]),
+                        )
 
                 # MTP: from optional MTP-replay round
+                mtp_path_draft_p_t = None
                 if mtp_req:
                     mtp_eagle3s = mtp_req.get("per_call_eagle3s", [])
                     mtp_e3_trees = mtp_req.get("per_call_eagle3_trees")
+                    mtp_e3_draft_p_ts = mtp_req.get(
+                        "per_call_eagle3_tree_path_draft_p_ts")
                     if call_idx < len(mtp_eagle3s):
                         mtp_call_eagle3s = mtp_eagle3s[call_idx]
                         if (mtp_e3_trees and call_idx < len(mtp_e3_trees)
@@ -233,6 +306,11 @@ def collect_step_records(
                         elif pos < len(mtp_call_eagle3s) and mtp_call_eagle3s[pos]:
                             m_parents, m_tokens = _flat_to_tree(mtp_call_eagle3s[pos])
                             proposer_trees["mtp"] = (m_tokens, m_parents)
+                        if (mtp_e3_draft_p_ts
+                                and call_idx < len(mtp_e3_draft_p_ts)
+                                and pos < len(mtp_e3_draft_p_ts[call_idx])
+                                and mtp_e3_draft_p_ts[call_idx][pos] is not None):
+                            mtp_path_draft_p_t = mtp_e3_draft_p_ts[call_idx][pos]
 
                 if not proposer_trees:
                     decoded.append(tokens[pos])
@@ -261,6 +339,10 @@ def collect_step_records(
                         entry["p_t"] = eagle3_p_t
                     if name == "eagle3" and eagle3_path_draft_p_t is not None:
                         entry["path_draft_p_t"] = eagle3_path_draft_p_t
+                    if name == "draft_model" and dm_path_draft_p_t is not None:
+                        entry["path_draft_p_t"] = dm_path_draft_p_t
+                    if name == "mtp" and mtp_path_draft_p_t is not None:
+                        entry["path_draft_p_t"] = mtp_path_draft_p_t
                     if name == "suffix":
                         entry["score"] = suffix_score
                     per_proposer[name] = entry
@@ -270,6 +352,31 @@ def collect_step_records(
                     gt_stored = list(future[:_GT_FUTURE_KEEP])
                 else:
                     gt_stored = list(future)
+
+                # Per-proposer GT: when a proposer ran in a separate capture
+                # (different target/replay state), its committed trajectory may
+                # diverge from the eagle3 trajectory. Calibration must compare
+                # against THAT proposer's own future, not eagle3's.
+                gt_mtp_stored = None
+                if mtp_req is not None:
+                    mtp_tokens_list = mtp_req.get("per_call_tokens") or []
+                    if call_idx < len(mtp_tokens_list):
+                        mtp_tokens = mtp_tokens_list[call_idx]
+                        if pos < len(mtp_tokens):
+                            mtp_future = mtp_tokens[pos:]
+                            if len(mtp_future) > 1:
+                                gt_mtp_stored = list(mtp_future[:_GT_FUTURE_KEEP])
+                gt_dm_stored = None
+                if dm_cap_req is not None:
+                    dm_tokens_list = dm_cap_req.get("per_call_tokens") or []
+                    if call_idx < len(dm_tokens_list):
+                        dm_tokens = dm_tokens_list[call_idx]
+                        # Apply same DM_LOG_OFFSET shift used for tree indexing.
+                        dm_pos_for_gt = pos - DM_LOG_OFFSET
+                        if 0 <= dm_pos_for_gt < len(dm_tokens):
+                            dm_future = dm_tokens[dm_pos_for_gt:]
+                            if len(dm_future) > 1:
+                                gt_dm_stored = list(dm_future[:_GT_FUTURE_KEEP])
 
                 if first_in_call:
                     ctx_stored = context.tolist()
@@ -287,6 +394,10 @@ def collect_step_records(
                     "gt_len": gt_full_len,
                     "context_token_ids": ctx_stored,
                 }
+                if gt_mtp_stored is not None:
+                    record["ground_truth_mtp"] = gt_mtp_stored
+                if gt_dm_stored is not None:
+                    record["ground_truth_dm"] = gt_dm_stored
                 records.append(record)
                 first_in_call = False
 
@@ -304,6 +415,7 @@ def assemble_records_from_artifacts(
     suffix_drafts_path: Optional[str] = None,
     draft_model_drafts_path: Optional[str] = None,
     mtp_agent_results_path: Optional[str] = None,
+    dm_capture_path: Optional[str] = None,
     exclude_path: Optional[str] = None,
     model: Optional[str] = None,
     dataset_path: Optional[str] = None,
@@ -386,6 +498,23 @@ def assemble_records_from_artifacts(
         print(f"MTP requests: {len(mtp_all_requests)}", file=sys.stderr)
         mtp_by_id = {mr["bfcl_id"]: mr for mr in mtp_all_requests}
 
+    dm_cap_all_requests = None
+    dm_cap_by_id: Optional[Dict[str, dict]] = None
+    if dm_capture_path:
+        # Standalone draft-model capture: same agent_results format as eagle3
+        # / MTP. Stream via ijson for large captures (e.g. swebench).
+        print(f"Streaming dm-capture: {dm_capture_path}", file=sys.stderr)
+        import ijson as _ijson_dm
+        dm_cap_all_requests = []
+        with open(dm_capture_path, "rb") as f:
+            for q in _ijson_dm.items(f, "questions.item"):
+                single = {"questions": [q], "per_request": []}
+                rs = extract_requests(single, exclude_ids)
+                dm_cap_all_requests.extend(rs)
+        print(f"DM-capture requests: {len(dm_cap_all_requests)}",
+              file=sys.stderr)
+        dm_cap_by_id = {dr["bfcl_id"]: dr for dr in dm_cap_all_requests}
+
     if not streaming:
         # Legacy: load full JSON at once.
         print(f"Loading: {agent_results_path}", file=sys.stderr)
@@ -403,6 +532,7 @@ def assemble_records_from_artifacts(
             suffix_by_key=suffix_by_key,
             dm_by_key=dm_by_key,
             mtp_requests=mtp_all_requests,
+            dm_capture_requests=dm_cap_all_requests,
             eagle3_reslice=eagle3_reslice,
         )
         elapsed = time.time() - t0
@@ -434,11 +564,16 @@ def assemble_records_from_artifacts(
             if mtp_by_id:
                 per_q_mtp = [mtp_by_id[r["bfcl_id"]] for r in reqs
                              if r["bfcl_id"] in mtp_by_id]
+            per_q_dm_cap = None
+            if dm_cap_by_id:
+                per_q_dm_cap = [dm_cap_by_id[r["bfcl_id"]] for r in reqs
+                                if r["bfcl_id"] in dm_cap_by_id]
             partial = collect_step_records(
                 reqs,
                 suffix_by_key=suffix_by_key,
                 dm_by_key=dm_by_key,
                 mtp_requests=per_q_mtp,
+                dm_capture_requests=per_q_dm_cap,
                 eagle3_reslice=eagle3_reslice,
             )
             records.extend(partial)
