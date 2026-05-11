@@ -231,3 +231,7 @@ __marimo__/
 
 # Archived runs / large result tarballs
 legacy/
+
+# Vendored third-party code (separate git clones) — track only patches/
+vendor/*
+!vendor/patches/

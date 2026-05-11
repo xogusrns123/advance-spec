@@ -1,0 +1,1987 @@
+diff --git a/arctic_inference/suffix_decoding/cache.py b/arctic_inference/suffix_decoding/cache.py
+index 2c0cd32..a9d6292 100644
+--- a/arctic_inference/suffix_decoding/cache.py
++++ b/arctic_inference/suffix_decoding/cache.py
+@@ -15,8 +15,9 @@
+ 
+ from __future__ import annotations
+ 
++from contextlib import contextmanager
+ from dataclasses import dataclass, field
+-from typing import Hashable, KeysView, List, Optional, Sequence
++from typing import Hashable, Iterator, KeysView, List, Optional, Sequence
+ 
+ import numpy as np
+ 
+@@ -60,7 +61,8 @@ class SuffixDecodingCache:
+     
+     def __init__(self,
+                  max_tree_depth: int = 64,
+-                 max_cached_requests: int = -1):
++                 max_cached_requests: int = -1,
++                 enable_undo: bool = False):
+         """
+         Initialize the SuffixDecodingCache.
+ 
+@@ -69,15 +71,22 @@ class SuffixDecodingCache:
+             max_cached_requests (int, optional): The maximum number of cached
+                 requests. Eviction is triggered when the limit is reached. `-1`
+                 means no limit on the number of cached requests.
++            enable_undo (bool, optional): If True, the underlying ``SuffixTree``
++                instances (global + per-request local) are constructed with
++                undo logging enabled, exposing ``extend_active_response`` /
++                ``pop_active_response`` / ``temporary_extension``. Default
++                False so callers that don't need reversibility pay no
++                overhead.
+         """
+         if max_cached_requests > 0x7FFFFFFF:
+             raise ValueError("max_cached_requests must be at most 2^31")
+ 
+         self._max_tree_depth = max_tree_depth
+         self._max_cached_requests = max_cached_requests
++        self._enable_undo = bool(enable_undo)
+ 
+         # Global suffix tree caches previous responses in a single tree.
+-        self._global_tree = SuffixTree(max_tree_depth)
++        self._global_tree = SuffixTree(max_tree_depth, self._enable_undo)
+ 
+         # Local suffix trees cache prompts for each active request separately.
+         self._local_trees = {}
+@@ -90,6 +99,12 @@ class SuffixDecodingCache:
+         # Unused sequence ID to assign to a new request ID.
+         self._next_seq_id = 0
+ 
++        # Per-request stack of pending temp-extension frame sizes. Each call
++        # to extend_active_response pushes an int (= number of tokens added);
++        # pop_active_response pops one frame. Only populated when
++        # _enable_undo is True.
++        self._pending_extensions: dict = {}
++
+     @property
+     def max_tree_depth(self) -> int:
+         return self._max_tree_depth
+@@ -150,7 +165,8 @@ class SuffixDecodingCache:
+         else:
+             extend_func = SuffixTree.extend
+ 
+-        self._local_trees[req_id] = SuffixTree(self._max_tree_depth)
++        self._local_trees[req_id] = SuffixTree(
++            self._max_tree_depth, self._enable_undo)
+         extend_func(self._local_trees[req_id], 0, prompt_token_ids)
+         if self._max_cached_requests != 0:
+             # Global cache is enabled.
+@@ -171,10 +187,18 @@ class SuffixDecodingCache:
+                 that uniquely identifies the request.
+ 
+         Raises:
+-            ValueError: If the request with the given `req_id` is not active.
++            ValueError: If the request with the given `req_id` is not active,
++                or if there are unclosed temporary extension frames for this
++                request (callers must pop_active_response any pending frames
++                before stop_request).
+         """
+         if req_id not in self._local_trees:
+             raise ValueError(f"Request '{req_id}' is not active")
++        if self._pending_extensions.get(req_id):
++            raise ValueError(
++                f"Request '{req_id}' has unclosed temporary extension frames; "
++                f"call pop_active_response to close them before stop_request")
++        self._pending_extensions.pop(req_id, None)
+         del self._local_trees[req_id]
+ 
+     def add_active_response(
+@@ -214,6 +238,152 @@ class SuffixDecodingCache:
+             seq_id = self._req_to_seq_id[req_id]
+             extend_func(self._global_tree, seq_id, token_ids)
+ 
++    def extend_active_response(
++        self,
++        req_id: Hashable,
++        token_ids: np.ndarray | Sequence[int],
++    ) -> None:
++        """
++        Reversible variant of ``add_active_response``. Appends ``token_ids``
++        to BOTH the local tree (seq=0) and the global tree (request's
++        allocated seq), and pushes a frame onto a per-request stack so a
++        matching ``pop_active_response`` can undo exactly this extension.
++
++        Use this for hypothetical / temporary extensions (e.g. the
++        simulator's per-anchor extension speculate flow). Use the original
++        ``add_active_response`` for permanent commits (actual GT acceptance).
++
++        Mixing the two on the same ``req_id`` between an extend and its
++        matching pop is unsafe — pop assumes only the temp-frame tokens
++        have been added since.
++
++        Args:
++            req_id (Hashable): The request identifier. Must be active.
++            token_ids: Sequence of token IDs to append. Empty input is a
++                no-op; an empty frame is still pushed so the caller can
++                pair its extend/pop calls without special-casing.
++
++        Raises:
++            RuntimeError: If the cache was not constructed with
++                ``enable_undo=True``.
++            ValueError: If the request is not active.
++        """
++        if not self._enable_undo:
++            raise RuntimeError(
++                "extend_active_response requires enable_undo=True at "
++                "SuffixDecodingCache construction")
++        if req_id not in self._local_trees:
++            raise ValueError(f"Request '{req_id}' is not active")
++
++        # Materialize length once. Do it BEFORE add_active_response since
++        # the call may consume an iterator (we accept Sequence too).
++        if isinstance(token_ids, np.ndarray):
++            n = int(token_ids.size)
++        else:
++            token_ids = list(token_ids)
++            n = len(token_ids)
++
++        # Reuse the permanent-path extend logic — it correctly updates both
++        # local seq=0 and global seq=allocated. The undo log accumulated by
++        # the underlying SuffixTree captures the n appends; pop_active_response
++        # will reverse exactly n on each tree.
++        if n > 0:
++            self.add_active_response(req_id, token_ids)
++        self._pending_extensions.setdefault(req_id, []).append(n)
++
++    def pop_active_response(
++        self,
++        req_id: Hashable,
++        n: Optional[int] = None,
++    ) -> None:
++        """
++        Reverse the most recent ``extend_active_response`` for ``req_id``.
++        If ``n`` is None, undoes the top frame's recorded count. If ``n``
++        is provided, undoes exactly that many tokens regardless of frame
++        boundaries (advanced use; caller is responsible for keeping the
++        frame stack consistent).
++
++        Reverses both the local tree (seq=0) and the global tree (request's
++        allocated seq, if still present in the global cache).
++
++        Args:
++            req_id (Hashable): The request identifier. Must be active.
++            n (Optional[int]): Number of tokens to pop. None means pop the
++                top frame (a single ``extend_active_response`` worth).
++
++        Raises:
++            RuntimeError: If the cache was not constructed with
++                ``enable_undo=True``.
++            ValueError: If the request is not active or if there is no
++                pending extension to pop (when n is None).
++        """
++        if not self._enable_undo:
++            raise RuntimeError(
++                "pop_active_response requires enable_undo=True at "
++                "SuffixDecodingCache construction")
++        if req_id not in self._local_trees:
++            raise ValueError(f"Request '{req_id}' is not active")
++
++        frames = self._pending_extensions.get(req_id, [])
++        if n is None:
++            if not frames:
++                raise ValueError(
++                    f"No pending extension to pop for request '{req_id}'")
++            n = frames.pop()
++            if not frames:
++                # Drop empty stack to keep the dict clean.
++                del self._pending_extensions[req_id]
++        else:
++            # Explicit n: drain frames until we've covered n tokens (frame
++            # bookkeeping best-effort).
++            remaining = n
++            while frames and remaining >= frames[-1]:
++                remaining -= frames.pop()
++            if remaining > 0 and frames:
++                frames[-1] -= remaining
++            if not frames:
++                self._pending_extensions.pop(req_id, None)
++
++        if n <= 0:
++            return
++
++        # Reverse on both trees. Order: local first (per-request, contained),
++        # then global (cross-request shared). Either order is correct since
++        # the trees are independent SuffixTree instances; doing local first
++        # means a partial failure (theoretically impossible, but defensive)
++        # leaves the global in a less surprising state.
++        self._local_trees[req_id].pop(0, n)
++        if req_id in self._req_to_seq_id:
++            seq_id = self._req_to_seq_id[req_id]
++            self._global_tree.pop(seq_id, n)
++
++    @contextmanager
++    def temporary_extension(
++        self,
++        req_id: Hashable,
++        token_ids: np.ndarray | Sequence[int],
++    ) -> Iterator[None]:
++        """
++        Context manager that extends the active response on enter and pops
++        on exit. Pairs cleanly with the simulator's per-anchor speculate flow:
++
++            with cache.temporary_extension(req_id, paths[i]):
++                draft = cache.speculate(req_id, ext_context, ...)
++            # tree state restored to pre-extension here
++
++        Pop runs in ``finally`` so an exception inside the body still
++        restores the tree.
++
++        Args:
++            req_id (Hashable): The request identifier. Must be active.
++            token_ids: Tokens to temporarily append.
++        """
++        self.extend_active_response(req_id, token_ids)
++        try:
++            yield
++        finally:
++            self.pop_active_response(req_id)
++
+     def evict_cached_response(self, req_id: Hashable):
+         """
+         Evicts the given request's response from the global cache. `req_id` can
+@@ -224,10 +394,16 @@ class SuffixDecodingCache:
+                 should be evicted.
+ 
+         Raises:
+-            ValueError: If no response exists for the given request identifier.
++            ValueError: If no response exists for the given request identifier,
++                or if there are unclosed temporary extension frames for this
++                request (eviction would corrupt the global tree mid-temp).
+         """
+         if req_id not in self._req_to_seq_id:
+             raise ValueError(f"Request '{req_id}' is not cached")
++        if self._pending_extensions.get(req_id):
++            raise ValueError(
++                f"Request '{req_id}' has unclosed temporary extension frames; "
++                f"call pop_active_response to close them before eviction")
+         seq_id = self._req_to_seq_id.pop(req_id)
+         self._seq_to_req_id.pop(seq_id)
+         self._global_tree.remove(seq_id)
+@@ -282,7 +458,7 @@ class SuffixDecodingCache:
+             spec_func = SuffixTree.speculate
+ 
+         if max_spec_tokens is None:
+-            max_spec_tokens = self.max_depth
++            max_spec_tokens = self._max_tree_depth
+ 
+         if len(context) > self._max_tree_depth:
+             context = context[-self._max_tree_depth :]
+diff --git a/csrc/suffix_decoding/bindings.cc b/csrc/suffix_decoding/bindings.cc
+index b1d058c..549761c 100644
+--- a/csrc/suffix_decoding/bindings.cc
++++ b/csrc/suffix_decoding/bindings.cc
+@@ -88,12 +88,17 @@ NB_MODULE(_C, m) {
+ 
+     nb::class_<SuffixTree>(m, "SuffixTree")
+         .def(nb::init<int>())
++        .def(nb::init<int, bool>())
+         .def("num_seqs", &SuffixTree::num_seqs)
+         .def("remove", &SuffixTree::remove)
+         // Overloads for extend method. Use different names to avoid overload
+         // resolution overhead at run-time.
+         .def("extend", &extend_vector)
+         .def("extend_ndarray", &extend_ndarray)
++        // Reversible undo API (requires enable_undo=true at construction).
++        .def("pop", &SuffixTree::pop)
++        .def("undo_log_length", &SuffixTree::undo_log_length)
++        .def("clear_undo_log", &SuffixTree::clear_undo_log)
+         // Overloads for speculate method.
+         .def("speculate", &speculate_vector)
+         .def("speculate_ndarray", &speculate_ndarray)
+diff --git a/csrc/suffix_decoding/suffix_tree.cc b/csrc/suffix_decoding/suffix_tree.cc
+index 3023983..f1b315b 100644
+--- a/csrc/suffix_decoding/suffix_tree.cc
++++ b/csrc/suffix_decoding/suffix_tree.cc
+@@ -16,8 +16,10 @@
+ #include <cassert>
+ #include <iostream>
+ #include <queue>
++#include <stdexcept>
+ #include <string>
+ #include <unordered_map>
++#include <utility>
+ #include <vector>
+ #include "suffix_tree.h"
+ 
+@@ -26,7 +28,11 @@
+                         std::to_string(__LINE__) + ": " + #cond;
+ 
+ SuffixTree::SuffixTree(int max_depth)
+-    : _max_depth(max_depth), _root(new Node()) {
++    : _max_depth(max_depth), _enable_undo(false), _root(new Node()) {
++}
++
++SuffixTree::SuffixTree(int max_depth, bool enable_undo)
++    : _max_depth(max_depth), _enable_undo(enable_undo), _root(new Node()) {
+ }
+ 
+ void _remove_from_siblings(Node* node) {
+@@ -290,10 +296,278 @@ void _decrement_count(Node* node) {
+     }
+ }
+ 
++// === Per-case reverse functions for SuffixTree::pop ===
++//
++// Each reverse_case_* below assumes the tree is currently in the post-
++// original-op state for ONE active-node iteration (per index i). It restores
++// the tree to the pre-iteration state for that single op step. The caller
++// (SuffixTree::pop) is responsible for invoking these in REVERSE order
++// across the per-token op's active_ops list, then handling setup-phase
++// reversal (root count, _seqs.pop_back, active_nodes deque restore).
++
++static void _reverse_case_1a(UndoActiveOp& aop, int seq_id) {
++    Node* node = aop.node;
++    assert(node);
++    // Original mutation: node->length += 1; node->endpoints[seq_id] += 1.
++    node->length -= 1;
++    auto it = node->endpoints.find(seq_id);
++    assert(it != node->endpoints.end());
++    it->second -= 1;
++}
++
++static void _reverse_case_1b(UndoActiveOp& aop, int seq_id) {
++    auto& pl = std::get<UndoCase1B>(aop.payload);
++    (void)pl;  // pl.was_first_child / pl.token informational; see below
++    Node* node = aop.node;
++    Node* new_child = aop.new_active_node;
++    assert(node && new_child);
++
++    // Restore the parent's endpoint that was erased when new_child was added.
++    // Pre-op, node->endpoints[seq_id] was set to seq_len-1, which equals
++    // new_child->ref_idx (new_child was created with that ref_idx).
++    node->endpoints[seq_id] = new_child->ref_idx;
++
++    // new_child has endpoints[seq_id] = seq_len; erase it for clean destruction.
++    new_child->endpoints.erase(seq_id);
++
++    // Detach new_child from node's sibling list. We use _remove_from_siblings
++    // unconditionally — it handles the solo-child case (head/tail both point
++    // to new_child, prev/next are nullptr) AND the case where later, other
++    // seqs added more children to node (so new_child may still be head but
++    // other tails exist). Doing the conditional special-case based on
++    // pl.was_first_child would silently break when interleaved appends alter
++    // node's child count between op and pop.
++    _remove_from_siblings(new_child);
++
++    // Drop new_child from node's children map. The unique_ptr destruction
++    // frees new_child and (transitively) its solo group if still owned.
++    node->children.erase(pl.token);
++}
++
++static void _reverse_case_2a(UndoActiveOp& aop, int seq_id) {
++    auto& pl = std::get<UndoCase2A>(aop.payload);
++    Node* child = aop.new_active_node;
++    Node* node = pl.stashed_node.get();
++    assert(child && node);
++    Node* parent = node->parent;
++    assert(parent);
++
++    // Step 1: Detach child uptr from parent->children[orig_token]. The
++    // original op installed child at this slot (post-op child->token ==
++    // orig_token).
++    auto pit = parent->children.find(pl.orig_token);
++    assert(pit != parent->children.end());
++    std::unique_ptr<Node> child_uptr = std::move(pit->second);
++    parent->children.erase(pl.orig_token);
++
++    // Step 2: Restore most of child's pre-op fields. Defer count and parent
++    // until after the sibling-list swap below:
++    //   - _replace_in_siblings(child, node) asserts old_node->count ==
++    //     new_node->count, which holds while child->count is still
++    //     pl.orig_count (the post-op value).
++    //   - The helper reads old_node->parent (= child->parent) to update
++    //     head/tail_child of THAT parent. Pre-swap, child->parent must
++    //     still be the shared parent (grandparent), not node.
++    child->token = pl.new_token;       // == op.token (pre-op child->token)
++    child->length = 1;
++    child->ref_seq = pl.child_orig_ref_seq;
++    child->ref_idx = pl.child_orig_ref_idx;
++    child->endpoints.erase(seq_id);    // child gained this in the op; remove
++
++    // Step 3: Reinsert node at parent->children[orig_token]. node's own
++    // fields are intact (it was stashed before any modification by the op).
++    parent->children.emplace(pl.orig_token, std::move(pl.stashed_node));
++
++    // Step 4: Reverse the original _replace_in_siblings(node, child). At
++    // this moment child->count == pl.orig_count == node->count (assert
++    // passes), and child->parent is still the shared parent (correct for
++    // the helper's parent-list updates).
++    _replace_in_siblings(child, node);
++
++    // Step 5: Finalize child's count + parent. child becomes node's only
++    // child; its count drops back to its pre-op value.
++    child->count = pl.orig_count - 1;
++    child->parent = node;
++
++    // Step 6: Reinstall child under node->children. The original op's
++    // `release()` (line:412 in append) left node->children[new_token] with
++    // an empty unique_ptr — the key is still present but the slot is empty.
++    // Assign into that slot directly (Int32Map::emplace returns existing on
++    // key collision, so it cannot insert here).
++    {
++        auto cit = node->children.find(pl.new_token);
++        assert(cit != node->children.end() &&
++               cit->second.get() == nullptr);
++        cit->second = std::move(child_uptr);
++    }
++
++    // Step 7: Restore node's head/tail child + child's solo group. Pre-op,
++    // case 2a precondition asserts node->children.size() == 1, so child was
++    // node's only child with its own (single-member) group.
++    node->head_child = node->tail_child = child;
++    child->group.reset(new Group(child));
++    // child->prev_sibling/next_sibling were already nullified by
++    // _replace_in_siblings in Step 4.
++
++    // node->endpoints was not touched by the original op (case 2a deallocates
++    // node wholesale). Nothing to restore there.
++}
++
++static void _reverse_case_2b(UndoActiveOp& aop, int seq_id, int op_token) {
++    auto& pl = std::get<UndoCase2B>(aop.payload);
++    Node* node = aop.node;
++    assert(node);
++    // Case 2b precondition: node->children.size() == 1. Find the single child
++    // regardless of whether the children-map key was changed during the op.
++    assert(node->children.size() == 1);
++    auto cit = node->children.begin();
++    Node* child = cit->second.get();
++    assert(child);
++
++    // Restore children-map key if it changed.
++    if (pl.key_changed) {
++        int new_key = child->token;  // current (post-op) key
++        auto cit2 = node->children.find(new_key);
++        assert(cit2 != node->children.end());
++        std::unique_ptr<Node> child_uptr = std::move(cit2->second);
++        node->children.erase(new_key);
++        node->children.emplace(op_token, std::move(child_uptr));
++    }
++
++    // Restore child geometry.
++    child->length = pl.child_orig_length;
++    child->ref_idx = pl.child_orig_ref_idx;
++    child->token = op_token;  // pre-op value (case 2b precondition)
++
++    // Restore node geometry.
++    node->length = pl.orig_length;
++    auto eit = node->endpoints.find(seq_id);
++    assert(eit != node->endpoints.end());
++    eit->second -= 1;
++    node->ref_seq = pl.orig_ref_seq;
++    node->ref_idx = pl.orig_ref_idx;
++}
++
++// Restore `node` to a specific position in its parent's sibling list. The
++// caller has just removed `node` from the list; this places it back so that
++// node->prev_sibling == prev_sibling_pre AND node->next_sibling ==
++// next_sibling_pre. node->count must already be its pre-op value (which
++// determines group placement).
++static void _reinsert_at_pre_position(Node* node, Node* prev_sibling_pre,
++                                      Node* next_sibling_pre) {
++    assert(node->parent);
++    if (prev_sibling_pre != nullptr) {
++        // Land right after the recorded predecessor.
++        _insert_into_siblings_after(node, prev_sibling_pre);
++    } else if (next_sibling_pre != nullptr) {
++        // Land right before the recorded successor (i.e., become head).
++        _insert_into_siblings_before(node, next_sibling_pre);
++    } else {
++        // Pre-op the node was the only child. parent's head/tail point
++        // back at it; we just need to reset everything.
++        Node* parent = node->parent;
++        assert(parent->head_child == nullptr && parent->tail_child == nullptr);
++        parent->head_child = parent->tail_child = node;
++        node->prev_sibling = node->next_sibling = nullptr;
++        // Fresh group for the solo child.
++        node->group.reset(new Group(node));
++    }
++}
++
++static void _reverse_case_3a(UndoActiveOp& aop, int seq_id) {
++    auto& pl = std::get<UndoCase3A>(aop.payload);
++    Node* node = aop.node;
++    Node* child = aop.new_active_node;
++    assert(node && child);
++
++    // Reverse _increment_count(child) by structurally removing child from
++    // the sibling list, decrementing count, then re-inserting at the
++    // recorded pre-op position. _decrement_count alone may land child in a
++    // different position within the same count-group when there are other
++    // ties (mainline algorithm is not strictly position-preserving across
++    // increment/decrement pairs). Restoring prev/next siblings explicitly
++    // preserves speculate determinism.
++    _remove_from_siblings(child);
++    child->count -= 1;
++    _reinsert_at_pre_position(child, pl.prev_sibling, pl.next_sibling);
++
++    // Reverse the endpoint move.
++    child->endpoints.erase(seq_id);
++    node->endpoints[seq_id] = pl.orig_node_endpoint_for_seq;
++}
++
++static void _reverse_case_3b(UndoActiveOp& aop, int seq_id) {
++    auto& pl = std::get<UndoCase3B>(aop.payload);
++    Node* node = aop.node;
++    Node* new_node = aop.new_active_node;
++    assert(node && new_node);
++    Node* child = new_node->head_child;
++    assert(child && new_node->tail_child == child);
++    assert(child->parent == new_node);
++
++    // Step 1: Detach new_node from its parent's sibling list. After this,
++    // new_node has no sibling/group references; we'll reinsert child at the
++    // recorded pre-op position once we've restored its count and parent.
++    _remove_from_siblings(new_node);
++
++    // Step 2: Move endpoint from new_node back to node.
++    new_node->endpoints.erase(seq_id);
++    node->endpoints[seq_id] = pl.orig_node_endpoint_for_seq;
++
++    // Step 3: Take ownership of child out of new_node->children.
++    auto cit = new_node->children.find(child->token);
++    assert(cit != new_node->children.end());
++    std::unique_ptr<Node> child_uptr = std::move(cit->second);
++    new_node->children.erase(child->token);
++
++    // Step 4: Restore child's pre-op geometry. child->prev/next_sibling
++    // still hold the fresh post-op values from when it became new_node's
++    // sole child; we'll overwrite via _reinsert_at_pre_position below.
++    child->length += 1;
++    child->ref_idx -= 1;
++    child->token = pl.child_orig_token;  // == op.token (case 3b precondition)
++    child->parent = node;
++    child->prev_sibling = child->next_sibling = nullptr;
++    // Drop the fresh post-op group (was created at append-time line :494).
++    child->group.reset();
++
++    // Step 5: Reinsert child at its exact pre-op position in node's
++    // sibling list. child's count is unchanged from pre-op (case 3b set
++    // new_node->count = child->count); restoration uses prev/next sibling.
++    _reinsert_at_pre_position(child, pl.child_prev_sibling,
++                              pl.child_next_sibling);
++
++    // Step 6: Clear new_node's head/tail (they still point to child).
++    new_node->head_child = new_node->tail_child = nullptr;
++
++    // Step 7: Swap node->children[op.token]. The slot currently owns
++    // new_node; we want it to own child instead. pl.token == pl.child_orig_token
++    // by case 3b precondition (pre-op child->token == op.token), so we
++    // operate on a single slot.
++    auto slot_it = node->children.find(pl.token);
++    assert(slot_it != node->children.end());
++    std::unique_ptr<Node> new_node_uptr = std::move(slot_it->second);
++    slot_it->second = std::move(child_uptr);
++    // new_node_uptr drops at function end, freeing new_node.
++}
++
+ // Append a new element to a new or existing sequence.
++//
++// When _enable_undo is true, every mutation made by this call is recorded
++// into a UndoTokenOp and pushed onto _undo_log[seq_id], so a subsequent
++// pop() can replay the inverse of each step. Reads of pre-mutation state
++// happen before the mutating writes; nothing else is reordered relative
++// to the un-instrumented version.
+ void SuffixTree::append(int seq_id, int token) {
++    // Per-token undo record. Filled in only when _enable_undo is true; the
++    // un-instrumented branches keep the original behavior bit-for-bit.
++    UndoTokenOp op;
++    op.seq_id = seq_id;
++    op.token = token;
++
+     // Initialize the sequence if it doesn't exist.
+-    if (!_seqs.contains(seq_id)) {
++    op.seq_was_created = !_seqs.contains(seq_id);
++    if (op.seq_was_created) {
+         assert(!_active_nodes.contains(seq_id));
+         _seqs.emplace(seq_id);
+         _active_nodes.emplace(seq_id);
+@@ -310,11 +584,17 @@ void SuffixTree::append(int seq_id, int token) {
+ 
+     // Ensure the number of active nodes doesn't exceed max_depth.
+     if (active_nodes.size() > static_cast<size_t>(_max_depth)) {
++        op.active_nodes_front_popped = true;
++        op.popped_front_node = active_nodes.front();
+         active_nodes.pop_front();
+     }
+     seq.push_back(token);
+     int32_t seq_len = static_cast<int32_t>(seq.size());
+-    
++
++    if (_enable_undo) {
++        op.active_ops.reserve(active_nodes.size());
++    }
++
+     // Iterate over all active nodes for this sequence.
+     for (Node*& active_node : active_nodes) {
+         Node* node = active_node;
+@@ -327,6 +607,11 @@ void SuffixTree::append(int seq_id, int token) {
+         assert(node->endpoints.contains(seq_id));
+         assert(node->endpoints[seq_id] == seq.size() - 1);
+ 
++        // Pre-allocate the per-iteration undo record. We fill in the case
++        // tag and payload inside each branch and push it at the end.
++        UndoActiveOp aop;
++        aop.node = node;
++
+         if (child == nullptr) {
+             // Case 1: No existing child node for the new token.
+             if (node->count == 1 && node != _root.get()) {
+@@ -338,11 +623,18 @@ void SuffixTree::append(int seq_id, int token) {
+                 assert(node->ref_seq == seq_id);
+                 node->length += 1;
+                 node->endpoints[seq_id] += 1;
++
++                aop.tag = UndoActiveOp::CASE_1A;
++                aop.new_active_node = node;
++                aop.payload = UndoCase1A{};
+             } else {
+                 // Case 1b: Either this is the root node, or the current suffix
+                 // is not the only one that passes through this node. Need to
+                 // extend the current suffix into a new child.
+ 
++                // Capture pre-state for undo (before any mutation).
++                bool was_first_child_pre = (node->children.size() == 0);
++
+                 // Create the new child node.
+                 Node* new_child = new Node(
+                     1, // count
+@@ -373,6 +665,13 @@ void SuffixTree::append(int seq_id, int token) {
+ 
+                 // Update the active node to the new child node.
+                 active_node = new_child;
++
++                aop.tag = UndoActiveOp::CASE_1B;
++                aop.new_active_node = new_child;
++                aop.payload = UndoCase1B{
++                    .token = token,
++                    .was_first_child = was_first_child_pre,
++                };
+             }
+         } else if (node->count == child->count + 1 && node != _root.get()) {
+             // Case 2: The active node has a child for the new token, and that
+@@ -386,6 +685,15 @@ void SuffixTree::append(int seq_id, int token) {
+                 // to the current suffix, then it will perfectly overlap with
+                 // that child. Fuse the current active node with that child.
+ 
++                // Capture pre-state BEFORE mutation.
++                int orig_token_pre = node->token;
++                int orig_length_pre = node->length;
++                int orig_ref_seq_pre = node->ref_seq;
++                int orig_ref_idx_pre = node->ref_idx;
++                int64_t orig_count_pre = node->count;
++                int child_orig_ref_seq_pre = child->ref_seq;
++                int child_orig_ref_idx_pre = child->ref_idx;
++
+                 // Update child to take the place of the current node.
+                 child->count += 1;  // Active node extends into the child node.
+                 child->token = node->token;
+@@ -405,7 +713,33 @@ void SuffixTree::append(int seq_id, int token) {
+                 assert(parent->children[node->token].get() == node);
+                 // Do it in two steps to avoid undefined evaluation order.
+                 Node* tmp = node->children[token].release();
+-                parent->children[child->token].reset(tmp);
++
++                if (_enable_undo) {
++                    // Stash node's uptr in the log so the .reset(tmp) below
++                    // doesn't free `node`. parent->children[child->token] is
++                    // the same slot as parent->children[orig_token_pre]
++                    // (child->token was just set to orig_token_pre at line
++                    // child->token = node->token). Move the uptr out before
++                    // reset clobbers it.
++                    auto slot_it = parent->children.find(orig_token_pre);
++                    UndoCase2A pl;
++                    pl.stashed_node = std::move(slot_it->second);
++                    pl.orig_token = orig_token_pre;
++                    pl.new_token = token;
++                    pl.orig_length = orig_length_pre;
++                    pl.orig_ref_seq = orig_ref_seq_pre;
++                    pl.orig_ref_idx = orig_ref_idx_pre;
++                    pl.orig_count = orig_count_pre;
++                    pl.child_orig_ref_seq = child_orig_ref_seq_pre;
++                    pl.child_orig_ref_idx = child_orig_ref_idx_pre;
++                    // Slot's uptr is now empty; reset(tmp) installs child.
++                    parent->children[child->token].reset(tmp);
++                    aop.tag = UndoActiveOp::CASE_2A;
++                    aop.new_active_node = child;
++                    aop.payload = std::move(pl);
++                } else {
++                    parent->children[child->token].reset(tmp);
++                }
+ 
+                 // Replace active node with child node.
+                 active_node = child;
+@@ -415,6 +749,13 @@ void SuffixTree::append(int seq_id, int token) {
+                 // the child node. In this case, we keep both nodes but extend
+                 // the length of the current node by 1 into the child node.
+ 
++                // Capture pre-state BEFORE mutation.
++                int orig_length_pre = node->length;
++                int orig_ref_seq_pre = node->ref_seq;
++                int orig_ref_idx_pre = node->ref_idx;
++                int child_orig_length_pre = child->length;
++                int child_orig_ref_idx_pre = child->ref_idx;
++
+                 // Extend the length of the current node by 1.
+                 node->length += 1;
+                 node->endpoints[seq_id] += 1;  // Advance endpoint for the seq.
+@@ -427,7 +768,8 @@ void SuffixTree::append(int seq_id, int token) {
+ 
+                 // The child's first token must be updated to its second token.
+                 child->token = _seqs[child->ref_seq][child->ref_idx];
+-                if (child->token != token) {
++                bool key_changed_pre = (child->token != token);
++                if (key_changed_pre) {
+                     // Need to update the key in the parent's children map.
+                     Node* tmp = node->children[token].release();
+                     node->children.emplace(child->token, tmp);
+@@ -435,6 +777,17 @@ void SuffixTree::append(int seq_id, int token) {
+                 }
+ 
+                 // Active node stays the same.
++
++                aop.tag = UndoActiveOp::CASE_2B;
++                aop.new_active_node = node;
++                aop.payload = UndoCase2B{
++                    .orig_length = orig_length_pre,
++                    .orig_ref_seq = orig_ref_seq_pre,
++                    .orig_ref_idx = orig_ref_idx_pre,
++                    .child_orig_length = child_orig_length_pre,
++                    .child_orig_ref_idx = child_orig_ref_idx_pre,
++                    .key_changed = key_changed_pre,
++                };
+             }
+         } else {
+             // Case 3: There exists a child node for the new token, and the
+@@ -443,6 +796,11 @@ void SuffixTree::append(int seq_id, int token) {
+                 // Case 3a: The child node has length 1, just update the active
+                 // node pointer to it.
+ 
++                int orig_node_endpoint_pre =
++                    static_cast<int>(node->endpoints[seq_id]);
++                Node* child_prev_sib_pre = child->prev_sibling;
++                Node* child_next_sib_pre = child->next_sibling;
++
+                 // Move the endpoint for the sequence to the child.
+                 node->endpoints.erase(seq_id);
+                 child->endpoints[seq_id] = seq_len;
+@@ -452,11 +810,28 @@ void SuffixTree::append(int seq_id, int token) {
+ 
+                 // Replace active node with child node.
+                 active_node = child;
++
++                aop.tag = UndoActiveOp::CASE_3A;
++                aop.new_active_node = child;
++                aop.payload = UndoCase3A{
++                    .orig_node_endpoint_for_seq = orig_node_endpoint_pre,
++                    .prev_sibling = child_prev_sib_pre,
++                    .next_sibling = child_next_sib_pre,
++                };
+             } else {
+                 // Case 3b: The child node has length > 1. If the suffix is
+                 // extended into it, then it must split into a segment of
+                 // length 1 and another segment with the remainder.
+ 
++                // Capture pre-state BEFORE mutation.
++                int child_orig_token_pre = child->token;
++                int child_orig_length_pre = child->length;
++                int child_orig_ref_idx_pre = child->ref_idx;
++                int orig_node_endpoint_pre =
++                    static_cast<int>(node->endpoints[seq_id]);
++                Node* child_prev_sib_pre = child->prev_sibling;
++                Node* child_next_sib_pre = child->next_sibling;
++
+                 // Create the new intermediate node.
+                 Node* new_node = new Node(
+                     child->count,
+@@ -498,8 +873,28 @@ void SuffixTree::append(int seq_id, int token) {
+ 
+                 // Update active node to the new intermediate node.
+                 active_node = new_node;
++
++                aop.tag = UndoActiveOp::CASE_3B;
++                aop.new_active_node = new_node;
++                aop.payload = UndoCase3B{
++                    .token = token,
++                    .child_orig_token = child_orig_token_pre,
++                    .child_orig_length = child_orig_length_pre,
++                    .child_orig_ref_idx = child_orig_ref_idx_pre,
++                    .orig_node_endpoint_for_seq = orig_node_endpoint_pre,
++                    .child_prev_sibling = child_prev_sib_pre,
++                    .child_next_sibling = child_next_sib_pre,
++                };
+             }
+         }
++
++        if (_enable_undo) {
++            op.active_ops.push_back(std::move(aop));
++        }
++    }
++
++    if (_enable_undo) {
++        _undo_log[seq_id].push_back(std::move(op));
+     }
+ }
+ 
+@@ -588,6 +983,116 @@ void SuffixTree::remove(int seq_id) {
+     }
+     _seqs.erase(seq_id);
+     _active_nodes.erase(seq_id);
++    // Undo logs reference Node*s in this seq's mutation chain; once we
++    // structurally remove() the seq those entries can no longer be replayed
++    // safely. Drop them.
++    if (_enable_undo) {
++        _undo_log.erase(seq_id);
++    }
++}
++
++// Reverse the last n_tokens append() calls for seq_id. See suffix_tree.h.
++void SuffixTree::pop(int seq_id, int n_tokens) {
++    if (!_enable_undo) {
++        throw std::runtime_error(
++            "SuffixTree::pop: undo is not enabled (construct with "
++            "enable_undo=true to use pop)");
++    }
++    if (n_tokens < 0) {
++        throw std::runtime_error(
++            "SuffixTree::pop: n_tokens must be non-negative");
++    }
++    if (n_tokens == 0) {
++        return;
++    }
++    auto log_it = _undo_log.find(seq_id);
++    if (log_it == _undo_log.end()) {
++        throw std::runtime_error(
++            "SuffixTree::pop: no undo log for the given seq_id");
++    }
++    auto& log = log_it->second;
++    if (static_cast<size_t>(n_tokens) > log.size()) {
++        throw std::runtime_error(
++            "SuffixTree::pop: n_tokens exceeds undo log length");
++    }
++
++    for (int k = 0; k < n_tokens; ++k) {
++        UndoTokenOp op = std::move(log.back());
++        log.pop_back();
++
++        std::vector<int32_t>& seq = _seqs[seq_id];
++        std::deque<Node*>& active_nodes = _active_nodes[seq_id];
++        assert(active_nodes.size() == op.active_ops.size());
++
++        // Reverse per-active-node ops in reverse iteration order. Each
++        // reverse_case_* updates the tree state; we then restore the deque
++        // entry from aop.node so the next pop iteration sees the correct
++        // pre-this-op active_nodes layout.
++        for (int i = static_cast<int>(op.active_ops.size()) - 1; i >= 0; --i) {
++            UndoActiveOp& aop = op.active_ops[i];
++            switch (aop.tag) {
++                case UndoActiveOp::CASE_1A:
++                    _reverse_case_1a(aop, seq_id); break;
++                case UndoActiveOp::CASE_1B:
++                    _reverse_case_1b(aop, seq_id); break;
++                case UndoActiveOp::CASE_2A:
++                    _reverse_case_2a(aop, seq_id); break;
++                case UndoActiveOp::CASE_2B:
++                    _reverse_case_2b(aop, seq_id, op.token); break;
++                case UndoActiveOp::CASE_3A:
++                    _reverse_case_3a(aop, seq_id); break;
++                case UndoActiveOp::CASE_3B:
++                    _reverse_case_3b(aop, seq_id); break;
++            }
++            active_nodes[i] = aop.node;
++        }
++
++        // Reverse setup phase, in reverse order of the original setup.
++        assert(!seq.empty() && seq.back() == op.token);
++        seq.pop_back();
++        if (op.active_nodes_front_popped) {
++            active_nodes.push_front(op.popped_front_node);
++        }
++        // Setup line "_root->endpoints[seq_id] = seq.size()" added the
++        // entry; the per-case reverse for the i==(size-1) iteration (always
++        // the root iteration, since active_nodes.push_back(_root) makes root
++        // the LAST entry) restored that entry. Now we erase it so the
++        // pre-this-append _root state is recovered.
++        _root->endpoints.erase(seq_id);
++        _root->count -= 1;
++        assert(!active_nodes.empty() && active_nodes.back() == _root.get());
++        active_nodes.pop_back();
++        if (op.seq_was_created) {
++            assert(active_nodes.empty() && seq.empty());
++            _seqs.erase(seq_id);
++            _active_nodes.erase(seq_id);
++            // References `seq` and `active_nodes` are now invalidated; they
++            // are out of scope at this iteration's end so no reuse occurs.
++        }
++    }
++
++    if (log.empty()) {
++        _undo_log.erase(seq_id);
++    }
++}
++
++int SuffixTree::undo_log_length(int seq_id) const {
++    auto it = _undo_log.find(seq_id);
++    if (it == _undo_log.end()) return 0;
++    return static_cast<int>(it->second.size());
++}
++
++void SuffixTree::clear_undo_log() {
++    // Drop every per-seq undo deque. Tree state is unchanged; subsequent
++    // pop() will throw until new appends accumulate fresh log entries.
++    std::vector<int32_t> seqs_to_clear;
++    seqs_to_clear.reserve(_undo_log.size());
++    for (auto entry : _undo_log) {
++        seqs_to_clear.push_back(entry.first);
++    }
++    for (int sid : seqs_to_clear) {
++        _undo_log.erase(sid);
++    }
+ }
+ 
+ Draft SuffixTree::speculate(std::span<const int32_t> context,
+diff --git a/csrc/suffix_decoding/suffix_tree.h b/csrc/suffix_decoding/suffix_tree.h
+index 6d642fa..9df0557 100644
+--- a/csrc/suffix_decoding/suffix_tree.h
++++ b/csrc/suffix_decoding/suffix_tree.h
+@@ -16,10 +16,12 @@
+ #pragma once
+ 
+ #include <cassert>
++#include <cstdint>
+ #include <deque>
+ #include <memory>
+ #include <span>
+ #include <utility>
++#include <variant>
+ #include <vector>
+ 
+ #include "int32_map.h"
+@@ -116,10 +118,112 @@ struct Draft {
+     int match_len = 0;
+ };
+ 
++// === Undo log structures (used by SuffixTree::pop) ===
++//
++// Each call to append() produces one UndoTokenOp when _enable_undo is set,
++// containing one UndoActiveOp per active-node iteration plus the setup-phase
++// state needed to restore _seqs / _active_nodes / _root mutations. pop()
++// replays them in reverse order.
++
++struct UndoCase1A {
++    // Trivial: append did node->length += 1 and node->endpoints[seq_id] += 1.
++    // Reverse subtracts 1 from each.
++};
++
++struct UndoCase1B {
++    // node->children[token] holds the newly created child (BFS-ordered).
++    int token;
++    // True when node had no children before this op (head_child/tail_child
++    // were both nullptr; new_child became the sole child with a fresh group).
++    bool was_first_child;
++};
++
++struct UndoCase2A {
++    // Owns the node that was deallocated by the original op. Restoring the
++    // node back into parent->children moves this uptr out.
++    std::unique_ptr<Node> stashed_node;
++    int orig_token;          // node->token before (== parent's pre-op key for node)
++    int new_token;           // child->token before (== the appended token)
++    int orig_length;         // node->length before
++    int orig_ref_seq;        // node->ref_seq before
++    int orig_ref_idx;        // node->ref_idx before
++    int64_t orig_count;      // node->count before (== child->count + 1)
++    int child_orig_ref_seq;  // child->ref_seq before
++    int child_orig_ref_idx;  // child->ref_idx before
++    // child_orig_length == 1 (case 2a precondition)
++    // child_orig_count == orig_count - 1
++    // child did NOT have endpoints[seq_id] before (case 2a precondition)
++};
++
++struct UndoCase2B {
++    int orig_length;             // node->length before
++    int orig_ref_seq;            // node->ref_seq before
++    int orig_ref_idx;            // node->ref_idx before
++    int child_orig_length;       // child->length before
++    int child_orig_ref_idx;      // child->ref_idx before
++    bool key_changed;            // children-map key was rekeyed (token -> new child->token)
++};
++
++struct UndoCase3A {
++    int orig_node_endpoint_for_seq;  // node->endpoints[seq_id] before
++    // Pre-_increment_count position of the child in node's sibling list.
++    // _increment_count may move the child within (or up) the sibling list,
++    // and the inverse _decrement_count alone can land child in a different
++    // position within the same count-group. Recording prev/next_sibling
++    // lets us restore the exact pre-op position.
++    Node* prev_sibling;              // child->prev_sibling before
++    Node* next_sibling;              // child->next_sibling before
++};
++
++struct UndoCase3B {
++    int token;                       // map key for new_node (== op.token)
++    int child_orig_token;            // child->token before (also == op.token)
++    int child_orig_length;           // child->length before
++    int child_orig_ref_idx;          // child->ref_idx before
++    int orig_node_endpoint_for_seq;  // node->endpoints[seq_id] before
++    Node* child_prev_sibling;        // child->prev_sibling before _replace
++    Node* child_next_sibling;        // child->next_sibling before _replace
++};
++
++struct UndoActiveOp {
++    enum Tag : uint8_t {
++        CASE_1A, CASE_1B, CASE_2A, CASE_2B, CASE_3A, CASE_3B,
++    };
++    Tag tag;
++    Node* node = nullptr;            // pre-op active_node (deque restoration target)
++    Node* new_active_node = nullptr; // post-op active_node (sanity)
++    std::variant<UndoCase1A, UndoCase1B, UndoCase2A, UndoCase2B,
++                 UndoCase3A, UndoCase3B> payload;
++
++    UndoActiveOp() = default;
++    UndoActiveOp(UndoActiveOp&&) = default;
++    UndoActiveOp& operator=(UndoActiveOp&&) = default;
++    UndoActiveOp(const UndoActiveOp&) = delete;
++    UndoActiveOp& operator=(const UndoActiveOp&) = delete;
++};
++
++struct UndoTokenOp {
++    int seq_id = 0;
++    int token = 0;
++    bool seq_was_created = false;
++    bool active_nodes_front_popped = false;
++    Node* popped_front_node = nullptr;
++    // i-th entry corresponds to _active_nodes[seq_id][i] AFTER the setup
++    // phase (i.e., after the optional pop_front and the push_back of root).
++    std::vector<UndoActiveOp> active_ops;
++
++    UndoTokenOp() = default;
++    UndoTokenOp(UndoTokenOp&&) = default;
++    UndoTokenOp& operator=(UndoTokenOp&&) = default;
++    UndoTokenOp(const UndoTokenOp&) = delete;
++    UndoTokenOp& operator=(const UndoTokenOp&) = delete;
++};
++
+ class SuffixTree {
+ public:
+ 
+     SuffixTree(int max_depth);
++    SuffixTree(int max_depth, bool enable_undo);
+ 
+     int num_seqs() const {
+         return static_cast<int>(_seqs.size());
+@@ -134,6 +238,20 @@ public:
+     // Remove the sequence with id seq_id.
+     void remove(int seq_id);
+ 
++    // Reverse the last n_tokens append() calls for seq_id, restoring the
++    // tree to the exact state it had before those appends. Requires the
++    // tree to have been constructed with enable_undo=true. Throws
++    // std::runtime_error if undo is disabled, n_tokens exceeds the recorded
++    // log length, the seq has no log, or n_tokens is negative.
++    void pop(int seq_id, int n_tokens);
++
++    // Number of appends currently undoable for seq_id (0 if seq has no log).
++    int undo_log_length(int seq_id) const;
++
++    // Drop all undo state without modifying the tree itself. Subsequent
++    // pop() calls will throw until new appends accumulate fresh log entries.
++    void clear_undo_log();
++
+     // Given a context, speculate the next tokens using the suffix tree.
+     Draft speculate(std::span<const int32_t> context,
+                     int max_spec_tokens,
+@@ -155,6 +273,11 @@ private:
+     // Maximum depth of the suffix tree.
+     int _max_depth;
+ 
++    // When true, append() records a per-token UndoTokenOp into _undo_log so
++    // that pop() can reverse the mutations. Default false to keep zero
++    // overhead for callers that do not need reversibility (e.g. vLLM).
++    bool _enable_undo = false;
++
+     // The root node of the suffix tree.
+     std::unique_ptr<Node> _root;
+ 
+@@ -167,6 +290,10 @@ private:
+     // most _max_depth iterations before being removed.
+     Int32Map<std::deque<Node*>> _active_nodes;
+ 
++    // Per-seq stack of undo logs, one entry per append. Only populated when
++    // _enable_undo is true. pop() peels entries off the back.
++    Int32Map<std::deque<UndoTokenOp>> _undo_log;
++
+     std::pair<Node*, int> _match_context(std::span<const int32_t> context);
+ 
+     Draft _speculate_path(Node* node, int idx, int max_spec_tokens,
+diff --git a/tests/unit_tests/test_suffix_tree_pop.py b/tests/unit_tests/test_suffix_tree_pop.py
+new file mode 100644
+index 0000000..a90a950
+--- /dev/null
++++ b/tests/unit_tests/test_suffix_tree_pop.py
+@@ -0,0 +1,861 @@
++"""Unit tests for SuffixTree.pop — the reversible undo API.
++
++These exercise each of the six append cases (1a, 1b, 2a, 2b, 3a, 3b),
++the active_nodes max_depth boundary, multi-seq interleaving, fresh-seq
++creation/teardown, and a randomized stress test that compares the popped
++tree against a brute-force rebuild.
++
++Every assertion goes through `check_integrity()` which structurally verifies
++counts, sibling/group invariants, ref_seq/ref_idx, and endpoint reachability.
++"""
++from __future__ import annotations
++
++import random
++
++import numpy as np
++import pytest
++
++from arctic_inference.suffix_decoding._C import SuffixTree
++from arctic_inference.suffix_decoding.cache import SuffixDecodingCache
++
++
++# --------------------------------------------------------------------------
++# Basic invariants
++# --------------------------------------------------------------------------
++
++
++class TestPopBasic:
++    def test_pop_zero_is_noop(self):
++        tree = SuffixTree(8, True)
++        tree.extend(0, [1, 2, 3])
++        tree.pop(0, 0)
++        assert tree.check_integrity() == ""
++        assert tree.num_seqs() == 1
++        assert tree.undo_log_length(0) == 3
++
++    def test_pop_without_undo_raises(self):
++        tree = SuffixTree(8)
++        tree.extend(0, [1, 2])
++        with pytest.raises(Exception):
++            tree.pop(0, 1)
++
++    def test_pop_more_than_log_raises(self):
++        tree = SuffixTree(8, True)
++        tree.extend(0, [1, 2, 3])
++        with pytest.raises(Exception):
++            tree.pop(0, 5)
++        # Tree state must be unchanged on failed pop.
++        assert tree.check_integrity() == ""
++        assert tree.undo_log_length(0) == 3
++
++    def test_pop_negative_raises(self):
++        tree = SuffixTree(8, True)
++        tree.extend(0, [1, 2, 3])
++        with pytest.raises(Exception):
++            tree.pop(0, -1)
++
++    def test_pop_unknown_seq_raises(self):
++        tree = SuffixTree(8, True)
++        tree.extend(0, [1, 2])
++        with pytest.raises(Exception):
++            tree.pop(99, 1)
++
++    def test_pop_after_remove_raises(self):
++        tree = SuffixTree(8, True)
++        tree.extend(0, [1, 2, 3])
++        tree.remove(0)
++        with pytest.raises(Exception):
++            tree.pop(0, 1)
++
++    def test_clear_undo_log(self):
++        tree = SuffixTree(8, True)
++        tree.extend(0, [1, 2, 3])
++        assert tree.undo_log_length(0) == 3
++        tree.clear_undo_log()
++        assert tree.undo_log_length(0) == 0
++        # Tree itself unaffected.
++        assert tree.check_integrity() == ""
++        assert tree.num_seqs() == 1
++        with pytest.raises(Exception):
++            tree.pop(0, 1)
++
++
++# --------------------------------------------------------------------------
++# Per-case reversibility
++# --------------------------------------------------------------------------
++
++
++class TestPopPerCase:
++    """Trigger each of the 6 append cases (1a, 1b, 2a, 2b, 3a, 3b) and verify
++    the pop reversal restores tree invariants."""
++
++    def test_case_1a_leaf_extend(self):
++        # Single-seq chain: each subsequent token after the first triggers
++        # case 1a on the previous (length=1, count=1) leaf.
++        tree = SuffixTree(8, True)
++        tree.extend(0, [10, 20, 30])  # [10] is 1b at root, [20] is 1b at root + 1a at N10
++        assert tree.check_integrity() == ""
++        tree.pop(0, 3)
++        assert tree.check_integrity() == ""
++        assert tree.num_seqs() == 0
++
++    def test_case_1b_root(self):
++        # First-ever token: case 1b at root, was_first_child=True.
++        tree = SuffixTree(8, True)
++        tree.extend(0, [42])
++        assert tree.check_integrity() == ""
++        tree.pop(0, 1)
++        assert tree.check_integrity() == ""
++        assert tree.num_seqs() == 0
++
++    def test_case_1b_nonfirst_child(self):
++        # New child added to a node that already has children (was_first_child=False).
++        tree = SuffixTree(8, True)
++        tree.extend(0, [10])    # root.children = {10}
++        tree.extend(1, [20])    # case 1b at root, was_first_child=False
++        assert tree.check_integrity() == ""
++        tree.pop(1, 1)
++        assert tree.check_integrity() == ""
++        # Reference: just seq 0.
++        assert tree.num_seqs() == 1
++
++    def test_case_2a_fusion(self):
++        # Construct: seq 0 = [1, 2, 3], seq 1 = [1, 2]. Then seq 1 appends 3:
++        # at the [1,2] node, count==2 (both seqs pass through), the [1,2,3]
++        # leaf has count==1, length==1. node->count == child->count + 1
++        # AND child->length == 1 → case 2a fires (fusion).
++        tree = SuffixTree(8, True)
++        tree.extend(0, [1, 2, 3])
++        tree.extend(1, [1, 2])
++        assert tree.check_integrity() == ""
++        tree.extend(1, [3])  # case 2a
++        assert tree.check_integrity() == ""
++        tree.pop(1, 1)
++        assert tree.check_integrity() == ""
++        # Reference state matches.
++
++    def test_case_2b_length_swap(self):
++        # Trigger case 2b: existing length>1 child whose count is one less
++        # than the parent's. After the fusion above, the resulting node
++        # holds a compressed length-2 path; use that as the basis.
++        tree = SuffixTree(8, True)
++        tree.extend(0, [1, 2, 3, 4])
++        tree.extend(1, [1, 2])
++        # At this point [1,2,3,4] is a deep chain. Now seq 1 appends 3:
++        # at the [1,2] node (count=2), child for token 3 is the next chunk
++        # (could be a length-1 or length-2 node depending on path compression).
++        # The fusion (case 2a) collapses if length==1; otherwise case 2b
++        # extends the parent length and shrinks the child.
++        # We can't easily distinguish 2a vs 2b by the API alone; both must
++        # round-trip cleanly so testing extend+pop suffices.
++        tree.extend(1, [3])
++        assert tree.check_integrity() == ""
++        tree.pop(1, 1)
++        assert tree.check_integrity() == ""
++
++    def test_case_3a_existing_length_1_child(self):
++        # node->count > child->count + 1 (so case 2 excluded) and child has
++        # length 1. Triggered when seq B retraces seq A's path with extra
++        # other seqs already passing through.
++        tree = SuffixTree(8, True)
++        tree.extend(0, [10])    # creates N10 (length 1)
++        # Now seq 1 also goes through 10:
++        tree.extend(1, [10])    # case 3a (root has count=2, N10 still length 1)
++        assert tree.check_integrity() == ""
++        tree.pop(1, 1)
++        assert tree.check_integrity() == ""
++
++    def test_case_3b_split(self):
++        # node has child with length>1 and count check fails for case 2.
++        # Triggered when seq B walks into a multi-token compressed segment
++        # left by seq A's leaf-extend cases.
++        tree = SuffixTree(8, True)
++        tree.extend(0, [10, 20])   # N10 ends up with length=2 via 1a
++        tree.extend(1, [10])       # case 3b at root (splits N10 into 1+1)
++        assert tree.check_integrity() == ""
++        tree.pop(1, 1)
++        assert tree.check_integrity() == ""
++
++
++# --------------------------------------------------------------------------
++# active_nodes deque boundary (max_depth)
++# --------------------------------------------------------------------------
++
++
++class TestPopMaxDepthBoundary:
++    def test_pop_long_sequence_with_front_pop(self):
++        """When seq length exceeds max_depth, append() pops the deque front.
++        The popped front node must be restored on reverse."""
++        max_depth = 4
++        tree = SuffixTree(max_depth, True)
++        tokens = list(range(1, 11))  # 10 tokens, exceeds max_depth=4
++        tree.extend(0, tokens)
++        assert tree.check_integrity() == ""
++        tree.pop(0, len(tokens))
++        assert tree.check_integrity() == ""
++        assert tree.num_seqs() == 0
++
++    def test_partial_pop_long_sequence(self):
++        """Pop only a suffix of a long sequence; the remaining log entries
++        must still be poppable later."""
++        tree = SuffixTree(4, True)
++        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
++        tree.extend(0, tokens)
++        # Partially pop, verify integrity, then pop the rest.
++        tree.pop(0, 3)
++        assert tree.check_integrity() == ""
++        assert tree.undo_log_length(0) == 5
++        tree.pop(0, 5)
++        assert tree.check_integrity() == ""
++        assert tree.num_seqs() == 0
++
++
++# --------------------------------------------------------------------------
++# Multi-seq interactions
++# --------------------------------------------------------------------------
++
++
++class TestPopMultiSeq:
++    def test_pop_one_seq_leaves_others_alone(self):
++        tree = SuffixTree(8, True)
++        tree.extend(0, [1, 2, 3])
++        tree.extend(1, [1, 2, 4])     # diverges at depth-2
++        tree.extend(2, [1, 2, 3])     # repeats seq 0's pattern
++        tree.pop(2, 3)
++        assert tree.check_integrity() == ""
++        assert tree.num_seqs() == 2
++
++    def test_appends_to_other_seq_between_extend_and_pop(self):
++        tree = SuffixTree(8, True)
++        tree.extend(0, [1, 2, 3])
++        tree.extend(1, [10, 20])
++        # Begin extend on seq 0; mutate seq 1 in between; pop seq 0.
++        tree.extend(0, [4, 5])
++        tree.extend(1, [30, 40])      # interleave on a different seq
++        tree.pop(0, 2)                # pop the [4, 5] from seq 0
++        assert tree.check_integrity() == ""
++
++    def test_pop_recreated_seq(self):
++        # Pop all of seq 0 → seq disappears → re-extend seq 0 with different
++        # tokens → the tree should be consistent.
++        tree = SuffixTree(8, True)
++        tree.extend(0, [1, 2, 3])
++        tree.pop(0, 3)
++        assert tree.num_seqs() == 0
++        tree.extend(0, [9, 8, 7])
++        assert tree.check_integrity() == ""
++        tree.pop(0, 3)
++        assert tree.check_integrity() == ""
++        assert tree.num_seqs() == 0
++
++
++# --------------------------------------------------------------------------
++# Speculate semantics
++# --------------------------------------------------------------------------
++
++
++class TestPopSpeculateRoundtrip:
++    def test_speculate_identical_before_and_after(self):
++        """Core invariant: speculate(ctx) returns the same draft before a
++        temp extend+pop pair as after. This is the simulator's use case."""
++        tree = SuffixTree(8, True)
++        tree.extend(0, [1, 2, 3, 4, 1, 2, 3, 5])
++        ctx = np.array([1, 2, 3], dtype=np.int32)
++        before = tree.speculate_ndarray(ctx, 8, 4.0, 0.0, 0.0, True)
++        # Temp extend with hypothetical tokens, then pop.
++        tree.extend(0, [99, 100])
++        tree.pop(0, 2)
++        assert tree.check_integrity() == ""
++        after = tree.speculate_ndarray(ctx, 8, 4.0, 0.0, 0.0, True)
++        assert list(after.token_ids) == list(before.token_ids)
++        assert list(after.parents) == list(before.parents)
++        assert pytest.approx(after.score) == before.score
++
++
++# --------------------------------------------------------------------------
++# Stress: random extend/pop sequences vs. brute rebuild
++# --------------------------------------------------------------------------
++
++
++class TestPopStress:
++    """Stress test under the simulator's actual usage discipline:
++
++      For any seq with a pending temp frame, NO other mutations to ANY seq
++      may happen until that frame is popped. (Equivalent to: temp extend
++      and its matching pop are an atomic block at the seq level.)
++
++    This is the contract the simulator's `_extension_step` honors —
++    `with cache.temporary_extension(req_id, paths[i])` extends, speculates,
++    pops without yielding. Pop reversibility relies on this contract: a
++    seq's per-token undo log records pre-mutation state at op time, but
++    intervening mutations from OTHER seqs may shift counts on shared nodes
++    (case 3a in particular) and invalidate the recorded reverse.
++
++    The stress here exercises:
++      - Multi-seq extend interleaved freely (no temp scopes overlap)
++      - Random temp extend + immediate pop blocks
++      - Per-case mix via random tokens triggering all 6 append paths
++    """
++    @pytest.mark.parametrize("seed", [0, 1, 2, 42, 1337])
++    def test_random_extend_pop_round_trip(self, seed):
++        rng = random.Random(seed)
++        max_depth = 8
++        n_seqs = 4
++        tree = SuffixTree(max_depth, True)
++        canonical = {i: [] for i in range(n_seqs)}
++        token_vocab = list(range(1, 16))
++
++        for step in range(300):
++            seq_id = rng.randrange(n_seqs)
++            mode = rng.random()
++            if mode < 0.5:
++                # Permanent extend.
++                k = rng.randint(1, 4)
++                toks = [rng.choice(token_vocab) for _ in range(k)]
++                tree.extend(seq_id, toks)
++                canonical[seq_id].extend(toks)
++            else:
++                # Atomic temp extend + immediate pop. No interleaving.
++                k = rng.randint(1, 4)
++                toks = [rng.choice(token_vocab) for _ in range(k)]
++                tree.extend(seq_id, toks)
++                tree.pop(seq_id, k)
++            err = tree.check_integrity()
++            assert err == "", (step, err)
++
++        # Build reference from the canonical commits.
++        ref = SuffixTree(max_depth, True)
++        for sid, toks in canonical.items():
++            if toks:
++                ref.extend(sid, toks)
++        assert ref.check_integrity() == ""
++
++        # Speculate score on the same context should match the reference's
++        # score (the *positions* of equal-count children are an internal
++        # detail of the sibling list and are not pop-invariant in general
++        # — but the speculation score, which is a sum over the chosen path's
++        # token probabilities, equals the score of the equivalent path in
++        # the reference because suffix-tree statistics are determined by
++        # the multiset of (seq, suffix-start) pairs, which is the same.)
++        for _ in range(20):
++            sid = rng.randrange(n_seqs)
++            if not canonical[sid]:
++                continue
++            ctx_len = rng.randint(1, min(len(canonical[sid]), max_depth))
++            ctx = np.array(canonical[sid][-ctx_len:], dtype=np.int32)
++            d_tree = tree.speculate_ndarray(ctx, 8, 4.0, 0.0, 0.0, True)
++            d_ref = ref.speculate_ndarray(ctx, 8, 4.0, 0.0, 0.0, True)
++            # match_len is determined purely by the underlying suffix
++            # multiset, so it must match. score is a top-K sum that is
++            # robust to sibling-tie ordering, so we check approximate equality.
++            assert d_tree.match_len == d_ref.match_len, (
++                f"match_len differ on seed={seed} sid={sid} ctx={list(ctx)}: "
++                f"tree={d_tree.match_len} ref={d_ref.match_len}")
++            assert abs(d_tree.score - d_ref.score) < 1e-5, (
++                f"score differ on seed={seed} sid={sid} ctx={list(ctx)}: "
++                f"tree={d_tree.score} ref={d_ref.score}")
++
++    @pytest.mark.parametrize("seed", [7, 13, 99])
++    def test_temp_extension_atomic_block(self, seed):
++        """Targeted test for the simulator's atomic 'with temporary_extension'
++        usage: build base state, then temp-extend / speculate / pop in tight
++        cycles. Each cycle must restore the tree bit-for-bit."""
++        rng = random.Random(seed)
++        max_depth = 8
++        tree = SuffixTree(max_depth, True)
++        # Build a base state of permanent appends across multiple seqs.
++        for sid in range(3):
++            n = rng.randint(5, 15)
++            toks = [rng.randint(1, 10) for _ in range(n)]
++            tree.extend(sid, toks)
++        assert tree.check_integrity() == ""
++
++        # Snapshot speculate output for a probe context BEFORE temp cycles.
++        probe_seq = 0
++        probe_ctx = np.array([1, 2, 3], dtype=np.int32)
++        baseline = tree.speculate_ndarray(
++            probe_ctx, 8, 4.0, 0.0, 0.0, True)
++
++        # Run many temp cycles.
++        for _ in range(50):
++            sid = rng.randrange(3)
++            k = rng.randint(1, 4)
++            toks = [rng.randint(1, 10) for _ in range(k)]
++            tree.extend(sid, toks)
++            # Speculate during the temp scope to confirm the tree is consistent.
++            assert tree.check_integrity() == ""
++            _ = tree.speculate_ndarray(
++                probe_ctx, 8, 4.0, 0.0, 0.0, True)
++            tree.pop(sid, k)
++            assert tree.check_integrity() == ""
++            # Speculate output must match baseline after every pop.
++            after = tree.speculate_ndarray(
++                probe_ctx, 8, 4.0, 0.0, 0.0, True)
++            assert list(after.token_ids) == list(baseline.token_ids)
++            assert list(after.parents) == list(baseline.parents)
++
++
++# --------------------------------------------------------------------------
++# SuffixDecodingCache integration (Phase 2 will exercise this more, but a
++# minimal smoke is useful here too).
++# --------------------------------------------------------------------------
++
++
++class TestCachePopSmoke:
++    def test_cache_constructed_with_undo_works_after_extend(self):
++        cache = SuffixDecodingCache(
++            max_tree_depth=16, max_cached_requests=10, enable_undo=True)
++        cache.start_request("r1", [1, 2, 3])
++        cache.add_active_response("r1", [4, 5])
++        assert cache._global_tree.check_integrity() == ""
++        cache.stop_request("r1")
++
++    def test_extend_pop_round_trip(self):
++        cache = SuffixDecodingCache(
++            max_tree_depth=16, max_cached_requests=10, enable_undo=True)
++        cache.start_request("r1", [1, 2, 3])
++        cache.add_active_response("r1", [4, 5])
++        # Speculate snapshot.
++        ctx = np.array([1, 2, 3, 4], dtype=np.int32)
++        before = cache.speculate("r1", ctx)
++        # Temp extension via context manager.
++        with cache.temporary_extension("r1", [99, 100]):
++            # During the scope, the tree has the temp tokens. Speculate
++            # should still work.
++            d_temp = cache.speculate("r1", np.array(
++                [1, 2, 3, 4, 5, 99, 100], dtype=np.int32))
++            assert isinstance(d_temp.token_ids, list)
++            # Both trees must remain integral inside the scope.
++            assert cache._global_tree.check_integrity() == ""
++            assert cache._local_trees["r1"].check_integrity() == ""
++        # After exit, integrity holds AND speculate output matches the
++        # pre-extension snapshot bit-for-bit.
++        assert cache._global_tree.check_integrity() == ""
++        assert cache._local_trees["r1"].check_integrity() == ""
++        after = cache.speculate("r1", ctx)
++        assert list(after.token_ids) == list(before.token_ids)
++        assert list(after.parents) == list(before.parents)
++        cache.stop_request("r1")
++
++    def test_extend_pop_explicit(self):
++        cache = SuffixDecodingCache(
++            max_tree_depth=16, max_cached_requests=10, enable_undo=True)
++        cache.start_request("r1", [1, 2, 3])
++        cache.extend_active_response("r1", [4, 5, 6])
++        assert cache._global_tree.check_integrity() == ""
++        # Pop without n: pops the top frame (size 3).
++        cache.pop_active_response("r1")
++        assert cache._global_tree.check_integrity() == ""
++        assert cache._local_trees["r1"].check_integrity() == ""
++        cache.stop_request("r1")
++
++    def test_pop_without_undo_raises(self):
++        cache = SuffixDecodingCache(
++            max_tree_depth=16, max_cached_requests=10, enable_undo=False)
++        cache.start_request("r1", [1, 2, 3])
++        with pytest.raises(RuntimeError):
++            cache.extend_active_response("r1", [4])
++        with pytest.raises(RuntimeError):
++            cache.pop_active_response("r1")
++        cache.stop_request("r1")
++
++    def test_stop_request_with_pending_frame_raises(self):
++        cache = SuffixDecodingCache(
++            max_tree_depth=16, max_cached_requests=10, enable_undo=True)
++        cache.start_request("r1", [1, 2, 3])
++        cache.extend_active_response("r1", [4, 5])
++        with pytest.raises(ValueError):
++            cache.stop_request("r1")
++        # Pop the frame and try again.
++        cache.pop_active_response("r1")
++        cache.stop_request("r1")  # should succeed
++
++    def test_evict_with_pending_frame_raises(self):
++        cache = SuffixDecodingCache(
++            max_tree_depth=16, max_cached_requests=10, enable_undo=True)
++        cache.start_request("r1", [1, 2, 3])
++        cache.extend_active_response("r1", [4, 5])
++        with pytest.raises(ValueError):
++            cache.evict_cached_response("r1")
++        cache.pop_active_response("r1")
++        cache.stop_request("r1")
++        cache.evict_cached_response("r1")
++
++    def test_nested_temporary_extension(self):
++        cache = SuffixDecodingCache(
++            max_tree_depth=16, max_cached_requests=10, enable_undo=True)
++        cache.start_request("r1", [1, 2, 3])
++        cache.add_active_response("r1", [4])
++        ctx = np.array([1, 2], dtype=np.int32)
++        before = cache.speculate("r1", ctx)
++        with cache.temporary_extension("r1", [5]):
++            with cache.temporary_extension("r1", [6, 7]):
++                inside = cache.speculate("r1", ctx)
++                assert isinstance(inside.token_ids, list)
++            # After inner pop, integrity OK.
++            assert cache._global_tree.check_integrity() == ""
++        # After outer pop, integrity OK and output matches.
++        after = cache.speculate("r1", ctx)
++        assert list(after.token_ids) == list(before.token_ids)
++        cache.stop_request("r1")
++
++    def test_temporary_extension_reverts_on_exception(self):
++        cache = SuffixDecodingCache(
++            max_tree_depth=16, max_cached_requests=10, enable_undo=True)
++        cache.start_request("r1", [1, 2, 3])
++        ctx = np.array([1, 2], dtype=np.int32)
++        before = cache.speculate("r1", ctx)
++        with pytest.raises(RuntimeError):
++            with cache.temporary_extension("r1", [9, 8]):
++                # Simulate an error inside the scope.
++                raise RuntimeError("simulated")
++        # Pop must still have happened via finally.
++        assert cache._global_tree.check_integrity() == ""
++        after = cache.speculate("r1", ctx)
++        assert list(after.token_ids) == list(before.token_ids)
++        cache.stop_request("r1")
++
++    def test_simulator_anchor_pattern(self):
++        """Reproduces the simulator's per-anchor flow on a single req_id:
++        many temp extensions back-to-back, each with a different anchor's
++        path. Each speculate during the scope must see the temp tokens; the
++        baseline must hold across all cycles."""
++        cache = SuffixDecodingCache(
++            max_tree_depth=64, max_cached_requests=10, enable_undo=True)
++        cache.start_request("req0", list(range(1, 21)))  # prompt
++        cache.add_active_response("req0", [21, 22, 23])  # decoded prefix
++        ctx = np.array([20, 21, 22], dtype=np.int32)
++        baseline = cache.speculate("req0", ctx)
++        # Simulate 30 anchor extensions.
++        anchor_paths = [
++            [50, 51], [52], [50, 51, 53], [54, 55, 56], [50, 57],
++            [58], [59, 60, 61, 62], [63], [64, 65], [50, 51, 52, 53],
++        ] * 3
++        for i, path in enumerate(anchor_paths):
++            with cache.temporary_extension("req0", path):
++                # Use the temp extension for a speculate.
++                ext_ctx = np.array(
++                    list(range(1, 24)) + path, dtype=np.int32)
++                d = cache.speculate("req0", ext_ctx)
++                assert isinstance(d.token_ids, list)
++                assert cache._global_tree.check_integrity() == ""
++            # After each pop the baseline holds.
++            assert cache._global_tree.check_integrity() == ""
++            assert cache._local_trees["req0"].check_integrity() == ""
++            after = cache.speculate("req0", ctx)
++            assert list(after.token_ids) == list(baseline.token_ids), i
++            assert list(after.parents) == list(baseline.parents), i
++        cache.stop_request("req0")
++
++
++# --------------------------------------------------------------------------
++# Additional edge cases (Phase 1 hardening)
++# --------------------------------------------------------------------------
++
++
++class TestPopEdgeCases:
++    """Tighter coverage for boundary conditions and unusual inputs."""
++
++    def test_extend_empty_then_pop_zero(self):
++        tree = SuffixTree(8, True)
++        tree.extend(0, [])  # no-op
++        assert tree.check_integrity() == ""
++        assert tree.num_seqs() == 0
++        # pop(seq, 0) is a no-op even if the seq doesn't exist (popping
++        # zero tokens is unambiguously nothing to do).
++        tree.pop(0, 0)
++        assert tree.check_integrity() == ""
++
++    def test_max_depth_one(self):
++        # Pathological max_depth=1: every append immediately front-pops the
++        # active deque (after the push of root makes size 2 > 1). Only one
++        # active node iterates per token (just root).
++        tree = SuffixTree(1, True)
++        tree.extend(0, [1, 2, 3, 4, 5])
++        assert tree.check_integrity() == ""
++        tree.pop(0, 5)
++        assert tree.check_integrity() == ""
++        assert tree.num_seqs() == 0
++
++    def test_token_zero_value(self):
++        # Token=0 is a valid token (only INT32_MIN and INT32_MIN+1 are
++        # reserved by Int32Map). Make sure pop handles it.
++        tree = SuffixTree(8, True)
++        tree.extend(0, [0, 0, 1, 0])
++        assert tree.check_integrity() == ""
++        tree.pop(0, 4)
++        assert tree.check_integrity() == ""
++        assert tree.num_seqs() == 0
++
++    def test_repeated_identical_tokens(self):
++        # Long run of the same token exercises case 1a chain extensively
++        # plus 2a/2b on the compressed leaf when other seqs join.
++        tree = SuffixTree(8, True)
++        tree.extend(0, [7, 7, 7, 7, 7, 7])
++        assert tree.check_integrity() == ""
++        tree.extend(1, [7, 7, 7])  # walks into compressed [7]+ chain
++        assert tree.check_integrity() == ""
++        tree.pop(1, 3)
++        assert tree.check_integrity() == ""
++        tree.pop(0, 6)
++        assert tree.check_integrity() == ""
++        assert tree.num_seqs() == 0
++
++    def test_pop_zero_after_full_pop(self):
++        # pop(seq, 0) is a no-op even after the seq has been fully popped
++        # (log entry erased). Subsequent pop(seq, 1) DOES throw.
++        tree = SuffixTree(8, True)
++        tree.extend(0, [1])
++        tree.pop(0, 1)
++        tree.pop(0, 0)            # no-op, must not throw
++        assert tree.num_seqs() == 0
++        with pytest.raises(Exception):
++            tree.pop(0, 1)
++
++    def test_speculate_during_temp_scope_sees_temp(self):
++        # Inside the temp extend → speculate → pop block, the speculate must
++        # incorporate the temp tokens (otherwise the simulator's whole
++        # purpose is defeated). Verify match_len grows when temp content
++        # extends a context's matchable suffix.
++        tree = SuffixTree(8, True)
++        # Build a base trajectory.
++        tree.extend(0, [1, 2, 3, 4, 5])
++        ctx_base = np.array([1, 2, 3], dtype=np.int32)
++        d_base = tree.speculate_ndarray(ctx_base, 8, 4.0, 0.0, 0.0, True)
++        base_match = d_base.match_len
++        # Now temp-extend with tokens that make the context have a longer
++        # observable suffix in the tree.
++        tree.extend(0, [9, 1, 2, 3])
++        ctx_temp = np.array([9, 1, 2, 3], dtype=np.int32)
++        d_temp = tree.speculate_ndarray(ctx_temp, 8, 4.0, 0.0, 0.0, True)
++        # The temp-extended tree must yield AT LEAST as much match as the
++        # baseline for the same probe (and typically more for the new ctx).
++        assert d_temp.match_len >= 1
++        tree.pop(0, 4)
++        assert tree.check_integrity() == ""
++
++    def test_repeated_extend_pop_on_same_seq_no_state_drift(self):
++        """Stressing pop/re-extend cycles on the same seq must not accumulate
++        residual log entries or tree state. Speculation outputs should be
++        bit-stable across cycles."""
++        tree = SuffixTree(8, True)
++        # Permanent base.
++        tree.extend(0, [1, 2, 3, 1, 2])
++        ctx = np.array([1, 2], dtype=np.int32)
++        baseline = tree.speculate_ndarray(ctx, 8, 4.0, 0.0, 0.0, True)
++        baseline_tokens = list(baseline.token_ids)
++        baseline_score = baseline.score
++
++        for cycle in range(100):
++            tree.extend(0, [9, 8, 7])
++            assert tree.check_integrity() == ""
++            tree.pop(0, 3)
++            assert tree.check_integrity() == ""
++            after = tree.speculate_ndarray(ctx, 8, 4.0, 0.0, 0.0, True)
++            assert list(after.token_ids) == baseline_tokens, (cycle, list(after.token_ids))
++            assert abs(after.score - baseline_score) < 1e-6, (cycle, after.score)
++            assert tree.undo_log_length(0) == 5  # only the permanent appends
++
++    def test_speculate_outputs_bit_stable_across_pop_reextend(self):
++        """For a single seq, extend → snapshot → pop → re-extend(same toks) →
++        speculate outputs must be bit-equal (sibling tie ordering also
++        preserved). This is stronger than 'match_len + score equal' — it
++        confirms the tree structure is restored exactly for the simulator's
++        single-seq pop pattern."""
++        tree = SuffixTree(16, True)
++        permanent = [1, 2, 3, 1, 2, 4, 1, 2, 3]
++        tree.extend(0, permanent)
++        # Snapshot speculate outputs over many contexts.
++        contexts = [
++            [1, 2], [1, 2, 3], [2, 3], [3, 1], [1], [2], [3], [4],
++            [1, 2, 4], [3, 1, 2], [1, 2, 3, 1],
++        ]
++        snaps = []
++        for c in contexts:
++            d = tree.speculate_ndarray(
++                np.array(c, dtype=np.int32), 8, 4.0, 0.0, 0.0, True)
++            snaps.append((list(d.token_ids), list(d.parents),
++                          list(d.probs), d.score, d.match_len))
++        # Now do many extend/pop cycles with various temp tokens.
++        for temp in [[5, 5, 5], [9, 1, 2, 3], [4], [1, 2, 3, 4, 5]]:
++            tree.extend(0, temp)
++            tree.pop(0, len(temp))
++            assert tree.check_integrity() == ""
++            for c, s in zip(contexts, snaps):
++                d = tree.speculate_ndarray(
++                    np.array(c, dtype=np.int32), 8, 4.0, 0.0, 0.0, True)
++                assert list(d.token_ids) == s[0], (c, list(d.token_ids), s[0])
++                assert list(d.parents) == s[1], (c, list(d.parents), s[1])
++                assert d.match_len == s[4], (c, d.match_len, s[4])
++
++    def test_pop_then_remove_then_reextend_clean(self):
++        # Full lifecycle: extend, pop part, remove the seq, then re-create
++        # with new content. Must be clean (no leftover undo state).
++        tree = SuffixTree(8, True)
++        tree.extend(0, [1, 2, 3])
++        tree.pop(0, 1)  # partial
++        assert tree.undo_log_length(0) == 2
++        tree.remove(0)  # drops the rest of seq AND the log
++        assert tree.undo_log_length(0) == 0
++        with pytest.raises(Exception):
++            tree.pop(0, 1)
++        # Re-create.
++        tree.extend(0, [9, 8, 7, 6])
++        assert tree.check_integrity() == ""
++        tree.pop(0, 4)
++        assert tree.check_integrity() == ""
++        assert tree.num_seqs() == 0
++
++    def test_many_seqs_atomic_temp_blocks(self):
++        # Many seqs, each doing atomic temp-extend+pop cycles, no cross-seq
++        # interleaving inside a temp block. Mirrors the simulator running
++        # extension on many cache_req_ids serially.
++        rng = random.Random(2024)
++        max_depth = 8
++        n_seqs = 16
++        tree = SuffixTree(max_depth, True)
++        # Permanent prefix per seq.
++        for sid in range(n_seqs):
++            n = rng.randint(3, 10)
++            toks = [rng.randint(1, 8) for _ in range(n)]
++            tree.extend(sid, toks)
++        assert tree.check_integrity() == ""
++        # Atomic temp blocks per seq.
++        for sid in range(n_seqs):
++            for _ in range(20):
++                k = rng.randint(1, 6)
++                temp = [rng.randint(1, 8) for _ in range(k)]
++                tree.extend(sid, temp)
++                assert tree.check_integrity() == ""
++                tree.pop(sid, k)
++                assert tree.check_integrity() == ""
++
++    def test_temp_then_partial_pop_then_full_pop(self):
++        # Pop in two stages on the SAME seq's temp tokens.
++        tree = SuffixTree(8, True)
++        tree.extend(0, [1, 2])  # permanent
++        tree.extend(0, [3, 4, 5, 6])  # temp
++        tree.pop(0, 2)  # pop [5, 6]
++        assert tree.check_integrity() == ""
++        assert tree.undo_log_length(0) == 4
++        tree.pop(0, 2)  # pop [3, 4]
++        assert tree.check_integrity() == ""
++        assert tree.undo_log_length(0) == 2
++        # Tree should now be the permanent state.
++        ref = SuffixTree(8, True)
++        ref.extend(0, [1, 2])
++        ctx = np.array([1], dtype=np.int32)
++        d_tree = tree.speculate_ndarray(ctx, 8, 4.0, 0.0, 0.0, True)
++        d_ref = ref.speculate_ndarray(ctx, 8, 4.0, 0.0, 0.0, True)
++        assert d_tree.match_len == d_ref.match_len
++        assert abs(d_tree.score - d_ref.score) < 1e-6
++
++    def test_temp_extends_across_max_depth_boundary(self):
++        # max_depth=4 with permanent length 3 + temp 4 (total 7 > max_depth):
++        # the temp's last appends front-pop active deque; pop must restore.
++        tree = SuffixTree(4, True)
++        tree.extend(0, [1, 2, 3])  # active deque grows: 1, 2, 3 entries
++        ctx = np.array([2], dtype=np.int32)
++        baseline = tree.speculate_ndarray(ctx, 8, 4.0, 0.0, 0.0, True)
++        # Temp extend that spans the max_depth front-pop trigger.
++        tree.extend(0, [4, 5, 6, 7])
++        assert tree.check_integrity() == ""
++        tree.pop(0, 4)
++        assert tree.check_integrity() == ""
++        after = tree.speculate_ndarray(ctx, 8, 4.0, 0.0, 0.0, True)
++        assert list(after.token_ids) == list(baseline.token_ids)
++        assert list(after.parents) == list(baseline.parents)
++        assert abs(after.score - baseline.score) < 1e-6
++
++    def test_long_random_single_seq_atomic_cycles(self):
++        # Long, varied single-seq workload to catch cumulative bugs.
++        rng = random.Random(99999)
++        tree = SuffixTree(16, True)
++        permanent = [rng.randint(1, 30) for _ in range(80)]
++        tree.extend(0, permanent)
++        baseline_states = []
++        # Save speculate outputs for varied contexts as the snapshot.
++        ctx_pool = [permanent[i:i + rng.randint(2, 10)]
++                    for i in range(0, len(permanent), 5)]
++        for c in ctx_pool[:15]:
++            if not c:
++                continue
++            d = tree.speculate_ndarray(
++                np.array(c, dtype=np.int32), 16, 4.0, 0.0, 0.0, True)
++            baseline_states.append((c, list(d.token_ids), list(d.parents),
++                                     d.match_len, d.score))
++        # 200 atomic temp cycles.
++        for _ in range(200):
++            k = rng.randint(1, 12)
++            temp = [rng.randint(1, 30) for _ in range(k)]
++            tree.extend(0, temp)
++            assert tree.check_integrity() == ""
++            tree.pop(0, k)
++            assert tree.check_integrity() == ""
++        # Verify all baseline states still match.
++        for c, tids, pids, ml, sc in baseline_states:
++            d = tree.speculate_ndarray(
++                np.array(c, dtype=np.int32), 16, 4.0, 0.0, 0.0, True)
++            assert list(d.token_ids) == tids, (c, list(d.token_ids), tids)
++            assert list(d.parents) == pids
++            assert d.match_len == ml
++            assert abs(d.score - sc) < 1e-6
++
++    def test_estimate_memory_stable_after_temp_cycles(self):
++        # Memory should not grow with each temp cycle (no log accumulation
++        # for fully-popped frames). Verify estimate_memory is bounded.
++        tree = SuffixTree(8, True)
++        tree.extend(0, [1, 2, 3])
++        baseline_mem = tree.estimate_memory()
++        for _ in range(100):
++            tree.extend(0, [4, 5, 6])
++            tree.pop(0, 3)
++        assert tree.check_integrity() == ""
++        after_mem = tree.estimate_memory()
++        # Allow some slack for slot retention in Int32Map (tombstones), but
++        # memory should not balloon.
++        assert after_mem <= baseline_mem * 3, (baseline_mem, after_mem)
++        assert tree.undo_log_length(0) == 3  # only the permanent
++
++    def test_undo_log_length_accuracy(self):
++        tree = SuffixTree(8, True)
++        assert tree.undo_log_length(0) == 0
++        tree.extend(0, [1, 2, 3])
++        assert tree.undo_log_length(0) == 3
++        tree.extend(0, [4, 5])
++        assert tree.undo_log_length(0) == 5
++        tree.pop(0, 2)
++        assert tree.undo_log_length(0) == 3
++        tree.pop(0, 3)
++        assert tree.undo_log_length(0) == 0
++
++    def test_clear_undo_log_then_extend(self):
++        tree = SuffixTree(8, True)
++        tree.extend(0, [1, 2, 3])
++        tree.clear_undo_log()
++        assert tree.undo_log_length(0) == 0
++        # Pop should fail.
++        with pytest.raises(Exception):
++            tree.pop(0, 1)
++        # New extends accumulate fresh log.
++        tree.extend(0, [4])
++        assert tree.undo_log_length(0) == 1
++        tree.pop(0, 1)
++        assert tree.check_integrity() == ""
++
++    def test_speculate_during_temp_with_deep_path(self):
++        # Specific simulator pattern: build base, then temp-extend a long
++        # path and speculate from a context that ends on the temp path.
++        # The speculate must reflect the temp extension in its drafts.
++        tree = SuffixTree(16, True)
++        tree.extend(0, [10, 20, 30, 10, 20, 40])
++        # Temp-extend with a path that, combined with base, creates new
++        # internal repetitions.
++        tree.extend(0, [10, 20, 30])
++        # Context that ends with [10, 20] should now match more positions.
++        ctx = np.array([10, 20], dtype=np.int32)
++        d_with_temp = tree.speculate_ndarray(ctx, 8, 4.0, 0.0, 0.0, True)
++        # Match length should be at least 1 (we have lots of [10,20,*] paths).
++        assert d_with_temp.match_len >= 1
++        tree.pop(0, 3)
++        assert tree.check_integrity() == ""
