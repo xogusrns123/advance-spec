@@ -226,5 +226,8 @@ __marimo__/
 .claude/
 # Slim agent dumps + ad-hoc filter scripts (top-level)
 /agent_slim_*.json
-/_filter_errored.py
+/_*.py
 /_sim_logs_*/
+
+# Archived runs / large result tarballs
+legacy/
