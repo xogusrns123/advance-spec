@@ -48,6 +48,20 @@ MODEL_PRESETS: dict[str, dict] = {
         "tool_call_parser": "qwen25",
         "speculative_algorithm": "EAGLE3",
     },
+    # Standalone draft-model speculation. Target is a *placeholder* — replay
+    # mode (SGLANG_ORACLE_REPLAY) overrides target output at every step, so
+    # the target's logits / hidden state never affect the draft tree. The
+    # only target requirement is tokenizer compatibility with the trajectory
+    # (Qwen3 family share a tokenizer). Using Qwen3-0.6B as target keeps
+    # the whole TP=1 fit on a single 4090 24GB (target + draft both 0.6B).
+    # Draft = Qwen3-0.6B is the proposer we're actually calibrating.
+    "qwen3_14b_dm": {
+        "model": "Qwen/Qwen3-0.6B",
+        "draft_model": "Qwen/Qwen3-0.6B",
+        "draft_lm": None,
+        "tool_call_parser": "qwen25",
+        "speculative_algorithm": "STANDALONE",
+    },
     "qwen3_32b": {
         "model": "Qwen/Qwen3-32B",
         "draft_model": "Zhihu-ai/Zhi-Create-Qwen3-32B-Eagle3",
@@ -74,6 +88,44 @@ MODEL_PRESETS: dict[str, dict] = {
         "tool_call_parser": "qwen25",
         "speculative_algorithm": "EAGLE",
     },
+    # Alias of qwen35_9b — separate output subdir so the new MTP captures
+    # don't collide with the legacy contaminated `qwen35_9b/` results
+    # (project_qwen35_9b_sglang_broken memory).
+    "qwen35_9b_mtp": {
+        "model": "Qwen/Qwen3.5-9B",
+        "draft_model": "Qwen/Qwen3.5-9B",
+        "draft_lm": "Qwen/Qwen3-0.6B",
+        "tool_call_parser": "qwen25",
+        "speculative_algorithm": "EAGLE",
+    },
+    # Qwen3.5-35B-A3B MoE (35B total / 3B active) with native MTP head.
+    # Same trick as 9B: draft_model_path == target_model_path triggers the
+    # MTP arch swap. TP=4 (all 4× 24GB cards).
+    "qwen35_35b_mtp": {
+        "model": "Qwen/Qwen3.5-35B-A3B",
+        "draft_model": "Qwen/Qwen3.5-35B-A3B",
+        "draft_lm": None,
+        "tool_call_parser": "qwen25",
+        "speculative_algorithm": "EAGLE",
+    },
+    "qwen35_27b_mtp": {
+        "model": "Qwen/Qwen3.5-27B",
+        "draft_model": "Qwen/Qwen3.5-27B",
+        "draft_lm": None,
+        "tool_call_parser": "qwen25",
+        "speculative_algorithm": "EAGLE",
+    },
+    # Qwen3.5-9B target + Qwen3-0.6B draft via STANDALONE — for draft-model
+    # calibration on the Qwen3.5-9B trajectory (parallel to MTP head's
+    # calibration). Vanilla-mode capture so target's natural output is
+    # deterministic given the prompt — trajectory matches qwen35_9b_mtp.
+    "qwen35_9b_dm": {
+        "model": "Qwen/Qwen3.5-9B",
+        "draft_model": "Qwen/Qwen3-0.6B",
+        "draft_lm": None,
+        "tool_call_parser": "qwen25",
+        "speculative_algorithm": "STANDALONE",
+    },
 }
 
 # Per-workload config for round-robin mode: which agent module, which
@@ -99,6 +151,16 @@ WORKLOAD_REGISTRY: dict[str, dict] = {
     "swebench_verified": {
         "agent_module": "simulation.agents.swebench_agent",
         "dataset": "data/swebench_verified/dataset_interleaved.jsonl",
+    },
+    # Sharded slices of swebench_verified for parallel capture across
+    # GPU pairs. Same agent, sliced dataset (positions 0-9 vs 10-19).
+    "swebench_verified_a": {
+        "agent_module": "simulation.agents.swebench_agent",
+        "dataset": "data/swebench_verified/dataset_interleaved_a.jsonl",
+    },
+    "swebench_verified_b": {
+        "agent_module": "simulation.agents.swebench_agent",
+        "dataset": "data/swebench_verified/dataset_interleaved_b.jsonl",
     },
     "longbench_lcc": {
         "agent_module": "simulation.agents.specbench_agent",
@@ -274,6 +336,12 @@ def execute_round_robin(cfg: dict, dry_run: bool = False) -> int:
                 # parses. With both workloads on the same SGLang server you
                 # can pick only one — split shards by tool format.
                 "tool_call_parser": sh.get("tool_call_parser", tool_call_parser),
+                # Per-shard SGLANG_ORACLE_REPLAY trajectory path. When set,
+                # the SGLang draft path replays the captured trajectory
+                # rather than letting the target model commit fresh tokens.
+                # Use this to align dm/standalone captures with the eagle3
+                # trajectory (so calibration is comparable apples-to-apples).
+                "oracle_replay": sh.get("oracle_replay"),
             })
     else:
         shard_specs = [{
@@ -282,6 +350,7 @@ def execute_round_robin(cfg: dict, dry_run: bool = False) -> int:
             "port": default_port,
             "plan": plan,
             "tool_call_parser": tool_call_parser,
+            "oracle_replay": cfg.get("oracle_replay"),
         }]
 
     print(f"Experiment: {cfg.get('name', '(unnamed)')} (round-robin)")
@@ -337,12 +406,15 @@ def execute_round_robin(cfg: dict, dry_run: bool = False) -> int:
         max_prefill_tokens=cfg.get("max_prefill_tokens"),
     )
 
+    max_per_workload = cfg.get("max_per_workload")
     if len(shard_specs) == 1:
         ss = shard_specs[0]
         rc = _run_rr_shard(
             shard_id=ss["id"], gpu_ids=ss["gpu_ids"],
             port=ss["port"], plan=ss["plan"],
             tool_call_parser=ss["tool_call_parser"],
+            oracle_replay=ss.get("oracle_replay"),
+            max_per_workload=max_per_workload,
             **shard_kwargs)
         print("Round-robin done.")
         return rc
@@ -357,6 +429,8 @@ def execute_round_robin(cfg: dict, dry_run: bool = False) -> int:
                       shard_id=ss["id"], gpu_ids=ss["gpu_ids"],
                       port=ss["port"], plan=ss["plan"],
                       tool_call_parser=ss["tool_call_parser"],
+                      oracle_replay=ss.get("oracle_replay"),
+                      max_per_workload=max_per_workload,
                       **shard_kwargs): ss
             for ss in shard_specs
         }
@@ -384,6 +458,8 @@ def _run_rr_shard(
     mem_fraction_static: float | None = None,
     max_total_tokens: int | None = None,
     max_prefill_tokens: int | None = None,
+    oracle_replay: str | None = None,
+    max_per_workload: int | None = None,
 ) -> int:
     """Boot one SGLang server on (gpu_ids, port) and run RR over `plan`."""
     rr_env = base_env.copy()
@@ -400,8 +476,24 @@ def _run_rr_shard(
     # forces topk=1 (chain-only), so we take the alternate fork:
     #   no_buffer mamba scheduler (default) + --disable-radix-cache
     # See _handle_mamba_radix_cache in sglang/srt/server_args.py.
+    # Per-shard oracle log path — prevents cross-shard contamination when
+    # multiple servers run concurrently (agents read from start_pos to end,
+    # would otherwise interleave with other shards' entries).
+    rr_env["SGLANG_ORACLE_LOG"] = f"/tmp/sglang_oracle_vanilla_shard{shard_id}.jsonl"
+    rr_env["SGLANG_ORACLE_TIMING_LOG"] = f"/tmp/sglang_oracle_timing_shard{shard_id}.jsonl"
+
     for k in ("SGLANG_ORACLE_REPLAY", "SGLANG_ORACLE_VERIFY_TRIES"):
         rr_env.pop(k, None)
+    if oracle_replay:
+        replay_abs = oracle_replay
+        if not os.path.isabs(replay_abs):
+            replay_abs = str(REPO_ROOT / replay_abs)
+        if not os.path.exists(replay_abs):
+            print(f"[shard {shard_id}] ERROR: oracle_replay path does not "
+                  f"exist: {replay_abs}", file=sys.stderr)
+            return 1
+        rr_env["SGLANG_ORACLE_REPLAY"] = replay_abs
+        print(f"[shard {shard_id}] SGLANG_ORACLE_REPLAY={replay_abs}")
 
     mem_fraction = mem_fraction_static if mem_fraction_static is not None else 0.85
     max_prefill = max_prefill_tokens if max_prefill_tokens is not None else 8192
@@ -454,9 +546,15 @@ def _run_rr_shard(
             progress = 0
             for s in plan:
                 done_n, total_n = _count_progress(s["out_file"], s["dataset"])
-                if total_n is not None and done_n >= total_n:
+                # Cap with per-workload sample limit when configured.
+                effective_total = total_n
+                if max_per_workload is not None:
+                    effective_total = (
+                        min(total_n, max_per_workload) if total_n is not None
+                        else max_per_workload)
+                if effective_total is not None and done_n >= effective_total:
                     print(f"[shard {shard_id}][iter {iter_idx}] "
-                          f"{s['workload']}: exhausted ({done_n}/{total_n}) "
+                          f"{s['workload']}: exhausted ({done_n}/{effective_total}) "
                           f"— skipping")
                     continue
                 print(f"[shard {shard_id}][iter {iter_idx}] "
@@ -495,14 +593,15 @@ def _build_agent_extra_flags(workload: str, merged: dict) -> list[str]:
             flags += ["--max-iterations", str(merged["max_iterations"])]
         if merged.get("include_category"):
             flags += ["--include-category", str(merged["include_category"])]
-    elif workload in ("swebench", "swebench_verified"):
+    elif workload in ("swebench", "swebench_verified",
+                       "swebench_verified_a", "swebench_verified_b"):
         if merged.get("max_iterations") is not None:
             flags += ["--max-iterations", str(merged["max_iterations"])]
         if merged.get("tool_style"):
             flags += ["--tool-style", str(merged["tool_style"])]
         if merged.get("repos_dir"):
             flags += ["--repos-dir", str(merged["repos_dir"])]
-        elif workload == "swebench_verified":
+        elif workload.startswith("swebench_verified"):
             # default repo cache path used by rr
             flags += ["--repos-dir", "data/swebench_verified/repos"]
     elif workload == "spider2_dbt":
