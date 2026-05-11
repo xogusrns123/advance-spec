@@ -1,0 +1,49 @@
+# ============================================================
+# Pass 2b — MTP swebench shard B (positions 10-19 of dataset).
+#
+# Single TP=2 shard on GPU 2,3. Sharded version paired with p2a
+# (GPU 0,1, positions 0-9). Output dir: swebench_verified_b_*.
+# ============================================================
+name: rr_qwen35_9b_mtp_capture_p2b
+
+model_preset: qwen35_9b_mtp
+
+stage1_steps: 8
+stage1_configs:
+  - topk: 8
+    num_draft_tokens: 16
+
+round_robin:
+  enabled: true
+  capture_full_pool: true
+  batch: 1
+  resume: true
+  context_length: 262144
+
+mem_fraction_static: 0.55
+max_prefill_tokens: 4096
+
+max_per_workload: 10
+
+workloads:
+  - swebench_verified_b
+
+workload_overrides:
+  swebench_verified_b:
+    max_iterations: 250
+    tool_style: minisweagent
+    repos_dir: data/swebench_verified/repos
+
+shards:
+  - id: 0
+    gpu_ids: [2, 3]
+    port: 30005
+    workloads: [swebench_verified_b]
+    tool_call_parser: qwen3_coder
+
+infra:
+  port: 30005
+  gpu_ids: [2, 3]
+
+output:
+  root: simulation/results

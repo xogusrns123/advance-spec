@@ -1,0 +1,45 @@
+# ============================================================
+# Sim sweep — active workloads only (3 of 6) with chain_replay DM data.
+# 작성: 2026-05-10 KST.
+#
+# Scope:
+#   - Active workloads per project_active_workloads memory:
+#     specbench / bfcl_v4 / swebench_verified
+#     (longbench_lcc / longbench_repobench / spider2_dbt dropped)
+#   - draft_model data: chain_replay (verify-level override fix)
+#     auto-attached from simulation/results/qwen3_14b_chain_dm/
+#     (see run_reslice_sweep.py preference order)
+#
+# Run with:
+#   python3 simulation/scripts/experiments/run_sim_sweeps.py \
+#       simulation/config/sim_qwen3_14b_active.yaml
+# ============================================================
+name: sim_qwen3_14b_active
+
+capture_steps: 8
+capture_topk: 16
+
+reslices:
+  - s2k4
+  - s2k8
+  - s2k16
+  - s4k4
+  - s4k8
+  - s4k16
+  - s6k4
+  - s6k8
+  - s6k16
+  - s8k4
+  - s8k8
+  - s8k16
+budgets: [1, 2, 4, 8, 16, 32, 64, 128]
+
+timeout_sec: 0
+max_parallel: 1
+in_docker: true
+out_dir: simulation/results/explorations
+
+workloads:
+  - bfcl_v4
+  - specbench
+  - swebench_verified

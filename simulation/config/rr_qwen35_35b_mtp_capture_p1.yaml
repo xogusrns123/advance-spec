@@ -1,0 +1,49 @@
+# ============================================================
+# Pass 1 — Qwen3.5-35B-A3B (MoE) native MTP capture, TP=4 GPU 0-3,
+#          specbench + bfcl_v4 (qwen25 parser).
+# ============================================================
+name: rr_qwen35_35b_mtp_capture_p1
+
+model_preset: qwen35_35b_mtp
+
+stage1_steps: 8
+stage1_configs:
+  - topk: 8
+    num_draft_tokens: 16
+
+round_robin:
+  enabled: true
+  capture_full_pool: true
+  batch: 1
+  resume: true
+  context_length: 16384
+
+mem_fraction_static: 0.8
+max_prefill_tokens: 4096
+
+max_per_workload: 20
+
+workloads:
+  - specbench
+  - bfcl_v4
+
+workload_overrides:
+  specbench:
+    max_tokens_override: 4096
+  bfcl_v4:
+    max_iterations: 20
+    include_category: web_search
+
+shards:
+  - id: 0
+    gpu_ids: [0, 1, 2, 3]
+    port: 30006
+    workloads: [specbench, bfcl_v4]
+    tool_call_parser: qwen25
+
+infra:
+  port: 30006
+  gpu_ids: [0, 1, 2, 3]
+
+output:
+  root: simulation/results

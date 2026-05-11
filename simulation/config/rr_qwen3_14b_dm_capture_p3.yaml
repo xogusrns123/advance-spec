@@ -1,0 +1,48 @@
+# ============================================================
+# Pass 3 — STANDALONE draft-model recapture (REPLAY-FIXED).
+# swebench_verified, max=10 (reduced for fast turnaround).
+# ============================================================
+name: rr_qwen3_14b_dm_capture_p3
+
+model_preset: qwen3_14b_dm
+
+stage1_steps: 8
+stage1_configs:
+  - topk: 16
+    num_draft_tokens: 128
+
+round_robin:
+  enabled: true
+  capture_full_pool: true
+  batch: 1
+  resume: true
+  context_length: 131072
+
+mem_fraction_static: 0.3
+max_prefill_tokens: 4096
+
+max_per_workload: 10
+
+workloads:
+  - swebench_verified
+
+workload_overrides:
+  swebench_verified:
+    max_iterations: 250
+    tool_style: minisweagent
+    repos_dir: data/swebench_verified/repos
+
+shards:
+  - id: 2
+    gpu_ids: [2]
+    port: 30002
+    workloads: [swebench_verified]
+    tool_call_parser: qwen3_coder
+    oracle_replay: simulation/results/qwen3_14b/replay_trajectories/swebench_verified.json
+
+infra:
+  port: 30002
+  gpu_ids: [2]
+
+output:
+  root: simulation/results

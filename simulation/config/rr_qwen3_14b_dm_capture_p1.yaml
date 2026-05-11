@@ -1,0 +1,46 @@
+# ============================================================
+# Pass 1 — STANDALONE draft-model recapture (REPLAY-FIXED).
+# specbench, max=20.
+# ============================================================
+name: rr_qwen3_14b_dm_capture_p1
+
+model_preset: qwen3_14b_dm
+
+stage1_steps: 8
+stage1_configs:
+  - topk: 16
+    num_draft_tokens: 128
+
+round_robin:
+  enabled: true
+  capture_full_pool: true
+  batch: 1
+  resume: true
+  context_length: 131072
+
+mem_fraction_static: 0.3
+max_prefill_tokens: 4096
+
+max_per_workload: 20
+
+workloads:
+  - specbench
+
+workload_overrides:
+  specbench:
+    max_tokens_override: 32768
+
+shards:
+  - id: 0
+    gpu_ids: [0]
+    port: 30000
+    workloads: [specbench]
+    tool_call_parser: qwen25
+    oracle_replay: simulation/results/qwen3_14b/replay_trajectories/specbench.json
+
+infra:
+  port: 30000
+  gpu_ids: [0]
+
+output:
+  root: simulation/results

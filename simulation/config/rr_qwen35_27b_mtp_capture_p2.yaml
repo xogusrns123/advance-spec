@@ -1,0 +1,47 @@
+# ============================================================
+# Pass 2 — Qwen3.5-27B (dense) MTP capture, TP=4 GPU 0-3,
+#          swebench_verified (qwen3_coder parser).
+# ============================================================
+name: rr_qwen35_27b_mtp_capture_p2
+
+model_preset: qwen35_27b_mtp
+
+stage1_steps: 8
+stage1_configs:
+  - topk: 8
+    num_draft_tokens: 16
+
+round_robin:
+  enabled: true
+  capture_full_pool: true
+  batch: 1
+  resume: true
+  context_length: 131072
+
+mem_fraction_static: 0.85
+max_prefill_tokens: 4096
+
+max_per_workload: 20
+
+workloads:
+  - swebench_verified
+
+workload_overrides:
+  swebench_verified:
+    max_iterations: 250
+    tool_style: minisweagent
+    repos_dir: data/swebench_verified/repos
+
+shards:
+  - id: 0
+    gpu_ids: [0, 1, 2, 3]
+    port: 30006
+    workloads: [swebench_verified]
+    tool_call_parser: qwen3_coder
+
+infra:
+  port: 30006
+  gpu_ids: [0, 1, 2, 3]
+
+output:
+  root: simulation/results

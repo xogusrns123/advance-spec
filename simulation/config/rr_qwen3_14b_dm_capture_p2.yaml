@@ -1,0 +1,47 @@
+# ============================================================
+# Pass 2 — STANDALONE draft-model recapture (REPLAY-FIXED).
+# bfcl_v4, max=20.
+# ============================================================
+name: rr_qwen3_14b_dm_capture_p2
+
+model_preset: qwen3_14b_dm
+
+stage1_steps: 8
+stage1_configs:
+  - topk: 16
+    num_draft_tokens: 128
+
+round_robin:
+  enabled: true
+  capture_full_pool: true
+  batch: 1
+  resume: true
+  context_length: 131072
+
+mem_fraction_static: 0.3
+max_prefill_tokens: 4096
+
+max_per_workload: 20
+
+workloads:
+  - bfcl_v4
+
+workload_overrides:
+  bfcl_v4:
+    max_iterations: 20
+    include_category: web_search
+
+shards:
+  - id: 1
+    gpu_ids: [1]
+    port: 30001
+    workloads: [bfcl_v4]
+    tool_call_parser: qwen25
+    oracle_replay: simulation/results/qwen3_14b/replay_trajectories/bfcl_v4.json
+
+infra:
+  port: 30001
+  gpu_ids: [1]
+
+output:
+  root: simulation/results

@@ -1,0 +1,51 @@
+# ============================================================
+# Pass 2a — MTP swebench shard A (positions 0-9 of dataset_interleaved).
+#
+# Single TP=2 shard on GPU 0,1. Sharded version of swebench capture
+# for parallel speed (paired with p2b on GPU 2,3 handling positions
+# 10-19). Resume picks up the 3 questions already captured under the
+# previous (unsplit) run.
+# ============================================================
+name: rr_qwen35_9b_mtp_capture_p2a
+
+model_preset: qwen35_9b_mtp
+
+stage1_steps: 8
+stage1_configs:
+  - topk: 8
+    num_draft_tokens: 16
+
+round_robin:
+  enabled: true
+  capture_full_pool: true
+  batch: 1
+  resume: true
+  context_length: 262144
+
+mem_fraction_static: 0.55
+max_prefill_tokens: 4096
+
+max_per_workload: 10
+
+workloads:
+  - swebench_verified_a
+
+workload_overrides:
+  swebench_verified_a:
+    max_iterations: 250
+    tool_style: minisweagent
+    repos_dir: data/swebench_verified/repos
+
+shards:
+  - id: 0
+    gpu_ids: [0, 1]
+    port: 30004
+    workloads: [swebench_verified_a]
+    tool_call_parser: qwen3_coder
+
+infra:
+  port: 30004
+  gpu_ids: [0, 1]
+
+output:
+  root: simulation/results

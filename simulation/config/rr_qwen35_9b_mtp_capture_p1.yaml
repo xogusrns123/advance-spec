@@ -1,0 +1,71 @@
+# ============================================================
+# Pass 1 — Qwen3.5-9B native MTP capture (TP=2, GPU 2-3),
+#          specbench + bfcl_v4 (qwen25 parser).
+#
+# Differences vs rr_qwen35_9b.yaml (the legacy baseline):
+#   - Single shard on GPU 2,3 (TP=2) instead of two TP=2 shards.
+#   - capture_full_pool=true (was false) — needed for reslicing.
+#   - num_draft_tokens=128 (matches eagle3 capture knobs for
+#     calibration parity; was 128 in legacy too).
+#   - max_tokens_override removed where possible (use native cap).
+#
+# Natural decoding (NO oracle_replay) per user direction —
+# Qwen3.5-9B generates its own trajectory; eagle3 calibration
+# comparison accepts trajectory drift.
+#
+# After p1 finishes, run _p2.yaml for swebench_verified.
+# ============================================================
+name: rr_qwen35_9b_mtp_capture_p1
+
+model_preset: qwen35_9b_mtp
+
+stage1_steps: 8
+stage1_configs:
+  - topk: 8
+    num_draft_tokens: 16    # 9B target on 4090 TP=2: target_forward scales
+                             # with num_draft_tokens (every draft token
+                             # processed even though vanilla mode forces 0
+                             # accepts). 128 was wasteful (~3.4 tok/s);
+                             # 16 gives 8x speedup while keeping enough
+                             # truncated-tree nodes per step for usable
+                             # calibration trial counts. Full pool still
+                             # captured for offline reslicing if needed.
+
+round_robin:
+  enabled: true
+  capture_full_pool: true
+  batch: 1
+  resume: true
+  context_length: 262144
+
+# Cap each workload at 20 captured questions (vanilla mode is slow on 4090
+# TP=2 ~3.4 tok/s, so a full capture would take days).
+max_per_workload: 20
+
+mem_fraction_static: 0.55
+max_prefill_tokens: 4096
+
+workloads:
+  - specbench
+  - bfcl_v4
+
+workload_overrides:
+  specbench:
+    max_tokens_override: 32768
+  bfcl_v4:
+    max_iterations: 20
+    include_category: web_search
+
+shards:
+  - id: 0
+    gpu_ids: [2, 3]
+    port: 30002
+    workloads: [specbench, bfcl_v4]
+    tool_call_parser: qwen25
+
+infra:
+  port: 30002
+  gpu_ids: [2, 3]
+
+output:
+  root: simulation/results
