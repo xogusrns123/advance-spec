@@ -111,32 +111,40 @@ def _load_trajectory(path: str) -> dict[str, list[int]]:
 
 
 class TrajectoryState:
+    """Force-replay state.
+
+    Strategy: concatenate ALL trajectories into one long forced sequence.
+    Every replay call returns the next token from this global sequence,
+    regardless of req_id. This guarantees deterministic forced output even
+    when the agent makes many short calls (each with its own SGLang rid)
+    that exhausts FIFO matching prematurely.
+
+    KV cache safety: SGLang's decode loop appends the committed token to
+    `req.output_ids` and uses it as the next forward's input. Overriding
+    the committed token before the next forward means KV[N] is computed
+    from the *forced* token, so attention at N+1 sees a self-consistent
+    context. The model's prediction quality drops (forced sequence may not
+    match what 0.6B would naturally produce) but that's exactly what we
+    want: calibrate the draft against eagle3's trajectory tokens.
+    """
+
     def __init__(self, trajectories: dict[str, list[int]]):
+        # Flatten all trajectories into one global force sequence.
+        # Sorted-by-key for determinism; concatenation order doesn't matter
+        # for calibration since we just need many (context, gt) tuples.
+        seq: list[int] = []
+        for k in sorted(trajectories.keys()):
+            seq.extend(trajectories[k])
+        self.full_sequence = seq
+        self.global_pos = 0
+        # Kept for log message compat (`Oracle REPLAY: N trajectories`).
         self.trajectories = trajectories
-        self.positions: dict[str, int] = {}
-        self._rid_map: dict[str, str] = {}  # new_rid → original_rid
-        # Deterministic FIFO queue of unmatched trajectory keys (sorted)
-        self._unmatched_queue: list[str] = sorted(trajectories.keys())
 
     def get_next_token(self, req_id: str) -> int | None:
-        orig_rid = self._rid_map.get(req_id)
-
-        # Unknown rid: assign next unmatched trajectory
-        if orig_rid is None:
-            if self._unmatched_queue:
-                orig_rid = self._unmatched_queue.pop(0)
-                self._rid_map[req_id] = orig_rid
-            else:
-                return None
-
-        traj = self.trajectories.get(orig_rid)
-        if traj is None:
+        if self.global_pos >= len(self.full_sequence):
             return None
-        pos = self.positions.get(orig_rid, 0)
-        if pos >= len(traj):
-            return None
-        token = traj[pos]
-        self.positions[orig_rid] = pos + 1
+        token = self.full_sequence[self.global_pos]
+        self.global_pos += 1
         return token
 
 
@@ -332,8 +340,15 @@ def _install_draft_p_t_tracer() -> None:
     positions by cumulative path probability. We compute those same
     probabilities alongside, via torch.gather on the same flat score_list
     concatenation, and stash them so patched_draft can use them per-request.
+
+    Patches all three module bindings (eagle_worker, multi_layer_eagle_worker,
+    eagle_utils) so EAGLE3 / MTP / STANDALONE workers all hit the traced
+    function. Stash always goes to ew_module (eagle_worker) for a single
+    canonical read site in _patch_draft_stash.
     """
     import sglang.srt.speculative.eagle_worker as ew_module
+    import sglang.srt.speculative.multi_layer_eagle_worker as mtp_module
+    import sglang.srt.speculative.eagle_utils as eu_module
     if getattr(ew_module, "_oracle_organize_traced", False):
         return
     original = ew_module.organize_draft_results
@@ -430,8 +445,13 @@ def _install_draft_p_t_tracer() -> None:
         return parent_list, top_scores_index, draft_tokens
 
     ew_module.organize_draft_results = traced
+    mtp_module.organize_draft_results = traced
+    eu_module.organize_draft_results = traced
     ew_module._oracle_organize_traced = True
-    logger.info("Installed EAGLE3 draft-p_t tracer on organize_draft_results")
+    logger.info(
+        "Installed draft-p_t tracer on organize_draft_results "
+        "(eagle_worker + multi_layer_eagle_worker + eagle_utils bindings; "
+        "covers EAGLE3 / MTP / STANDALONE)")
 
 
 # ---------------------------------------------------------------------------
@@ -439,10 +459,18 @@ def _install_draft_p_t_tracer() -> None:
 # ---------------------------------------------------------------------------
 
 def _detect_proposer_type(eagle_worker) -> str:
-    """Detect whether the worker is EAGLE3 or MTP."""
+    """Detect proposer type from the worker class name.
+
+    Returns one of: 'mtp', 'draft_model', 'eagle3'.
+    - MultiLayerEagleWorker → 'mtp' (NEXTN / native MTP head)
+    - StandaloneWorker      → 'draft_model' (e.g. Qwen3-0.6B as draft for Qwen3-14B)
+    - EAGLEWorker           → 'eagle3' (default fallback for both EAGLE and EAGLE3)
+    """
     cls_name = type(eagle_worker).__name__
     if "MultiLayer" in cls_name:
         return "mtp"
+    if "Standalone" in cls_name:
+        return "draft_model"
     return "eagle3"
 
 
@@ -458,10 +486,16 @@ def patch_eagle_worker_full(eagle_worker: "EAGLEWorker") -> None:
     """
     eagle_worker._oracle_proposer_type = _detect_proposer_type(eagle_worker)
     replay_state = None
-    if ORACLE_REPLAY_PATH:
-        trajectory = _load_trajectory(ORACLE_REPLAY_PATH)
+    # Read env at PATCH TIME, not module-import time. The env var is set by
+    # the orchestrator (run_experiment.py) before subprocess.Popen, but the
+    # module-level constant ORACLE_REPLAY_PATH may be stale if oracle_patch
+    # was imported earlier (transitively via sglang internals) before the
+    # env was injected. Re-reading here guarantees we see the runtime value.
+    replay_path = os.environ.get("SGLANG_ORACLE_REPLAY", "") or ORACLE_REPLAY_PATH
+    if replay_path:
+        trajectory = _load_trajectory(replay_path)
         replay_state = TrajectoryState(trajectory)
-        logger.info(f"Oracle REPLAY: {len(trajectory)} trajectories")
+        logger.info(f"Oracle REPLAY: {len(trajectory)} trajectories from {replay_path}")
 
     # Override draft budget if requested (for latency measurement)
     if ORACLE_DRAFT_BUDGET:
@@ -477,6 +511,11 @@ def patch_eagle_worker_full(eagle_worker: "EAGLEWorker") -> None:
     if os.environ.get("SGLANG_LATENCY_ONLY", "0") == "1":
         _setup_latency_only(eagle_worker)
         return
+
+    # Stash for patched_verify (which needs replay state to override
+    # res.verified_id / res.draft_input.verified_id BEFORE the outer
+    # forward calls forward_draft_extend_after_decode).
+    eagle_worker._oracle_replay_state = replay_state
 
     _patch_verify_greedy_func()
     _patch_draft_stash(eagle_worker)
@@ -736,6 +775,49 @@ def _patch_verify_logits(eagle_worker: "EAGLEWorker",
                 getattr(_res, "accept_length_per_req_cpu", []) or [])
         except Exception:
             eagle_worker._oracle_last_accept_lengths = []
+
+        # REPLAY override at verify-output level. Must happen here (not
+        # in patched_forward) because forward_batch_generation calls
+        # forward_draft_extend_after_decode AFTER verify but BEFORE the
+        # outer forward returns, and that uses batch.spec_info.verified_id
+        # (= res.draft_input.verified_id) to seed the next draft chain.
+        # If we override only at the outer level, draft sees the natural
+        # argmax for the next step and predictions diverge from trajectory.
+        replay = getattr(eagle_worker, "_oracle_replay_state", None)
+        if replay is not None:
+            try:
+                _, _res, _, _ = result
+                accept_lens = list(
+                    getattr(_res, "accept_length_per_req_cpu", []) or [])
+                vid = getattr(_res, "verified_id", None)
+                if vid is not None and accept_lens:
+                    v_offset = 0
+                    for i, alen in enumerate(accept_lens):
+                        n_tokens = alen + 1
+                        req = batch.reqs[i] if i < len(batch.reqs) else None
+                        rid = getattr(req, "rid", str(i)) if req else str(i)
+                        for j in range(n_tokens):
+                            forced = replay.get_next_token(rid)
+                            if forced is None:
+                                break
+                            try:
+                                vid[v_offset + j] = forced
+                            except Exception:
+                                pass
+                            # Also keep req.output_ids in sync (the verify
+                            # path appends committed tokens later).
+                            if req and req.output_ids:
+                                req.output_ids[-1] = forced
+                        v_offset += n_tokens
+                    # Mirror to draft_input.verified_id (next-step seed).
+                    di = getattr(_res, "draft_input", None)
+                    if di is not None:
+                        di_vid = getattr(di, "verified_id", None)
+                        if di_vid is not None and di_vid.numel() == vid.numel():
+                            di_vid.copy_(vid)
+            except Exception as _e:
+                logger.warning(f"REPLAY verify-override failed: {_e}")
+
         return result
 
     eagle_worker.verify = patched_verify
@@ -788,17 +870,11 @@ def _patch_forward_log(
 
         tp_rank = getattr(eagle_worker, "tp_rank", 0)
 
-        # Replay: override tokens on ALL TP ranks to keep them in sync
-        if replay_state is not None and is_decode:
-            accept_lengths_r = getattr(result, "accept_length_per_req_cpu", None)
-            if accept_lengths_r:
-                num_reqs_r = len(accept_lengths_r)
-                for i in range(num_reqs_r):
-                    req = batch.reqs[i] if i < len(batch.reqs) else None
-                    req_id = getattr(req, "rid", str(i)) if req else str(i)
-                    forced = replay_state.get_next_token(req_id)
-                    if forced is not None and req and req.output_ids:
-                        req.output_ids[-1] = forced
+        # NOTE: REPLAY override happens in patched_verify (earlier in
+        # the call chain). Don't double-override here — that would consume
+        # extra trajectory tokens. result.next_token_ids was already
+        # overridden by reference inside patched_verify (since it's the
+        # same tensor as res.verified_id).
 
         # Only log on TP rank 0
         if tp_rank != 0:
@@ -835,6 +911,14 @@ def _patch_forward_log(
                 # Update vanilla_token for logging (already overridden above)
                 if replay_state is not None and req and req.output_ids:
                     vanilla_token = req.output_ids[-1]
+                # DEBUG: log first 3 logged tokens to compare with override
+                _seen_log = getattr(eagle_worker, "_oracle_log_dbg", 0)
+                if _seen_log < 3:
+                    logger.info(
+                        f"LOG DEBUG: vanilla_token={vanilla_token}, "
+                        f"req_accepted[0]={req_accepted[0] if req_accepted else None}, "
+                        f"output_ids[-1]={req.output_ids[-1] if req and req.output_ids else None}")
+                    eagle_worker._oracle_log_dbg = _seen_log + 1
 
                 # draft_token layout: [root_verified, draft_0, draft_1, ...]
                 # root_verified is the previous step's token, skip it

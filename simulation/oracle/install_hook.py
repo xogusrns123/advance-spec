@@ -181,6 +181,13 @@ def install_oracle_patch() -> None:
         "MultiLayerEagleWorker",
     )
 
+    # Patch StandaloneWorker (STANDALONE algorithm) — does NOT call super().__init__()
+    # so eagle_worker.py injection alone misses it. Inject directly.
+    _inject_oracle_into_worker(
+        root / "srt" / "speculative" / "standalone_worker.py",
+        "StandaloneWorker",
+    )
+
 
 NEW_ORACLE_IMPORT = "from simulation.oracle.oracle_patch import patch_eagle_worker_full"
 OLD_ORACLE_IMPORT = (
