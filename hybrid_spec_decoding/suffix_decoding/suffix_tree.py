@@ -11,8 +11,9 @@ Install: uv pip install arctic-inference
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Hashable, Optional, Sequence
+from typing import Hashable, Iterator, Optional, Sequence
 
 from arctic_inference.suffix_decoding import SuffixDecodingCache as _NativeCache
 from arctic_inference.suffix_decoding.cache import SuffixDecodingDraft
@@ -74,10 +75,12 @@ class SuffixDecodingCache:
         max_spec_offset: float = 0.0,
         min_token_prob: float = 0.1,
         use_tree_spec: bool = True,
+        enable_undo: bool = False,
     ):
         self._cache = _NativeCache(
             max_tree_depth=max_tree_depth,
             max_cached_requests=max_cached_requests,
+            enable_undo=enable_undo,
         )
         self.max_tree_depth = max_tree_depth
         self.max_spec_tokens = max_spec_tokens
@@ -85,6 +88,7 @@ class SuffixDecodingCache:
         self.max_spec_offset = max_spec_offset
         self.min_token_prob = min_token_prob
         self.use_tree_spec = use_tree_spec
+        self.enable_undo = enable_undo
 
     def start_request(
         self,
@@ -135,3 +139,31 @@ class SuffixDecodingCache:
     def evict_cached_response(self, req_id: Hashable) -> None:
         """Remove a cached response from the global tree."""
         self._cache.evict_cached_response(req_id)
+
+    def extend_active_response(
+        self,
+        req_id: Hashable,
+        token_ids: Sequence[int],
+    ) -> None:
+        """Reversible append. Pair with pop_active_response. Requires
+        enable_undo=True at construction."""
+        self._cache.extend_active_response(req_id, token_ids)
+
+    def pop_active_response(
+        self,
+        req_id: Hashable,
+        n: Optional[int] = None,
+    ) -> None:
+        """Undo the most recent extend_active_response. Requires enable_undo=True."""
+        self._cache.pop_active_response(req_id, n)
+
+    @contextmanager
+    def temporary_extension(
+        self,
+        req_id: Hashable,
+        token_ids: Sequence[int],
+    ) -> Iterator[None]:
+        """Context manager for atomic extend → speculate → pop. Recommended
+        usage in extension speculation flows."""
+        with self._cache.temporary_extension(req_id, token_ids):
+            yield

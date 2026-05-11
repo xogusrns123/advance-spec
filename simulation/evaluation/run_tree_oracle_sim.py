@@ -209,8 +209,12 @@ def simulate_decoding(
         from hybrid_spec_decoding.suffix_decoding.suffix_tree import (
             SuffixDecodingCache as _FreshCache,
         )
+        # enable_undo=True powers the per-anchor temporary_extension flow
+        # in _extension_step (paths[i] is appended to BOTH local & global
+        # trees, speculate runs, then pop reverses both bit-exactly).
         local_cache = _FreshCache(
             max_tree_depth=64, max_cached_requests=100000,
+            enable_undo=True,
         )
     else:
         local_cache = None
@@ -1007,16 +1011,29 @@ def _extension_step(rec: dict, budget: int, suffix_cache, cache_req_id: str,
 
         ext_context = np.array(base_context + paths[node_idx], dtype=np.int32)
 
+        # AB-TEST KNOB: set BENCH_NO_TEMP_EXT=1 to skip the temporary_extension
+        # wrapper (mimics pre-pop behavior — speculate against tree state
+        # that has NOT seen paths[node_idx]). Default behavior uses temp.
+        import os as _os
+        _no_temp = _os.environ.get("BENCH_NO_TEMP_EXT") == "1"
         try:
             _per_kwargs = dict(max_spec_factor=suffix_max_spec_factor,
                                min_token_prob=suffix_min_token_prob,
                                use_tree_spec=True)
             if suffix_max_spec_tokens > 0:
                 _per_kwargs["max_spec_tokens"] = suffix_max_spec_tokens
-            draft = suffix_cache.speculate(
-                cache_req_id, ext_context,
-                **_per_kwargs,
-            )
+            if _no_temp:
+                draft = suffix_cache.speculate(
+                    cache_req_id, ext_context,
+                    **_per_kwargs,
+                )
+            else:
+                with suffix_cache.temporary_extension(
+                        cache_req_id, paths[node_idx]):
+                    draft = suffix_cache.speculate(
+                        cache_req_id, ext_context,
+                        **_per_kwargs,
+                    )
         except Exception:
             continue
 
