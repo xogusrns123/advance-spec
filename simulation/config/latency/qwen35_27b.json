@@ -1,0 +1,117 @@
+{
+  "vanilla_step_ms": 92.1992,
+  "target_forward_ms": {
+    "4": 92.1992,
+    "16": 99.3957,
+    "64": 97.1608,
+    "128": 104.5477,
+    "256": 148.7386
+  },
+  "eagle3_draft_ms": {
+    "4": 10.968,
+    "16": 11.3685,
+    "64": 11.272,
+    "128": 11.272
+  },
+  "eagle3_draft_ms_by_steps": {
+    "2": {
+      "4": 4.55,
+      "16": 4.544,
+      "64": 4.5455
+    },
+    "4": {
+      "4": 10.968,
+      "16": 11.3685,
+      "64": 11.272,
+      "128": 11.272
+    },
+    "6": {
+      "4": 17.4455,
+      "16": 17.3655,
+      "64": 17.0695,
+      "128": 17.0695,
+      "256": 17.0695
+    },
+    "8": {
+      "4": 24.056,
+      "16": 24.8595,
+      "64": 23.6415,
+      "128": 23.6415,
+      "256": 23.6415
+    }
+  },
+  "target_forward_ms_by_topk": {
+    "8": {
+      "4": 92.1992,
+      "16": 99.3957,
+      "64": 97.1608,
+      "128": 104.5477,
+      "256": 148.7386
+    }
+  },
+  "eagle3_draft_ms_by_topk_steps": {
+    "8": {
+      "2": {
+        "4": 4.55,
+        "16": 4.544,
+        "64": 4.5455
+      },
+      "4": {
+        "4": 10.968,
+        "16": 11.3685,
+        "64": 11.272,
+        "128": 11.272
+      },
+      "6": {
+        "4": 17.4455,
+        "16": 17.3655,
+        "64": 17.0695,
+        "128": 17.0695,
+        "256": 17.0695
+      },
+      "8": {
+        "4": 24.056,
+        "16": 24.8595,
+        "64": 23.6415,
+        "128": 23.6415,
+        "256": 23.6415
+      }
+    }
+  },
+  "draft_lm_tpot_ms": null,
+  "suffix_speculate_ms": null,
+  "_metadata": {
+    "target_model": "Qwen/Qwen3.5-27B",
+    "draft_model": "Qwen/Qwen3.5-27B",
+    "draft_lm": null,
+    "canonical_steps": 4,
+    "canonical_topk": 8,
+    "draft_ref_n": 3,
+    "available_topks": [
+      8
+    ],
+    "available_steps": [
+      2,
+      4,
+      6,
+      8
+    ],
+    "available_budgets": [
+      4,
+      16,
+      64,
+      128,
+      256
+    ],
+    "aggregation": "median across workloads (+steps for target_forward_ms)",
+    "source_files": {
+      "eagle3_cost": "/workspace/results/latency/qwen35_27b/eagle3_cost.json",
+      "draft_model_cost": null,
+      "suffix_cost": null
+    }
+  },
+  "_detailed": {
+    "draft_lm_tpot_ms_by_n": {},
+    "suffix_speculate_ms_by_workload": {}
+  }
+}
