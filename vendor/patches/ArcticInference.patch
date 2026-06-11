@@ -1,5 +1,5 @@
 diff --git a/arctic_inference/suffix_decoding/cache.py b/arctic_inference/suffix_decoding/cache.py
-index 2c0cd32..a9d6292 100644
+index 2c0cd32..d41d92b 100644
 --- a/arctic_inference/suffix_decoding/cache.py
 +++ b/arctic_inference/suffix_decoding/cache.py
 @@ -15,8 +15,9 @@
@@ -13,7 +13,33 @@ index 2c0cd32..a9d6292 100644
  
  import numpy as np
  
-@@ -60,7 +61,8 @@ class SuffixDecodingCache:
+@@ -34,6 +35,9 @@ class SuffixDecodingDraft:
+             encode the tree structure. The parent token of token_ids[i] is
+             token_ids[parents[i]].
+         probs (List[float]): List of estimated probabilities for each token.
++        counts (List[int]): For each token, the raw suffix-tree node count
++            (number of suffixes passing through that node) from which
++            ``probs`` were derived.
+         score (float): The overall score of the suffix match computed as the
+             sum of the estimated probabilities of each speculated token.
+         match_len (int): The length of the context match that yielded this
+@@ -42,6 +46,7 @@ class SuffixDecodingDraft:
+     token_ids: List[int] = field(default_factory=list)
+     parents: List[int] = field(default_factory=list)
+     probs: List[float] = field(default_factory=list)
++    counts: List[int] = field(default_factory=list)
+     score: float = 0.0
+     match_len: int = 0
+ 
+@@ -51,6 +56,7 @@ class SuffixDecodingDraft:
+             token_ids=draft.token_ids,
+             parents=draft.parents,
+             probs=draft.probs,
++            counts=draft.counts,
+             score=draft.score,
+             match_len=draft.match_len,
+         )
+@@ -60,7 +66,8 @@ class SuffixDecodingCache:
      
      def __init__(self,
                   max_tree_depth: int = 64,
@@ -23,7 +49,7 @@ index 2c0cd32..a9d6292 100644
          """
          Initialize the SuffixDecodingCache.
  
-@@ -69,15 +71,22 @@ class SuffixDecodingCache:
+@@ -69,15 +76,22 @@ class SuffixDecodingCache:
              max_cached_requests (int, optional): The maximum number of cached
                  requests. Eviction is triggered when the limit is reached. `-1`
                  means no limit on the number of cached requests.
@@ -47,7 +73,7 @@ index 2c0cd32..a9d6292 100644
  
          # Local suffix trees cache prompts for each active request separately.
          self._local_trees = {}
-@@ -90,6 +99,12 @@ class SuffixDecodingCache:
+@@ -90,6 +104,12 @@ class SuffixDecodingCache:
          # Unused sequence ID to assign to a new request ID.
          self._next_seq_id = 0
  
@@ -60,7 +86,7 @@ index 2c0cd32..a9d6292 100644
      @property
      def max_tree_depth(self) -> int:
          return self._max_tree_depth
-@@ -150,7 +165,8 @@ class SuffixDecodingCache:
+@@ -150,7 +170,8 @@ class SuffixDecodingCache:
          else:
              extend_func = SuffixTree.extend
  
@@ -70,7 +96,7 @@ index 2c0cd32..a9d6292 100644
          extend_func(self._local_trees[req_id], 0, prompt_token_ids)
          if self._max_cached_requests != 0:
              # Global cache is enabled.
-@@ -171,10 +187,18 @@ class SuffixDecodingCache:
+@@ -171,10 +192,18 @@ class SuffixDecodingCache:
                  that uniquely identifies the request.
  
          Raises:
@@ -90,7 +116,7 @@ index 2c0cd32..a9d6292 100644
          del self._local_trees[req_id]
  
      def add_active_response(
-@@ -214,6 +238,152 @@ class SuffixDecodingCache:
+@@ -214,6 +243,152 @@ class SuffixDecodingCache:
              seq_id = self._req_to_seq_id[req_id]
              extend_func(self._global_tree, seq_id, token_ids)
  
@@ -243,7 +269,7 @@ index 2c0cd32..a9d6292 100644
      def evict_cached_response(self, req_id: Hashable):
          """
          Evicts the given request's response from the global cache. `req_id` can
-@@ -224,10 +394,16 @@ class SuffixDecodingCache:
+@@ -224,10 +399,16 @@ class SuffixDecodingCache:
                  should be evicted.
  
          Raises:
@@ -261,7 +287,7 @@ index 2c0cd32..a9d6292 100644
          seq_id = self._req_to_seq_id.pop(req_id)
          self._seq_to_req_id.pop(seq_id)
          self._global_tree.remove(seq_id)
-@@ -282,7 +458,7 @@ class SuffixDecodingCache:
+@@ -282,7 +463,7 @@ class SuffixDecodingCache:
              spec_func = SuffixTree.speculate
  
          if max_spec_tokens is None:
@@ -271,10 +297,16 @@ index 2c0cd32..a9d6292 100644
          if len(context) > self._max_tree_depth:
              context = context[-self._max_tree_depth :]
 diff --git a/csrc/suffix_decoding/bindings.cc b/csrc/suffix_decoding/bindings.cc
-index b1d058c..549761c 100644
+index b1d058c..c229132 100644
 --- a/csrc/suffix_decoding/bindings.cc
 +++ b/csrc/suffix_decoding/bindings.cc
-@@ -88,12 +88,17 @@ NB_MODULE(_C, m) {
+@@ -83,17 +83,23 @@ NB_MODULE(_C, m) {
+         .def_rw("token_ids", &Draft::token_ids)
+         .def_rw("parents", &Draft::parents)
+         .def_rw("probs", &Draft::probs)
++        .def_rw("counts", &Draft::counts)
+         .def_rw("score", &Draft::score)
+         .def_rw("match_len", &Draft::match_len);
  
      nb::class_<SuffixTree>(m, "SuffixTree")
          .def(nb::init<int>())
@@ -293,7 +325,7 @@ index b1d058c..549761c 100644
          .def("speculate", &speculate_vector)
          .def("speculate_ndarray", &speculate_ndarray)
 diff --git a/csrc/suffix_decoding/suffix_tree.cc b/csrc/suffix_decoding/suffix_tree.cc
-index 3023983..f1b315b 100644
+index 3023983..88a0157 100644
 --- a/csrc/suffix_decoding/suffix_tree.cc
 +++ b/csrc/suffix_decoding/suffix_tree.cc
 @@ -16,8 +16,10 @@
@@ -944,8 +976,24 @@ index 3023983..f1b315b 100644
  }
  
  Draft SuffixTree::speculate(std::span<const int32_t> context,
+@@ -834,6 +1339,7 @@ Draft SuffixTree::_speculate_path(Node* node, int idx,
+             ret.parents.push_back(static_cast<int>(ret.token_ids.size()) - 1);
+             ret.token_ids.push_back(ref_data[idx]);
+             ret.probs.push_back(prob);
++            ret.counts.push_back(node->count);
+             ret.score += prob;
+             idx++;
+         } else {
+@@ -885,6 +1391,7 @@ Draft SuffixTree::_speculate_tree(Node* node, int idx,
+             ret.token_ids.push_back(token);
+             ret.parents.push_back(it.parent);
+             ret.probs.push_back(it.prob);
++            ret.counts.push_back(it.node->count);
+             ret.score += it.prob;
+             queue.emplace(it.prob, it.node, it.idx + 1,
+                           static_cast<int>(ret.token_ids.size()) - 1);
 diff --git a/csrc/suffix_decoding/suffix_tree.h b/csrc/suffix_decoding/suffix_tree.h
-index 6d642fa..9df0557 100644
+index 6d642fa..bac8e9b 100644
 --- a/csrc/suffix_decoding/suffix_tree.h
 +++ b/csrc/suffix_decoding/suffix_tree.h
 @@ -16,10 +16,12 @@
@@ -961,7 +1009,19 @@ index 6d642fa..9df0557 100644
  #include <vector>
  
  #include "int32_map.h"
-@@ -116,10 +118,112 @@ struct Draft {
+@@ -109,6 +111,11 @@ struct Draft {
+     // For each token, the estimated probability of the token.
+     std::vector<float> probs;
+ 
++    // For each token, the raw suffix-tree count of the node that produced it
++    // (Node::count: number of suffixes passing through that node). Lets
++    // callers recover the underlying frequency from which probs were derived.
++    std::vector<int64_t> counts;
++
+     // Floating point score of the draft (sum of all probs).
+     float score = 0.0;
+ 
+@@ -116,10 +123,112 @@ struct Draft {
      int match_len = 0;
  };
  
@@ -1074,7 +1134,7 @@ index 6d642fa..9df0557 100644
  
      int num_seqs() const {
          return static_cast<int>(_seqs.size());
-@@ -134,6 +238,20 @@ public:
+@@ -134,6 +243,20 @@ public:
      // Remove the sequence with id seq_id.
      void remove(int seq_id);
  
@@ -1095,7 +1155,7 @@ index 6d642fa..9df0557 100644
      // Given a context, speculate the next tokens using the suffix tree.
      Draft speculate(std::span<const int32_t> context,
                      int max_spec_tokens,
-@@ -155,6 +273,11 @@ private:
+@@ -155,6 +278,11 @@ private:
      // Maximum depth of the suffix tree.
      int _max_depth;
  
@@ -1107,7 +1167,7 @@ index 6d642fa..9df0557 100644
      // The root node of the suffix tree.
      std::unique_ptr<Node> _root;
  
-@@ -167,6 +290,10 @@ private:
+@@ -167,6 +295,10 @@ private:
      // most _max_depth iterations before being removed.
      Int32Map<std::deque<Node*>> _active_nodes;
  
