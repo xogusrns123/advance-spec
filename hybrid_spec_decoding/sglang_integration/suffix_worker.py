@@ -72,6 +72,21 @@ class SuffixWorker:
             max_tree_depth=64,
             max_cached_requests=100000,
         )
+
+        # Chain mode (SGLANG_SUFFIX_CHAIN=1): top-1 path speculation
+        # (use_tree_spec=False) with no artificial length cap — the draft
+        # length is bounded only by the trie match (match_len x factor)
+        # and the verify tensor size (draft_token_num - 1).
+        self.suffix_chain = _os.environ.get("SGLANG_SUFFIX_CHAIN", "0") == "1"
+        self.suffix_factor = float(
+            _os.environ.get("SGLANG_SUFFIX_FACTOR", "4.0"))
+        self.suffix_min_p = float(
+            _os.environ.get("SGLANG_SUFFIX_MIN_P", "0.0"))
+        if self.suffix_chain:
+            logger.info(
+                f"SuffixWorker CHAIN mode: top-1 path spec, "
+                f"max_spec_tokens={self.draft_token_num - 1}, "
+                f"factor={self.suffix_factor}, min_p={self.suffix_min_p}")
         # Track active requests for start/stop lifecycle
         self._active_requests: set[str] = set()
 
@@ -80,13 +95,18 @@ class SuffixWorker:
             f"SuffixWorker initialized (draft_token_num={self.draft_token_num})"
         )
 
-        # Oracle verify patch: replace speculation with pre-built union tries
-        from simulation.oracle.oracle_verify_patch import (
-            is_verify_tries_enabled,
-            patch_suffix_worker_for_verify,
-        )
-        if is_verify_tries_enabled():
-            patch_suffix_worker_for_verify(self)
+        # Oracle verify patch: replace speculation with pre-built union tries.
+        # The module is not shipped on all branches — skip silently if absent.
+        try:
+            from simulation.oracle.oracle_verify_patch import (
+                is_verify_tries_enabled,
+                patch_suffix_worker_for_verify,
+            )
+        except ImportError:
+            pass
+        else:
+            if is_verify_tries_enabled():
+                patch_suffix_worker_for_verify(self)
 
     def clear_cache_pool(self):
         self.suffix_cache = SuffixDecodingCache(
@@ -246,13 +266,22 @@ class SuffixWorker:
 
             # Speculate (but IGNORE the result — use fallback only)
             try:
-                draft = self.suffix_cache.speculate(
-                    req_id, context, max_spec_tokens=D
-                )
+                if self.suffix_chain:
+                    draft = self.suffix_cache.speculate(
+                        req_id, context,
+                        max_spec_tokens=D - 1,
+                        max_spec_factor=self.suffix_factor,
+                        min_token_prob=self.suffix_min_p,
+                        use_tree_spec=False,
+                    )
+                else:
+                    draft = self.suffix_cache.speculate(
+                        req_id, context, max_spec_tokens=D
+                    )
                 token_ids = list(draft.token_ids)
                 parents = list(draft.parents)
                 if token_ids:
-                    logger.warning(
+                    logger.debug(
                         f"SUFFIX DRAFT req={req_id}: "
                         f"n_tokens={len(token_ids)}, "
                         f"token_ids={token_ids[:8]}, "
@@ -370,6 +399,7 @@ class SuffixWorker:
         spec_info = model_worker_batch.spec_info
         num_accepted_tokens = 0
         accept_lens = None
+        accept_length_per_req_cpu = None
 
         if model_worker_batch.forward_mode.is_target_verify():
             if batch.has_grammar:
@@ -407,6 +437,7 @@ class SuffixWorker:
                 batch, logits_output, self.page_size, vocab_mask
             )
             accept_lens = verify_input.accept_length
+            accept_length_per_req_cpu = verify_input.accept_length.cpu().tolist()
             if batch.return_logprob:
                 add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
             self._finalize_completed_requests(batch)
@@ -426,6 +457,7 @@ class SuffixWorker:
             logits_output=logits_output,
             next_token_ids=next_token_ids,
             num_accepted_tokens=num_accepted_tokens,
+            accept_length_per_req_cpu=accept_length_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
             accept_lens=accept_lens,
         )

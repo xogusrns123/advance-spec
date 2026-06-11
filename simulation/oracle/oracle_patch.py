@@ -505,6 +505,14 @@ def patch_eagle_worker_full(eagle_worker: "EAGLEWorker") -> None:
         eagle_worker.server_args.speculative_num_draft_tokens = budget
         logger.info(f"Oracle DRAFT BUDGET override: {original} → {budget}")
 
+    # CHAIN-HYBRID mode: per-depth eagle3+suffix online construction
+    # (chain_hybrid_patch). Installed BEFORE the latency-only wrappers so
+    # the suffix lookup + decision overhead lands inside eagle3_draft_ms /
+    # step_total_ms. Requires SGLANG_LATENCY_ONLY=1 (validated inside).
+    if os.environ.get("SGLANG_CHAIN_HYBRID", "0") == "1":
+        from .chain_hybrid_patch import patch_chain_hybrid
+        patch_chain_hybrid(eagle_worker)
+
     # LATENCY-ONLY mode: pure timing instrumentation. No force-accept, no
     # tree/p_t extraction — server runs REAL speculative decoding so target
     # actually commits accepted draft tokens. Used by measure_eagle3_cost.py.
