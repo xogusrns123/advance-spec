@@ -1,0 +1,59 @@
+# ============================================================
+# Round-Robin Stage 1 capture — Qwen3.5-27B native MTP,
+# steps=16 topk=1 (chain), TP=4 GPU 0-3.
+#
+# Purpose: chain hand-off oracle analysis at chain length 16.
+# topk=1 = deployable single chain; ndt=17 so eagle3_tree (= MTP
+# chain — see project_eagle_label_means_mtp) is the full 16-chain
+# even without the full-pool tracer.
+#
+# bfcl_v4 web_search only, 10 tasks.
+#
+# Run with:
+#   docker exec -u root -d sglang-bench bash -c \
+#     "cd /workspace && python3 simulation/scripts/run_experiment.py \
+#       simulation/config/rr_qwen35_27b_mtp_s16k1_capture.yaml \
+#       > /tmp/rr_s16k1_27b.log 2>&1"
+# ============================================================
+name: rr_qwen35_27b_mtp_s16k1_capture
+
+model_preset: qwen35_27b_mtp
+
+stage1_steps: 16
+stage1_configs:
+  - topk: 1
+    num_draft_tokens: 17
+
+round_robin:
+  enabled: true
+  capture_full_pool: true
+  batch: 1
+  resume: true
+  context_length: 131072
+
+mem_fraction_static: 0.85
+max_prefill_tokens: 4096
+
+max_per_workload: 10
+
+workloads:
+  - bfcl_v4
+
+workload_overrides:
+  bfcl_v4:
+    max_iterations: 20
+    include_category: web_search
+
+shards:
+  - id: 0
+    gpu_ids: [0, 1, 2, 3]
+    port: 30006
+    workloads: [bfcl_v4]
+    tool_call_parser: qwen25
+
+infra:
+  port: 30006
+  gpu_ids: [0, 1, 2, 3]
+
+output:
+  root: simulation/results

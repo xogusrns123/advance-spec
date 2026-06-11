@@ -1,0 +1,49 @@
+# ============================================================
+# Round-Robin Stage 1 capture — qwen3_14b, steps=16 topk=1 (chain).
+#
+# Purpose: chain hand-off oracle analysis at chain length 16
+# (see project_chain_handoff_oracle memory). topk=1 = deployable
+# single chain; ndt=17 so the truncated eagle3_tree itself is the
+# full 16-chain even if the full-pool tracer is inactive in chain
+# mode (double safety — pool with K=1 is only 16 entries anyway).
+#
+# bfcl_v4 web_search only, 10 tasks.
+#
+# Run with:
+#   docker exec -u root -d sglang-bench bash -c \
+#     "cd /workspace && python3 simulation/scripts/run_experiment.py \
+#       simulation/config/rr_qwen3_14b_s16k1_capture.yaml \
+#       > /tmp/rr_s16k1_14b.log 2>&1"
+# ============================================================
+name: rr_qwen3_14b_s16k1_capture_smoke
+
+model_preset: qwen3_14b
+
+stage1_steps: 16
+stage1_configs:
+  - topk: 1
+    num_draft_tokens: 17
+
+round_robin:
+  enabled: true
+  capture_full_pool: true
+  batch: 1
+  resume: true
+  context_length: 131072
+
+max_per_workload: 1
+
+workloads:
+  - bfcl_v4
+
+workload_overrides:
+  bfcl_v4:
+    max_iterations: 20
+    include_category: web_search
+
+infra:
+  port: 30010
+  gpu_ids: [2, 3]  # tp2 — Qwen3-14B bf16 (28GB) does not fit one 24GB 4090
+
+output:
+  root: simulation/results
