@@ -30,6 +30,7 @@ class SuffixDraft:
     token_ids: list[int] = field(default_factory=list)
     parents: list[int] = field(default_factory=list)   # -1 = child of context
     probs: list[float] = field(default_factory=list)
+    counts: list[int] = field(default_factory=list)
     score: float = 0.0
     match_len: int = 0
 
@@ -39,6 +40,7 @@ class SuffixDraft:
             token_ids=list(draft.token_ids),
             parents=list(draft.parents),
             probs=list(draft.probs),
+            counts=list(getattr(draft, "counts", []) or []),
             score=draft.score,
             match_len=draft.match_len,
         )

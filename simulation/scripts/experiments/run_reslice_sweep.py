@@ -167,7 +167,13 @@ def main():
         if args.in_docker:
             inner = " ".join(shlex.quote(a) for a in cmd_inner)
             sim_par = os.environ.get("SIM_PARALLEL", "1")
-            wrapped = (f"cd {DOCKER_ROOT} && SIM_PARALLEL={sim_par} timeout {args.timeout_sec} "
+            # Pass through optional env vars used by the simulator.
+            env_passthrough = f"SIM_PARALLEL={sim_par}"
+            for ev in ("EXTENSION_BREAKDOWN", "BREAKDOWN_BEST_CONFIGS", "BENCH_NO_TEMP_EXT"):
+                v = os.environ.get(ev)
+                if v is not None:
+                    env_passthrough += f" {ev}={shlex.quote(v)}"
+            wrapped = (f"cd {DOCKER_ROOT} && {env_passthrough} timeout {args.timeout_sec} "
                        f"{inner} > /tmp/sim_{args.workload}_{tag}_full.log 2>&1")
             cmd = ["docker", "exec", args.docker_name, "bash", "-c", wrapped]
         else:

@@ -53,7 +53,7 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -73,7 +73,10 @@ def _accumulate_per_node(tids: List[int], pids: List[int],
                            confs: List[float], gt: list,
                            n_bins: int,
                            trials: List[int],
-                           accepts: List[int]) -> int:
+                           accepts: List[int],
+                           trials_by_depth: Optional[List[List[int]]] = None,
+                           accepts_by_depth: Optional[List[List[int]]] = None,
+                           max_depth_track: int = 16) -> int:
     """Per-NODE binning (original EAGLE-2 Fig.6 strict semantics).
     Each draft node is a separate trial when its parent path matches gt.
     Accept iff token[n] == gt[d-1]. Bin by node's own conf.
@@ -81,6 +84,11 @@ def _accumulate_per_node(tids: List[int], pids: List[int],
     Used for per_step and path_prob axes — granular per-node calibration
     where high-conf bins concentrate the 'right' candidates and show
     near-diagonal calibration.
+
+    When ``trials_by_depth`` / ``accepts_by_depth`` (2-D, shape
+    [max_depth_track][n_bins]) are provided, additionally bump
+    ``[d-1][bin_idx]`` for every trial with ``1 <= d <= max_depth_track``.
+    Lets downstream slice calibration per depth.
     """
     n = len(tids)
     if n == 0 or not gt:
@@ -127,8 +135,15 @@ def _accumulate_per_node(tids: List[int], pids: List[int],
             bin_idx = n_bins - 1
         trials[bin_idx] += 1
         n_added += 1
-        if int(tids[i]) == int(gt[d - 1]):
+        is_accept = int(tids[i]) == int(gt[d - 1])
+        if is_accept:
             accepts[bin_idx] += 1
+        if (trials_by_depth is not None
+                and accepts_by_depth is not None
+                and 1 <= d <= max_depth_track):
+            trials_by_depth[d - 1][bin_idx] += 1
+            if is_accept:
+                accepts_by_depth[d - 1][bin_idx] += 1
     return n_added
 
 
@@ -210,6 +225,59 @@ def _accumulate_per_depth_group(tids: List[int], pids: List[int],
         if any(int(tids[c]) == gt_tok for c in siblings):
             accepts[bin_idx] += 1
     return n_added
+
+
+def _accumulate_per_draft_mat(tids: List[int], pids: List[int],
+                              score_raw: float, gt: list,
+                              n_bins: int, score_max: float,
+                              n_drafts: List[int],
+                              sum_accept_length: List[int]) -> int:
+    """Per-DRAFT MAT (mean accepted tokens) accumulation.
+
+    One trial = one draft tree at one step. Bin by raw draft score
+    (clamped to [0, score_max]). Accumulate the *accept_length* — the
+    number of consecutive tokens the greedy tree walk accepts. The
+    per-bin MAT = sum_accept_length[bin] / n_drafts[bin] reports the
+    expected accepted-token-per-step at that score level — directly
+    interpretable as speculative-decoding throughput contribution.
+
+    Stored under the legacy `trials`/`accepts` fields for plumbing
+    compatibility (notebook reads `accepts/trials` and gets MAT).
+    """
+    if not tids or not gt:
+        return 0
+    s = float(score_raw)
+    if s != s:  # NaN guard
+        return 0
+    if s < 0.0:
+        s = 0.0
+    elif s > score_max:
+        s = score_max
+    bin_idx = int(s / score_max * n_bins) if score_max > 0 else 0
+    if bin_idx >= n_bins:
+        bin_idx = n_bins - 1
+
+    # Greedy tree walk: count consecutive ground-truth matches.
+    accept_length = 0
+    node = -1
+    children_by_parent: Dict[int, List[int]] = {}
+    for i in range(len(pids)):
+        children_by_parent.setdefault(pids[i], []).append(i)
+    for gt_tok in gt:
+        children = children_by_parent.get(node, [])
+        matched = False
+        for c in children:
+            if int(tids[c]) == int(gt_tok):
+                accept_length += 1
+                node = c
+                matched = True
+                break
+        if not matched:
+            break
+
+    n_drafts[bin_idx] += 1
+    sum_accept_length[bin_idx] += accept_length
+    return 1
 
 
 # Backwards-compat alias (legacy unit tests). Routes to depth-group, the
@@ -311,6 +379,17 @@ def main():
     trials = {m: {ax: [0] * n_bins for ax in axes} for m in methods}
     accepts = {m: {ax: [0] * n_bins for ax in axes} for m in methods}
 
+    # Depth-split counters for per_step + path_prob axes only (score is
+    # per-DRAFT scalar, has no per-node depth).
+    MAX_DEPTH_TRACK = 16
+    depth_axes = ("per_step", "path_prob")
+    trials_by_depth = {
+        m: {ax: [[0] * n_bins for _ in range(MAX_DEPTH_TRACK)]
+            for ax in depth_axes} for m in methods}
+    accepts_by_depth = {
+        m: {ax: [[0] * n_bins for _ in range(MAX_DEPTH_TRACK)]
+            for ax in depth_axes} for m in methods}
+
     n_seqs = 0
     n_steps = 0
     n_no_eagle3_base = 0
@@ -358,14 +437,21 @@ def main():
                     nt_ps = _accumulate_per_node(
                         base_tids, base_pids, e3_per_step, gt, n_bins,
                         trials["eagle3"]["per_step"],
-                        accepts["eagle3"]["per_step"])
+                        accepts["eagle3"]["per_step"],
+                        trials_by_depth["eagle3"]["per_step"],
+                        accepts_by_depth["eagle3"]["per_step"],
+                        MAX_DEPTH_TRACK)
                     _accumulate_per_node(
                         base_tids, base_pids, e3_path_prob, gt, n_bins,
                         trials["eagle3"]["path_prob"],
-                        accepts["eagle3"]["path_prob"])
-                    # score: per-DEPTH-GROUP (sibling group = 1 trial, ANY-match)
-                    _accumulate_per_depth_group(
-                        base_tids, base_pids, e3_score_per_node, gt, n_bins,
+                        accepts["eagle3"]["path_prob"],
+                        trials_by_depth["eagle3"]["path_prob"],
+                        accepts_by_depth["eagle3"]["path_prob"],
+                        MAX_DEPTH_TRACK)
+                    # score: per-DRAFT MAT (mean accepted tokens per bin)
+                    _accumulate_per_draft_mat(
+                        base_tids, base_pids, e3_score_raw, gt,
+                        n_bins, score_max,
                         trials["eagle3"]["score"],
                         accepts["eagle3"]["score"])
                     n_eagle3_trials += nt_ps  # per_step trial count
@@ -394,13 +480,20 @@ def main():
                         nt_ps = _accumulate_per_node(
                             sf_tids, sf_pids, sf_per_step, gt, n_bins,
                             trials["suffix"]["per_step"],
-                            accepts["suffix"]["per_step"])
+                            accepts["suffix"]["per_step"],
+                            trials_by_depth["suffix"]["per_step"],
+                            accepts_by_depth["suffix"]["per_step"],
+                            MAX_DEPTH_TRACK)
                         _accumulate_per_node(
                             sf_tids, sf_pids, sf_cum, gt, n_bins,
                             trials["suffix"]["path_prob"],
-                            accepts["suffix"]["path_prob"])
-                        _accumulate_per_depth_group(
-                            sf_tids, sf_pids, sf_score_per_node, gt, n_bins,
+                            accepts["suffix"]["path_prob"],
+                            trials_by_depth["suffix"]["path_prob"],
+                            accepts_by_depth["suffix"]["path_prob"],
+                            MAX_DEPTH_TRACK)
+                        _accumulate_per_draft_mat(
+                            sf_tids, sf_pids, sf_score_raw, gt,
+                            n_bins, score_max,
                             trials["suffix"]["score"],
                             accepts["suffix"]["score"])
                         n_suffix_trials += nt_ps
@@ -428,13 +521,20 @@ def main():
                     n_dm_trials += _accumulate_per_node(
                         dm_tids, dm_pids, dm_per_step, gt_dm, n_bins,
                         trials["draft_model"]["per_step"],
-                        accepts["draft_model"]["per_step"])
+                        accepts["draft_model"]["per_step"],
+                        trials_by_depth["draft_model"]["per_step"],
+                        accepts_by_depth["draft_model"]["per_step"],
+                        MAX_DEPTH_TRACK)
                     _accumulate_per_node(
                         dm_tids, dm_pids, dm_path_prob, gt_dm, n_bins,
                         trials["draft_model"]["path_prob"],
-                        accepts["draft_model"]["path_prob"])
-                    _accumulate_per_depth_group(
-                        dm_tids, dm_pids, dm_score_per_node, gt_dm, n_bins,
+                        accepts["draft_model"]["path_prob"],
+                        trials_by_depth["draft_model"]["path_prob"],
+                        accepts_by_depth["draft_model"]["path_prob"],
+                        MAX_DEPTH_TRACK)
+                    _accumulate_per_draft_mat(
+                        dm_tids, dm_pids, dm_score_raw, gt_dm,
+                        n_bins, score_max,
                         trials["draft_model"]["score"],
                         accepts["draft_model"]["score"])
 
@@ -458,13 +558,20 @@ def main():
                     n_mtp_trials += _accumulate_per_node(
                         mtp_tids, mtp_pids, mtp_per_step, gt_mtp, n_bins,
                         trials["mtp"]["per_step"],
-                        accepts["mtp"]["per_step"])
+                        accepts["mtp"]["per_step"],
+                        trials_by_depth["mtp"]["per_step"],
+                        accepts_by_depth["mtp"]["per_step"],
+                        MAX_DEPTH_TRACK)
                     _accumulate_per_node(
                         mtp_tids, mtp_pids, mtp_path_prob, gt_mtp, n_bins,
                         trials["mtp"]["path_prob"],
-                        accepts["mtp"]["path_prob"])
-                    _accumulate_per_depth_group(
-                        mtp_tids, mtp_pids, mtp_score_per_node, gt_mtp, n_bins,
+                        accepts["mtp"]["path_prob"],
+                        trials_by_depth["mtp"]["path_prob"],
+                        accepts_by_depth["mtp"]["path_prob"],
+                        MAX_DEPTH_TRACK)
+                    _accumulate_per_draft_mat(
+                        mtp_tids, mtp_pids, mtp_score_raw, gt_mtp,
+                        n_bins, score_max,
                         trials["mtp"]["score"],
                         accepts["mtp"]["score"])
 
@@ -530,9 +637,18 @@ def main():
         "per_step_bin_edges": per_step_bin_edges,
         "path_prob_bin_edges": path_prob_bin_edges,
         "score_bin_edges": score_bin_edges,
+        "max_depth_track": MAX_DEPTH_TRACK,
         "by_method": {
             m: {
-                ax: {"trials": trials[m][ax], "accepts": accepts[m][ax]}
+                ax: {
+                    "trials": trials[m][ax],
+                    "accepts": accepts[m][ax],
+                    **(
+                        {"trials_by_depth": trials_by_depth[m][ax],
+                         "accepts_by_depth": accepts_by_depth[m][ax]}
+                        if ax in depth_axes else {}
+                    ),
+                }
                 for ax in axes
             }
             for m in methods

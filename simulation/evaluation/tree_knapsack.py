@@ -28,6 +28,28 @@ def greedy_tree_walk(
     return accepted
 
 
+def greedy_tree_walk_path(
+    token_ids: list[int],
+    parents: list[int],
+    ground_truth: list[int],
+) -> list[int]:
+    """Same walk as ``greedy_tree_walk`` but returns the list of node
+    indices on the accepted path (in order). Empty list = no accepts."""
+    path: list[int] = []
+    node = -1
+    for gt_token in ground_truth:
+        matched = False
+        for i in range(len(parents)):
+            if parents[i] == node and token_ids[i] == gt_token:
+                path.append(i)
+                node = i
+                matched = True
+                break
+        if not matched:
+            break
+    return path
+
+
 def position_accept_rates(
     token_ids: list[int],
     parents: list[int],
