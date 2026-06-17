@@ -281,6 +281,11 @@ def execute_round_robin(cfg: dict, dry_run: bool = False) -> int:
     infra = cfg.get("infra", {}) or {}
     default_port = int(infra.get("port", 30000))
     default_gpu_ids = infra.get("gpu_ids") or [0]
+    # Optional server backend overrides. Blackwell/sm_120 needs triton
+    # attention + pytorch sampling + a 12.8 CUDA_HOME (see project_blackwell_env).
+    attention_backend = infra.get("attention_backend")
+    sampling_backend = infra.get("sampling_backend")
+    cuda_home = infra.get("cuda_home")
 
     # Build per-workload invocation specs.
     plan: list[dict] = []
@@ -404,6 +409,9 @@ def execute_round_robin(cfg: dict, dry_run: bool = False) -> int:
         mem_fraction_static=cfg.get("mem_fraction_static"),
         max_total_tokens=cfg.get("max_total_tokens"),
         max_prefill_tokens=cfg.get("max_prefill_tokens"),
+        attention_backend=attention_backend,
+        sampling_backend=sampling_backend,
+        cuda_home=cuda_home,
     )
 
     max_per_workload = cfg.get("max_per_workload")
@@ -460,10 +468,18 @@ def _run_rr_shard(
     max_prefill_tokens: int | None = None,
     oracle_replay: str | None = None,
     max_per_workload: int | None = None,
+    attention_backend: str | None = None,
+    sampling_backend: str | None = None,
+    cuda_home: str | None = None,
 ) -> int:
     """Boot one SGLang server on (gpu_ids, port) and run RR over `plan`."""
     rr_env = base_env.copy()
     rr_env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
+    if cuda_home:
+        # Blackwell/sm_120: system nvcc rejects sm_120 JIT; point at the 12.8
+        # toolkit (see project_blackwell_env).
+        rr_env["CUDA_HOME"] = cuda_home
+        rr_env["PATH"] = f"{cuda_home}/bin:" + rr_env.get("PATH", "")
     rr_env["SGLANG_ORACLE_VANILLA"] = "1"
     if capture_full_pool:
         rr_env["SGLANG_CAPTURE_FULL_POOL"] = "1"
@@ -522,6 +538,13 @@ def _run_rr_shard(
         "--disable-radix-cache",
         "--host", "0.0.0.0", "--port", str(port),
     ]
+    if attention_backend:
+        # Target attn + EAGLE3 draft attn (draft head_dim 80 isn't FlashInfer-
+        # supported; Blackwell sm_120 needs triton anyway).
+        cmd += ["--attention-backend", attention_backend,
+                "--speculative-draft-attention-backend", attention_backend]
+    if sampling_backend:
+        cmd += ["--sampling-backend", sampling_backend]
     if context_length is not None:
         cmd += ["--context-length", str(context_length)]
     if max_total_tokens is not None:

@@ -46,14 +46,17 @@ workload_overrides:
 
 shards:
   - id: 0
-    gpu_ids: [0, 1, 2, 3]
+    gpu_ids: [0]
     port: 30006
     workloads: [bfcl_v4]
     tool_call_parser: qwen25
 
 infra:
   port: 30006
-  gpu_ids: [0, 1, 2, 3]
+  gpu_ids: [0]  # GPU0 = RTX PRO 6000 Blackwell (96GB), tp1
+  attention_backend: triton       # Blackwell sm_120
+  sampling_backend: pytorch
+  cuda_home: /usr/local/cuda-12.8
 
 output:
   root: simulation/results

@@ -419,6 +419,7 @@ def run_benchmark(
     replay: str | None = None,
     resume: bool = False,
     include_category: str | None = None,
+    offset: int = 0,
 ) -> None:
     """Run BFCLv4 agentic benchmark."""
     collect_oracle = is_oracle_enabled()
@@ -485,6 +486,11 @@ def run_benchmark(
 
     pending = [r for r in dataset
                if str(r.get("bfcl_id", r.get("id", ""))) not in done]
+    # --offset skips the first `offset` pending requests before --num-requests
+    # caps the count — used to carve disjoint train/test task slices for
+    # offline calibration (fit on [0:K], evaluate on [K:K+M]).
+    if offset:
+        pending = pending[offset:]
     if num_requests is not None:
         pending = pending[:num_requests]
     mode_str = "replay" if replay else "normal"
@@ -572,6 +578,10 @@ def main():
                              "e.g. 'web_search' to skip memory_* (which "
                              "have prereq dependencies that block "
                              "round-robin --num-requests 1)")
+    parser.add_argument("--offset", type=int, default=0,
+                        help="Skip the first N pending requests before "
+                             "--num-requests caps the count (disjoint "
+                             "train/test slices for calibration).")
     args = parser.parse_args()
 
     run_benchmark(
@@ -585,6 +595,7 @@ def main():
         replay=args.replay,
         resume=args.resume,
         include_category=args.include_category,
+        offset=args.offset,
     )
 
 

@@ -445,6 +445,10 @@ def main():
     ap.add_argument("--j-max", type=int, default=8,
                     help="max hand-off depth j (= chain depth of the "
                          "capture; 8 for steps8 captures, 16 for steps16)")
+    ap.add_argument("--base-label", default="eagle",
+                    help="base proposer label in figures: 'eagle' (14B EAGLE3) "
+                         "or 'mtp' (27B native MTP; see "
+                         "project_eagle_label_means_mtp)")
     args = ap.parse_args()
 
     J_GRID[:] = list(range(0, args.j_max + 1))
@@ -487,7 +491,8 @@ def main():
         fig_wls = (args.fig_workloads.split(",")
                    if args.fig_workloads else None)
         make_figures(summary, args.fig_dir, fig_k=args.fig_k,
-                     variant=args.fig_variant, fig_workloads=fig_wls)
+                     variant=args.fig_variant, fig_workloads=fig_wls,
+                     base_label=args.base_label)
         print(f"figures -> {args.fig_dir}", file=sys.stderr)
 
     if n_bad:

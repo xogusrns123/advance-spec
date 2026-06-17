@@ -86,8 +86,15 @@ def analyze_decisions(decision_path: str | Path,
         cut = int(len(decisions) * skip_first_frac)
         decisions = decisions[cut:]
 
+    # Tail-append records (depth >= S, chosen always "suffix", suffix_p is a
+    # cumulative path prob) would pollute the head selection stats — analyze
+    # them separately.
+    tail = [d for d in decisions if d.get("tail")]
+    decisions = [d for d in decisions if not d.get("tail")]
+
     n = len(decisions)
-    out: dict = {"n_decisions": n, "n_step_records": len(steps)}
+    out: dict = {"n_decisions": n, "n_step_records": len(steps),
+                 "n_tail_records": len(tail)}
     if n == 0:
         return out
 
@@ -129,7 +136,49 @@ def analyze_decisions(decision_path: str | Path,
             acc, tot = row["reached"][d["chosen"]]
             row["reached"][d["chosen"]] = [acc + (1 if a >= depth + 1 else 0),
                                            tot + 1]
-    out["join_rate"] = round(n_joined / n, 4)
+
+    # ---- tail block (route b: suffix run appended beyond S) --------------
+    n_tail_joined = 0
+    if tail:
+        s_depth = min(d["depth"] for d in tail)  # = S (tail starts at S)
+        by_pos: dict[int, dict] = defaultdict(
+            lambda: {"n": 0, "reached": 0, "accepted": 0})
+        per_step_len: dict[tuple, int] = defaultdict(int)
+        accepted_total = 0
+        for d in tail:
+            key = (d["rid"], d["decode_step"])
+            per_step_len[key] += 1
+            pos = d["depth"] - s_depth
+            row = by_pos[pos]
+            row["n"] += 1
+            a = steps.get(key)
+            if a is None:
+                continue
+            n_tail_joined += 1
+            if a >= d["depth"]:
+                row["reached"] += 1
+                if a >= d["depth"] + 1:
+                    row["accepted"] += 1
+                    accepted_total += 1
+        out["tail"] = {
+            "n_records": len(tail),
+            "tail_start_depth": s_depth,
+            "steps_with_tail_rate": (
+                round(len(per_step_len) / len(steps), 4) if steps else None),
+            "tail_len": quantiles([float(v) for v in per_step_len.values()]),
+            "extra_committed_per_step": (
+                round(accepted_total / len(steps), 4) if steps else None),
+            "by_position": [
+                {"pos": pos, "n": r["n"], "n_reached": r["reached"],
+                 "cond_accept": (round(r["accepted"] / r["reached"], 4)
+                                 if r["reached"] else None)}
+                for pos, r in sorted(by_pos.items())
+            ],
+        }
+
+    total = n + len(tail)
+    out["join_rate"] = (
+        round((n_joined + n_tail_joined) / total, 4) if total else None)
 
     table = []
     for depth in sorted(by_depth):
@@ -190,13 +239,14 @@ def main() -> int:
             print(f"[{name:8s}] wall={head.get('wall_time_s')}s (reference, "
                   f"no per-step timing)")
 
-    dec_path = next(
-        (row["decision_log"] for row in arms.values()
-         if isinstance(row, dict) and row.get("decision_log")), None)
-    if dec_path:
-        dec = analyze_decisions(dec_path, args.skip_first_frac)
-        analysis["decisions"] = dec
-        print(f"\n--- decisions (n={dec.get('n_decisions')}, "
+    analysis["decisions"] = {}
+    for name, row in arms.items():
+        if not (isinstance(row, dict) and row.get("decision_log")):
+            continue
+        dec = analyze_decisions(row["decision_log"], args.skip_first_frac)
+        analysis["decisions"][name] = dec
+        print(f"\n--- decisions [{name}] (n={dec.get('n_decisions')}, "
+              f"tail={dec.get('n_tail_records')}, "
               f"join_rate={dec.get('join_rate')}, "
               f"skip_first_frac={args.skip_first_frac}) ---")
         print(f"suffix proposal rate: {dec.get('suffix_proposal_rate')}   "
@@ -215,7 +265,17 @@ def main() -> int:
                       f"{r['n_reached_eagle3']:>7} "
                       f"{str(r['cond_accept_suffix']):>11} "
                       f"{r['n_reached_suffix']:>7}")
-    else:
+        t = dec.get("tail")
+        if t:
+            print(f"tail: start_depth={t['tail_start_depth']} "
+                  f"steps_with_tail={t['steps_with_tail_rate']} "
+                  f"len={t['tail_len']} "
+                  f"extra_committed/step={t['extra_committed_per_step']}")
+            print(f"{'pos':>5} {'n':>7} {'reached':>8} {'cond_accept':>12}")
+            for r in t["by_position"]:
+                print(f"{r['pos']:>5} {r['n']:>7} {r['n_reached']:>8} "
+                      f"{str(r['cond_accept']):>12}")
+    if not analysis["decisions"]:
         print("\n(no hybrid decision log in summary — decision analysis skipped)")
 
     if args.json:

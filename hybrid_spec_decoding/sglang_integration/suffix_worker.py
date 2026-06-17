@@ -19,7 +19,9 @@ from __future__ import annotations
 # earliest point to set it for child processes.
 # GLM-4.7-Flash MoE topk uses @torch.compile, spawning min(32, cpu_count)
 # subprocesses per TP rank.
+import json as _json
 import os as _os
+import time as _time
 if "TORCHINDUCTOR_COMPILE_THREADS" not in _os.environ:
     _os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
 
@@ -394,6 +396,12 @@ class SuffixWorker:
             generate_token_bitmask,
         )
 
+        # Optional per-step accept/timing log (same JSONL schema as the
+        # oracle LATENCY_ONLY instrumentation on EAGLEWorker) so suffix-only
+        # arms get MAT/survival stats from the same analysis tools.
+        _tlog = _os.environ.get("SGLANG_ORACLE_TIMING_LOG")
+        _t0 = _time.perf_counter() if _tlog else 0.0
+
         self._prepare_for_speculative_decoding(batch)
         model_worker_batch = batch.get_model_worker_batch()
         spec_info = model_worker_batch.spec_info
@@ -452,6 +460,21 @@ class SuffixWorker:
                 batch_result.next_token_ids,
                 batch_result.can_run_cuda_graph,
             )
+
+        if _tlog and accept_length_per_req_cpu is not None:
+            try:
+                with open(_tlog, "a") as _f:
+                    _f.write(_json.dumps({
+                        "phase": "decode",
+                        "step_total_ms": round(
+                            (_time.perf_counter() - _t0) * 1e3, 3),
+                        "accept_lengths": [int(a) for a in
+                                           accept_length_per_req_cpu],
+                        "committed_tokens": [int(a) + 1 for a in
+                                             accept_length_per_req_cpu],
+                    }) + "\n")
+            except OSError:
+                pass
 
         return GenerationBatchResult(
             logits_output=logits_output,

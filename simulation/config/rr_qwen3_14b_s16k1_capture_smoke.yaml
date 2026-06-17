@@ -43,7 +43,10 @@ workload_overrides:
 
 infra:
   port: 30010
-  gpu_ids: [2, 3]  # tp2 — Qwen3-14B bf16 (28GB) does not fit one 24GB 4090
+  gpu_ids: [0]  # GPU0 = RTX PRO 6000 Blackwell (96GB) — Qwen3-14B fits at tp1
+  attention_backend: triton       # Blackwell sm_120 + EAGLE3 draft head_dim 80
+  sampling_backend: pytorch
+  cuda_home: /usr/local/cuda-12.8
 
 output:
   root: simulation/results
