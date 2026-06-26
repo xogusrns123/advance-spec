@@ -531,6 +531,14 @@ def _run_rr_shard(
         "--kv-cache-dtype", "fp8_e5m2",
         "--disable-cuda-graph",
         "--watchdog-timeout", "600",
+        # CRITICAL for oracle capture: recent sglang defaults to Spec V2
+        # (EAGLEWorkerV2/StandaloneWorkerV2) whenever overlap scheduling is on
+        # (spec_info.py: enable_overlap = not disable_overlap_schedule). The
+        # oracle vanilla patch (install_hook -> patch_eagle_worker_full) only
+        # hooks the V1 workers (EAGLEWorker/MultiLayerEagleWorker/StandaloneWorker),
+        # so under Spec V2 it never fires and captures get 0 oracle entries.
+        # Force V1 by disabling overlap (matches measure_chain_hybrid COMMON_FLAGS).
+        "--disable-overlap-schedule",
         # SGLang 0.5.10+ requires --disable-radix-cache for Qwen3.5 (Mamba
         # arch) when using tree-mode speculative decoding (topk > 1). The
         # alternative would be Spec V2 + extra_buffer mamba scheduler, but

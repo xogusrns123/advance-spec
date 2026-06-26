@@ -94,11 +94,23 @@ def load_split(pairs_path: str, fit_n: int, test_n: int):
 
 
 def _fit_specs(p, y, centers, rates):
+    # Continuous objective (target_p): y is q_target in [0,1], not binary {0,1};
+    # logistic/beta then need the LinearRegression variants (the binary sklearn
+    # classifiers raise on continuous labels). histogram/isotonic are native.
+    uniq = np.unique(y)
+    is_cont = uniq.size > 2 or not np.all(np.isin(uniq, (0.0, 1.0)))
+    if is_cont:
+        from calib_perposition import _cont_spec  # noqa: E402
+        logistic = _cont_spec("logistic", p, y)
+        beta = _cont_spec("beta", p, y)
+    else:
+        logistic = fit_logistic(p, y)
+        beta = fit_beta(p, y)
     return {
         "histogram": fit_histogram(p, y, centers, rates),
         "isotonic": fit_isotonic(p, y),
-        "logistic": fit_logistic(p, y),
-        "beta": fit_beta(p, y),
+        "logistic": logistic,
+        "beta": beta,
     }
 
 
@@ -166,7 +178,7 @@ def main() -> None:
     ap.add_argument("--test-n-tasks", type=int, default=10)
     args = ap.parse_args()
 
-    out = Path(args.out_dir)
+    out = Path(args.out_dir) / "histogram"  # bar reliability plots live here
     out.mkdir(parents=True, exist_ok=True)
     data, nfit, ntest = load_split(args.pairs, args.fit_n_tasks, args.test_n_tasks)
     print(f"fit tasks={nfit} test tasks={ntest}", file=sys.stderr)

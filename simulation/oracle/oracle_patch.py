@@ -39,6 +39,12 @@ ORACLE_TIMING_PATH = Path(
 ORACLE_REPLAY_PATH = os.environ.get("SGLANG_ORACLE_REPLAY", "")
 ORACLE_DRAFT_BUDGET = os.environ.get("SGLANG_DRAFT_BUDGET", "")  # override draft token count
 
+# Latest DFlash per-step accepted-draft counts, captured from
+# DFlashVerifyInput.verify (4th return = num_correct_drafts_per_req_cpu) and
+# consumed by the DFlash timed_fwd wrapper. Safe for the single-request
+# latency-measurement path (one in-flight request, sequential steps).
+_DFLASH_LAST_CORRECT = None
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -555,6 +561,23 @@ def _setup_latency_only(eagle_worker) -> None:
 
     eagle_worker.draft = timed_draft
 
+    # Draft-model EXTEND forward. For STANDALONE (small draft LM) the draft
+    # model must process the freshly committed context here — this is the
+    # dominant draft-side cost and otherwise leaks into post_verify_ms. For
+    # EAGLE/EAGLE3 it reuses target hidden states so it is cheap. Attribute
+    # its wall time to the draft cost.
+    if hasattr(eagle_worker, "forward_draft_extend_after_decode"):
+        _orig_extend = eagle_worker.forward_draft_extend_after_decode
+
+        def timed_extend(*a, **k):
+            t0 = _time.perf_counter()
+            r = _orig_extend(*a, **k)
+            eagle_worker._oracle_last_draft_extend_ms = (
+                _time.perf_counter() - t0) * 1000
+            return r
+
+        eagle_worker.forward_draft_extend_after_decode = timed_extend
+
     # verify + target_forward timers. stash_verify_logits=False: skip the
     # .cpu().clone() so target_forward_ms reflects only CPU dispatch (the
     # true GPU wall time flows into verify_overhead, and the sum equals the
@@ -588,9 +611,15 @@ def _setup_latency_only(eagle_worker) -> None:
         phase = "decode" if is_decode else "prefill"
 
         draft_ms = getattr(eagle_worker, "_oracle_last_draft_ms", None)
+        extend_ms = getattr(eagle_worker, "_oracle_last_draft_extend_ms", None)
         fwd_ms = getattr(eagle_worker, "_oracle_last_target_forward_ms", None)
         verify_total_ms = getattr(eagle_worker, "_oracle_last_verify_total_ms", None)
         accept_lens = getattr(eagle_worker, "_oracle_last_accept_lengths", []) or []
+
+        # Total draft-side cost = propose (draft) + draft-model extend forward.
+        draft_total_ms = None
+        if draft_ms is not None or extend_ms is not None:
+            draft_total_ms = (draft_ms or 0.0) + (extend_ms or 0.0)
 
         entry = {
             "phase": phase,
@@ -600,18 +629,20 @@ def _setup_latency_only(eagle_worker) -> None:
             entry["num_tokens"] = int(batch.input_ids.numel())
         except Exception:
             pass
-        if draft_ms is not None:
-            entry["eagle3_draft_ms"] = round(draft_ms, 3)
+        if draft_total_ms is not None:
+            entry["eagle3_draft_ms"] = round(draft_total_ms, 3)
+        if extend_ms is not None:
+            entry["draft_extend_ms"] = round(extend_ms, 3)
         if fwd_ms is not None:
             entry["target_forward_ms"] = round(fwd_ms, 3)
         if verify_total_ms is not None:
             entry["verify_total_ms"] = round(verify_total_ms, 3)
         if verify_total_ms is not None and fwd_ms is not None:
             entry["verify_overhead_ms"] = round(verify_total_ms - fwd_ms, 3)
-        if (step_total_ms is not None and draft_ms is not None
+        if (step_total_ms is not None and draft_total_ms is not None
                 and verify_total_ms is not None):
             entry["post_verify_ms"] = round(
-                step_total_ms - draft_ms - verify_total_ms, 3)
+                step_total_ms - draft_total_ms - verify_total_ms, 3)
 
         if is_decode:
             entry["accept_lengths"] = list(accept_lens)
@@ -628,6 +659,7 @@ def _setup_latency_only(eagle_worker) -> None:
 
         # Reset per-step stashes
         eagle_worker._oracle_last_draft_ms = None
+        eagle_worker._oracle_last_draft_extend_ms = None
         eagle_worker._oracle_last_target_forward_ms = None
         eagle_worker._oracle_last_verify_total_ms = None
         eagle_worker._oracle_last_step_total_ms = None
@@ -640,6 +672,196 @@ def _setup_latency_only(eagle_worker) -> None:
     logger.info(
         "Oracle LATENCY-ONLY patch applied "
         "(real speculative decoding, timing instrumentation only)")
+
+
+def patch_dflash_worker(worker) -> None:
+    """LATENCY-only timing for DFlashWorker (block-diffusion drafter).
+
+    DFlash has no eagle-style draft()/verify() methods; the per-step work is:
+      _prepare_for_speculative_decoding  -> builds the draft block, runs the
+          draft (diffusion) model forward  => draft cost (eagle3_draft_ms)
+      target_worker.forward_batch_generation(is_verify=True) => verify/target_forward
+      forward_batch_generation            => whole step (step_total_ms)
+    Emits the SAME JSONL schema as the eagle latency patch so the existing
+    summarizer reads it unchanged. Only active under SGLANG_LATENCY_ONLY=1.
+    """
+    if os.environ.get("SGLANG_LATENCY_ONLY", "0") != "1":
+        return
+    import time as _time
+
+    def _accum(attr, dt):
+        setattr(worker, attr, (getattr(worker, attr, 0.0) or 0.0) + dt)
+
+    # draft = block-construction (_prepare) — but _prepare also calls
+    # _append_target_hidden_to_draft_kv internally; a SECOND append runs
+    # post-verify (next-step draft KV prep). We time _prepare, and separately
+    # accumulate ALL draft-side sub-ops so we can attribute the post-verify
+    # draft prep (which otherwise leaks into "others") to draft.
+    if hasattr(worker, "_prepare_for_speculative_decoding"):
+        _orig_prep = worker._prepare_for_speculative_decoding
+
+        def timed_prep(*a, **k):
+            t0 = _time.perf_counter()
+            r = _orig_prep(*a, **k)
+            worker._oracle_last_draft_ms = (_time.perf_counter() - t0) * 1000
+            return r
+
+        worker._prepare_for_speculative_decoding = timed_prep
+
+    # draft model forward (pure drafter compute), accumulated per step
+    dmr = getattr(worker, "draft_model_runner", None)
+    if dmr is not None and hasattr(dmr, "forward"):
+        _orig_dfwd = dmr.forward
+
+        def timed_dfwd(*a, **k):
+            t0 = _time.perf_counter()
+            r = _orig_dfwd(*a, **k)
+            _accum("_oracle_dflash_draftfwd", (_time.perf_counter() - t0) * 1000)
+            return r
+
+        dmr.forward = timed_dfwd
+
+    # _append_target_hidden_to_draft_kv: draft-side KV prep, accumulated over
+    # BOTH call sites (inside _prepare + post-verify).
+    if hasattr(worker, "_append_target_hidden_to_draft_kv"):
+        _orig_app = worker._append_target_hidden_to_draft_kv
+
+        def timed_app(*a, **k):
+            t0 = _time.perf_counter()
+            r = _orig_app(*a, **k)
+            _accum("_oracle_dflash_append", (_time.perf_counter() - t0) * 1000)
+            return r
+
+        worker._append_target_hidden_to_draft_kv = timed_app
+
+    # post-verify target mamba-state update (target-side overhead)
+    if hasattr(worker, "_update_target_mamba_state_after_verify"):
+        _orig_mamba = worker._update_target_mamba_state_after_verify
+
+        def timed_mamba(*a, **k):
+            t0 = _time.perf_counter()
+            r = _orig_mamba(*a, **k)
+            _accum("_oracle_dflash_mamba", (_time.perf_counter() - t0) * 1000)
+            return r
+
+        worker._update_target_mamba_state_after_verify = timed_mamba
+
+    # block-acceptance logic (DFlashVerifyInput.verify) — analogous to EAGLE's
+    # verify_tree_greedy, which IS counted inside eagle verify. Class-level wrap.
+    try:
+        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+        if not getattr(DFlashVerifyInput, "_oracle_verify_wrapped", False):
+            _orig_bverify = DFlashVerifyInput.verify
+
+            def timed_bverify(self_vi, *a, **k):
+                global _DFLASH_LAST_CORRECT
+                t0 = _time.perf_counter()
+                r = _orig_bverify(self_vi, *a, **k)
+                _accum("_oracle_dflash_blockverify",
+                       (_time.perf_counter() - t0) * 1000)
+                # verify() returns (new_bonus_tokens, commit_lens,
+                # next_target_hidden, num_correct_drafts_per_req_cpu: List[int]).
+                # The last element is the per-request accepted *draft* token count
+                # (excludes the always-committed bonus token) — our tau / mat.
+                try:
+                    if isinstance(r, (tuple, list)) and len(r) >= 4:
+                        _DFLASH_LAST_CORRECT = list(r[-1])
+                except Exception:
+                    pass
+                return r
+
+            DFlashVerifyInput.verify = timed_bverify
+            DFlashVerifyInput._oracle_verify_wrapped = True
+    except Exception:
+        pass
+
+    tw = worker.target_worker
+    _orig_tfwd = tw.forward_batch_generation
+
+    def timed_tfwd(batch, *a, **k):
+        is_verify = bool(k.get("is_verify", False))
+        t0 = _time.perf_counter()
+        r = _orig_tfwd(batch, *a, **k)
+        dt = (_time.perf_counter() - t0) * 1000
+        if is_verify:
+            worker._oracle_last_target_forward_ms = dt
+            worker._oracle_last_verify_total_ms = dt
+        return r
+
+    tw.forward_batch_generation = timed_tfwd
+
+    _orig_fwd = worker.forward_batch_generation
+
+    def timed_fwd(batch, *a, **k):
+        # snapshot the append accumulated DURING _prepare (call #1) so we can
+        # split it from the post-verify append (call #2 = draft prep for next step)
+        worker._oracle_dflash_append = 0.0
+        t0 = _time.perf_counter()
+        r = _orig_fwd(batch, *a, **k)
+        step = (_time.perf_counter() - t0) * 1000
+
+        is_decode = not (
+            batch.forward_mode.is_extend()
+            or getattr(batch, "is_extend_in_batch", False))
+        prep = getattr(worker, "_oracle_last_draft_ms", None)
+        fwd = getattr(worker, "_oracle_last_target_forward_ms", None)
+        draftfwd = getattr(worker, "_oracle_dflash_draftfwd", None)
+        append = getattr(worker, "_oracle_dflash_append", None)
+        mamba = getattr(worker, "_oracle_dflash_mamba", None)
+        blockverify = getattr(worker, "_oracle_dflash_blockverify", None)
+        # verify = target forward + block-acceptance (DFlashVerifyInput.verify),
+        # matching the eagle convention where verify_total includes the
+        # acceptance step (verify_tree_greedy). Without this, the block
+        # acceptance (~3.5ms) leaks into "others".
+        vt = (fwd + (blockverify or 0.0)) if fwd is not None else None
+
+        entry = {"phase": "decode" if is_decode else "prefill",
+                 "step_total_ms": round(step, 3)}
+        if prep is not None:
+            entry["eagle3_draft_ms"] = round(prep, 3)
+        if fwd is not None:
+            entry["target_forward_ms"] = round(fwd, 3)
+        if vt is not None:
+            entry["verify_total_ms"] = round(vt, 3)
+        if prep is not None and vt is not None:
+            entry["post_verify_ms"] = round(step - prep - vt, 3)
+        # diagnostic sub-timings (read from raw JSONL)
+        if draftfwd is not None:
+            entry["vd_draftfwd_ms"] = round(draftfwd, 3)
+        if append is not None:
+            entry["vd_append_ms"] = round(append, 3)
+        if mamba is not None:
+            entry["vd_mamba_ms"] = round(mamba, 3)
+        if blockverify is not None:
+            entry["vd_blockverify_ms"] = round(blockverify, 3)
+        if is_decode:
+            global _DFLASH_LAST_CORRECT
+            correct = _DFLASH_LAST_CORRECT
+            _DFLASH_LAST_CORRECT = None
+            if correct is None:  # fallback to any result-attached field
+                na = getattr(r, "num_accepted_drafts", None)
+                if na is not None:
+                    correct = na if hasattr(na, "__len__") else [na]
+            try:
+                if correct is not None:
+                    accs = [int(x) for x in correct]
+                    entry["accept_lengths"] = accs
+                    # committed = accepted draft tokens + 1 bonus token per req.
+                    entry["committed_tokens"] = [a + 1 for a in accs]
+            except Exception:
+                pass
+        _log_timing(entry)
+
+        worker._oracle_last_draft_ms = None
+        worker._oracle_last_target_forward_ms = None
+        worker._oracle_last_verify_total_ms = None
+        worker._oracle_dflash_draftfwd = 0.0
+        worker._oracle_dflash_mamba = 0.0
+        worker._oracle_dflash_blockverify = 0.0
+        return r
+
+    worker.forward_batch_generation = timed_fwd
+    logger.info("Oracle DFLASH LATENCY-ONLY patch (diagnostic) applied")
 
 
 def _patch_verify_greedy_func() -> None:
@@ -656,17 +878,12 @@ def _patch_verify_greedy_func() -> None:
 
     original_func = eagle_info.verify_tree_greedy_func
 
-    def patched_verify_tree_greedy_func(
-        predicts, accept_index, accept_token_num,
-        candidates, retrive_index, retrive_next_token,
-        retrive_next_sibling, target_predict, topk,
-    ):
-        # Run original to get correct target_predict (bonus token)
-        predicts, accept_index, accept_token_num = original_func(
-            predicts, accept_index, accept_token_num,
-            candidates, retrive_index, retrive_next_token,
-            retrive_next_sibling, target_predict, topk,
-        )
+    def patched_verify_tree_greedy_func(*args, **kwargs):
+        # Signature-agnostic: sglang 0.5.9 passed retrive_* positionally;
+        # 0.5.12 passes retrieve_* as keyword args. Pass through whatever was
+        # sent and operate on the return (predicts, accept_index, accept_token_num
+        # / num_correct_drafts) to force accept_length=0.
+        predicts, accept_index, accept_token_num = original_func(*args, **kwargs)
 
         # Force accept_length=0: only keep the first accepted token (bonus)
         # accept_index[i] = [first_idx, -1, -1, ...] → only bonus token
@@ -770,17 +987,35 @@ def _patch_verify_logits(eagle_worker: "EAGLEWorker",
     """
     original_verify = eagle_worker.verify
 
-    def patched_verify(batch, spec_info):
+    def patched_verify(*args, **kwargs):
+        # Signature-agnostic: sglang's EAGLEWorker.verify() arg/return shape
+        # changed between 0.5.9 (verify(batch, spec_info)) and 0.5.12.
         import time as _time
         _t0 = _time.perf_counter()
-        result = original_verify(batch, spec_info)
+        result = original_verify(*args, **kwargs)
         _t1 = _time.perf_counter()
         eagle_worker._oracle_last_verify_total_ms = (_t1 - _t0) * 1000
-        # Stash real accept_length per request (list of ints; excludes bonus).
+        # Stash real accept_length per request (best-effort across versions).
         try:
-            _, _res, _, _ = result
-            eagle_worker._oracle_last_accept_lengths = list(
-                getattr(_res, "accept_length_per_req_cpu", []) or [])
+            # sglang 0.5.12 renamed accept_length_per_req_cpu ->
+            # num_correct_drafts_per_req_cpu (GenerationBatchResult /
+            # verify_output). Accept either (same per-request accepted-draft
+            # count) so MAT timing works on both old and new sglang.
+            def _al(o):
+                v = getattr(o, "accept_length_per_req_cpu", None)
+                if v is None:
+                    v = getattr(o, "num_correct_drafts_per_req_cpu", None)
+                return list(v) if v is not None else None
+            _res = None
+            if isinstance(result, tuple):
+                for _it in result:
+                    if _al(_it) is not None:
+                        _res = _it
+                        break
+            elif _al(result) is not None:
+                _res = result
+            eagle_worker._oracle_last_accept_lengths = (
+                _al(_res) if _res is not None else None) or []
         except Exception:
             eagle_worker._oracle_last_accept_lengths = []
 
@@ -793,6 +1028,7 @@ def _patch_verify_logits(eagle_worker: "EAGLEWorker",
         # argmax for the next step and predictions diverge from trajectory.
         replay = getattr(eagle_worker, "_oracle_replay_state", None)
         if replay is not None:
+            batch = args[0] if args else kwargs.get("batch")
             try:
                 _, _res, _, _ = result
                 accept_lens = list(
@@ -834,10 +1070,11 @@ def _patch_verify_logits(eagle_worker: "EAGLEWorker",
     # and (optionally) logit stashing before verify filters them.
     original_target_forward = eagle_worker.target_worker.forward_batch_generation
 
-    def patched_target_forward(model_worker_batch, is_verify=False):
+    def patched_target_forward(*args, **kwargs):
         import time as _time
+        is_verify = bool(kwargs.get("is_verify", False))
         _t_fwd_start = _time.perf_counter()
-        result = original_target_forward(model_worker_batch, is_verify=is_verify)
+        result = original_target_forward(*args, **kwargs)
         _t_fwd_end = _time.perf_counter()
         if is_verify:
             eagle_worker._oracle_last_target_forward_ms = (

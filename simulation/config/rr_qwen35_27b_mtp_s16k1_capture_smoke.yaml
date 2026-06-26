@@ -31,7 +31,7 @@ round_robin:
   resume: true
   context_length: 131072
 
-mem_fraction_static: 0.85
+mem_fraction_static: 0.80
 max_prefill_tokens: 4096
 
 max_per_workload: 1
@@ -56,7 +56,7 @@ infra:
   gpu_ids: [0]  # GPU0 = RTX PRO 6000 Blackwell (96GB), tp1
   attention_backend: triton       # Blackwell sm_120
   sampling_backend: pytorch
-  cuda_home: /usr/local/cuda-12.8
+  cuda_home: /usr/local/cuda  # container drifted 12.8 -> 13.0
 
 output:
   root: simulation/results

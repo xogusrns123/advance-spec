@@ -401,13 +401,21 @@ class SuffixWorker:
         # arms get MAT/survival stats from the same analysis tools.
         _tlog = _os.environ.get("SGLANG_ORACLE_TIMING_LOG")
         _t0 = _time.perf_counter() if _tlog else 0.0
+        _draft_ms = 0.0
+        _target_forward_ms = 0.0
+        _verify_total_ms = 0.0
 
+        # Suffix DRAFT = trie lookup + draft-tensor prep (model-free, expected
+        # tiny). CPU-bound, so perf_counter is accurate without a cuda sync.
+        _td0 = _time.perf_counter() if _tlog else 0.0
         self._prepare_for_speculative_decoding(batch)
+        if _tlog:
+            _draft_ms = (_time.perf_counter() - _td0) * 1e3
         model_worker_batch = batch.get_model_worker_batch()
         spec_info = model_worker_batch.spec_info
-        num_accepted_tokens = 0
+        num_correct_drafts = 0
         accept_lens = None
-        accept_length_per_req_cpu = None
+        num_correct_drafts_per_req_cpu = None
 
         if model_worker_batch.forward_mode.is_target_verify():
             if batch.has_grammar:
@@ -417,6 +425,7 @@ class SuffixWorker:
                     spec_info.retrive_next_token.shape
                 ).cpu()
 
+            _tv0 = _time.perf_counter() if _tlog else 0.0
             batch_result = self.target_worker.forward_batch_generation(
                 model_worker_batch, is_verify=True
             )
@@ -424,6 +433,8 @@ class SuffixWorker:
                 batch_result.logits_output,
                 batch_result.can_run_cuda_graph,
             )
+            if _tlog:
+                _target_forward_ms = (_time.perf_counter() - _tv0) * 1e3
 
             verify_input: NgramVerifyInput = model_worker_batch.spec_info
             vocab_mask = None
@@ -441,11 +452,20 @@ class SuffixWorker:
                     vocab_mask = vocab_mask.to(verify_input.retrive_next_token.device)
                     batch.sampling_info.vocab_mask = None
 
-            logits_output, next_token_ids, num_accepted_tokens = verify_input.verify(
+            logits_output, next_token_ids, num_correct_drafts = verify_input.verify(
                 batch, logits_output, self.page_size, vocab_mask
             )
-            accept_lens = verify_input.accept_length
-            accept_length_per_req_cpu = verify_input.accept_length.cpu().tolist()
+            # 0.5.12 NgramVerifyInput convention (suffix reuses NgramVerifyInput):
+            # accept_lens = num_accept_tokens (with bonus); num_correct_drafts =
+            # drafts-only per-req count. The .cpu() below forces a real sync.
+            accept_lens = verify_input.num_accept_tokens
+            num_correct_drafts_per_req_cpu = (
+                verify_input.num_correct_drafts.cpu().tolist()
+            )
+            if _tlog:
+                # target forward + verify; the .cpu() above forces a real sync,
+                # so this span reflects actual target compute (the "verify cost").
+                _verify_total_ms = (_time.perf_counter() - _tv0) * 1e3
             if batch.return_logprob:
                 add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
             self._finalize_completed_requests(batch)
@@ -461,17 +481,20 @@ class SuffixWorker:
                 batch_result.can_run_cuda_graph,
             )
 
-        if _tlog and accept_length_per_req_cpu is not None:
+        if _tlog and num_correct_drafts_per_req_cpu is not None:
             try:
                 with open(_tlog, "a") as _f:
                     _f.write(_json.dumps({
                         "phase": "decode",
                         "step_total_ms": round(
                             (_time.perf_counter() - _t0) * 1e3, 3),
+                        "eagle3_draft_ms": round(_draft_ms, 3),
+                        "target_forward_ms": round(_target_forward_ms, 3),
+                        "verify_total_ms": round(_verify_total_ms, 3),
                         "accept_lengths": [int(a) for a in
-                                           accept_length_per_req_cpu],
+                                           num_correct_drafts_per_req_cpu],
                         "committed_tokens": [int(a) + 1 for a in
-                                             accept_length_per_req_cpu],
+                                             num_correct_drafts_per_req_cpu],
                     }) + "\n")
             except OSError:
                 pass
@@ -479,8 +502,8 @@ class SuffixWorker:
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=next_token_ids,
-            num_accepted_tokens=num_accepted_tokens,
-            accept_length_per_req_cpu=accept_length_per_req_cpu,
+            num_correct_drafts=num_correct_drafts,
+            num_correct_drafts_per_req_cpu=num_correct_drafts_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
             accept_lens=accept_lens,
         )

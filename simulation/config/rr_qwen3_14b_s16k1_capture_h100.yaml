@@ -1,0 +1,44 @@
+# ============================================================
+# FULL 14B s16k1 capture on the H100 (GPU 1). Regenerates the deleted
+# canonical capture at simulation/results/qwen3_14b/bfcl_v4_steps16_topk1_capture/.
+# Same as rr_qwen3_14b_s16k1_capture.yaml but: gpu_ids=[1] (H100),
+# cuda_home=/usr/local/cuda (12.8 path is gone; 13.0 nvcc targets sm_90),
+# mem_fraction_static=0.6 (H100 shared-safe). Validated via the 1-task smoke.
+# ============================================================
+name: rr_qwen3_14b_s16k1_capture_h100
+
+model_preset: qwen3_14b
+
+stage1_steps: 16
+stage1_configs:
+  - topk: 1
+    num_draft_tokens: 17
+
+round_robin:
+  enabled: true
+  capture_full_pool: true
+  batch: 1
+  resume: true
+  context_length: 131072
+
+max_per_workload: 80
+
+workloads:
+  - bfcl_v4
+
+workload_overrides:
+  bfcl_v4:
+    max_iterations: 20
+    include_category: web_search
+
+mem_fraction_static: 0.6
+
+infra:
+  port: 30011
+  gpu_ids: [1]                    # GPU1 = H100 PCIe (leaves Blackwell GPU0 free)
+  attention_backend: triton       # AngelSlim eagle3 draft head_dim 80; FlashInfer SM90 unsupported
+  sampling_backend: pytorch
+  cuda_home: /usr/local/cuda       # 13.0 (has nvcc, sm_90); 12.8 path is gone
+
+output:
+  root: simulation/results

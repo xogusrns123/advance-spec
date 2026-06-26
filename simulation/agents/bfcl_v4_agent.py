@@ -80,20 +80,136 @@ from simulation.oracle.oracle_patch import (
 from simulation.agents.tools.bfcl import patch_websearch_in_globals, cleanup_globals
 
 
+# Anti-runaway for thinking models. Qwen3.5 / GLM emit only a CLOSING </think>
+# (the opening tag is injected by the chat template). On tool-call turns Qwen3.5
+# greedily degenerates into
+#     reasoning</think>\n\n[call]\n</think>\n\n[call]\n</think>...
+# repeating the same tool call to max_tokens (the trajectory pollution that made
+# suffix decoding look artificially good). STOP_AFTER_CALL cuts that loop right
+# after the first complete tool call; the BFCL parser re-adds the trailing "]"
+# that the stop string consumes, and _strip_thinking recovers the first call even
+# when the loop is not stopped (e.g. replaying old captures).
+STOP_AFTER_CALL = ["]\n</think>", "]</think>", "]\n\n</think>"]
+MAX_GEN_TOKENS = 8192
+
+# A BFCL execute-prompting tool call looks like "[func_name(...". Used to pick the
+# real action block out of the reasoning / loop artifacts.
+_CALL_RE = re.compile(r"\[\s*[A-Za-z_]\w*\s*\(")
+
+
+def _first_call_group(s: str) -> str:
+    """Return the first complete "[ func(...) ]" group in s.
+
+    Bracket-matched so a single call is extracted even when the model emits
+    several newline-separated calls in one block ([c1]\\n[c2]...), which the BFCL
+    parser (ast.parse, mode="eval") cannot handle. Quotes are respected so "]"
+    inside a string argument does not close the group early. An unterminated group
+    is returned as-is; the parser appends the missing "]".
+    """
+    m = _CALL_RE.search(s)
+    if not m:
+        return s
+    start = m.start()
+    depth = 0
+    in_str = None
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if ch == in_str and s[i - 1] != "\\":
+                in_str = None
+            continue
+        if ch in "\"'":
+            in_str = ch
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return s[start:i + 1]
+    return s[start:]
+
+
+def _all_call_groups(s: str) -> list[str]:
+    """All complete "[ func(...) ]" groups in s (bracket-matched, quotes
+    respected). Handles newline-separated parallel calls "[c1]\\n[c2]..." that
+    the BFCL parser (single ast.parse) cannot take as one string."""
+    groups: list[str] = []
+    i, n = 0, len(s)
+    while i < n:
+        m = _CALL_RE.search(s, i)
+        if not m:
+            break
+        start = m.start()
+        depth = 0
+        in_str = None
+        end = n
+        for j in range(start, n):
+            ch = s[j]
+            if in_str:
+                if ch == in_str and s[j - 1] != "\\":
+                    in_str = None
+                continue
+            if ch in "\"'":
+                in_str = ch
+            elif ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    end = j + 1
+                    break
+        groups.append(s[start:end])
+        i = end
+    return groups
+
+
+def _strip_thinking_calls(text: str) -> list[str]:
+    """ALL tool-call groups from the first post-thinking segment.
+
+    Like _strip_thinking but recovers EVERY parallel call the model emitted in
+    one turn ([c1]\\n[c2]...) instead of only the first — returning a single
+    result for a multi-call turn confused the model into a degenerate
+    repeat-to-max_tokens loop (bfcl web_search 42/44). Later </think>-delimited
+    segments are still ignored (those are the loop artifacts). [] = plain answer.
+    """
+    text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+    if "</think>" in text:
+        segs = [s.strip() for s in text.split("</think>")]
+        cand = next((s for s in segs if _CALL_RE.search(s)), None)
+        if cand is None:
+            return []
+        text = cand
+    if _CALL_RE.search(text):
+        return _all_call_groups(text)
+    return []
+
+
 def _strip_thinking(text: str) -> str:
-    """Strip thinking content.
+    """Strip thinking and return the FIRST post-thinking tool call (or answer).
 
     Handles:
-    - <think>...</think> (standard)
-    - Bare text...</think> (GLM-4.7-Flash: no opening tag)
-    - Multiple </think> closings
+    - <think>...</think> (standard, paired)
+    - Bare text...</think> (Qwen3.5 / GLM-4.7-Flash: no opening tag)
+    - Multiple </think> closings (Qwen3.5 emits one per tool call when looping):
+      pick the FIRST segment that contains a tool call, so the first VALID call is
+      recovered instead of the truncated trailing fragment that rsplit(-1) gave.
     """
-    # First: standard <think>...</think>
+    # First: remove well-formed <think>...</think> blocks (paired tags).
     text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
-    # Then: if </think> still remains (no opening <think>), take text after last </think>
     if "</think>" in text:
-        text = text.rsplit("</think>", 1)[-1].strip()
-    return text
+        # A bare closing </think> remains. Split and take the first segment that
+        # looks like a tool call (later </think> closings are loop artifacts).
+        segs = [s.strip() for s in text.split("</think>")]
+        cand = next((s for s in segs if _CALL_RE.search(s)), None)
+        if cand is None:
+            non_empty = [s for s in segs if s]
+            return non_empty[-1] if non_empty else text.strip()
+        text = cand
+    # No </think> left. If a tool call is present, return its first complete
+    # group; otherwise it is a plain-text answer -> return as-is.
+    if _CALL_RE.search(text):
+        return _first_call_group(text)
+    return text.strip()
 
 
 def load_bfcl_v4_dataset(
@@ -142,6 +258,7 @@ def process_request(
     request: dict,
     max_iterations: int,
     collect_oracle: bool = True,
+    generate_fn=None,
 ) -> dict:
     """Process a single BFCLv4 agentic request.
 
@@ -219,34 +336,50 @@ def process_request(
         if collect_oracle:
             oracle_pos = get_oracle_log_position()
 
-        # LLM call
+        # LLM call. generate_fn (e.g. an offline HF DFlash decoder) replaces the
+        # OpenAI server while keeping the SAME multi-turn tool loop; it must
+        # return the assistant content string for `messages`.
         t_llm = time.perf_counter()
-        try:
-            formatted_prompt = system_prompt_pre_processing_chat_model(
-                messages, functions, entry_id
-            ) if not messages else messages
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=0.0,
-                max_tokens=32768,
-            )
-        except Exception as e:
-            all_steps.append({"type": "llm", "step": step, "error": str(e)})
-            break
+        if generate_fn is not None:
+            try:
+                content = generate_fn(messages, step)
+            except Exception as e:
+                all_steps.append({"type": "llm", "step": step, "error": str(e)})
+                break
+            step_data = {
+                "type": "llm", "step": step,
+                "latency_s": time.perf_counter() - t_llm,
+                "prompt_tokens": None, "completion_tokens": None,
+                "content": content, "messages": copy.deepcopy(messages),
+            }
+        else:
+            try:
+                formatted_prompt = system_prompt_pre_processing_chat_model(
+                    messages, functions, entry_id
+                ) if not messages else messages
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=0.0,
+                    max_tokens=MAX_GEN_TOKENS,
+                    stop=STOP_AFTER_CALL,
+                )
+            except Exception as e:
+                all_steps.append({"type": "llm", "step": step, "error": str(e)})
+                break
 
-        latency = time.perf_counter() - t_llm
-        content = response.choices[0].message.content or ""
+            latency = time.perf_counter() - t_llm
+            content = response.choices[0].message.content or ""
 
-        step_data = {
-            "type": "llm",
-            "step": step,
-            "latency_s": latency,
-            "prompt_tokens": response.usage.prompt_tokens,
-            "completion_tokens": response.usage.completion_tokens,
-            "content": content,
-            "messages": copy.deepcopy(messages),
-        }
+            step_data = {
+                "type": "llm",
+                "step": step,
+                "latency_s": latency,
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "content": content,
+                "messages": copy.deepcopy(messages),
+            }
 
         # Collect oracle entries
         if collect_oracle:
@@ -258,10 +391,16 @@ def process_request(
 
         messages.append({"role": "assistant", "content": content})
 
-        # Decode response
+        # Decode response: execute ALL tool calls emitted this turn (parallel
+        # [c1]\n[c2]... lists), not just the first. Returning only the first
+        # result of a multi-call turn confused the model into a degenerate
+        # repeat-to-max_tokens loop (bfcl 42/44); execute_multi_turn_func_call
+        # already runs + feeds back the whole list.
         try:
-            text_to_decode = _strip_thinking(content)
-            decoded_calls = default_decode_execute_prompting(text_to_decode)
+            groups = _strip_thinking_calls(content)
+            decoded_calls = []
+            for g in groups:
+                decoded_calls += default_decode_execute_prompting(g)
         except Exception:
             # Decode failure = final text answer
             all_steps.append(step_data)
@@ -374,7 +513,8 @@ def replay_request(
                 model=model,
                 messages=messages,
                 temperature=0.0,
-                max_tokens=32768,
+                max_tokens=MAX_GEN_TOKENS,
+                stop=STOP_AFTER_CALL,
             )
         except Exception as e:
             step_data["error"] = str(e)
@@ -420,6 +560,7 @@ def run_benchmark(
     resume: bool = False,
     include_category: str | None = None,
     offset: int = 0,
+    exclude_ids: str | None = None,
 ) -> None:
     """Run BFCLv4 agentic benchmark."""
     collect_oracle = is_oracle_enabled()
@@ -440,6 +581,15 @@ def run_benchmark(
         before = len(dataset)
         dataset = [r for r in dataset if include_category in (r.get("category") or "")]
         print(f"--include-category {include_category!r}: kept {len(dataset)}/{before}")
+
+    # Optional exclusion of specific bfcl_ids (e.g. greedy-decoding repetition
+    # loopers that pollute the trajectory). Matches on id or bfcl_id.
+    if exclude_ids:
+        drop = {x.strip() for x in exclude_ids.split(",") if x.strip()}
+        before = len(dataset)
+        dataset = [r for r in dataset
+                   if str(r.get("id", r.get("bfcl_id", ""))) not in drop]
+        print(f"--exclude-ids {sorted(drop)}: kept {len(dataset)}/{before}")
 
     # Load Round 1 results for replay mode
     round1_by_id = {}
@@ -582,6 +732,10 @@ def main():
                         help="Skip the first N pending requests before "
                              "--num-requests caps the count (disjoint "
                              "train/test slices for calibration).")
+    parser.add_argument("--exclude-ids", default=None,
+                        help="Comma-separated bfcl_ids to drop from the dataset "
+                             "(e.g. greedy-repetition loopers that pollute the "
+                             "trajectory).")
     args = parser.parse_args()
 
     run_benchmark(
@@ -596,6 +750,7 @@ def main():
         resume=args.resume,
         include_category=args.include_category,
         offset=args.offset,
+        exclude_ids=args.exclude_ids,
     )
 
 

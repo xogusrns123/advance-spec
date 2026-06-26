@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from typing import TYPE_CHECKING
 
@@ -123,10 +124,21 @@ class _ChainHybridState:
         self.fallback_meta: list | None = None    # per-row (score, probs, match_len)
         # record/oracle mode state
         self.gt_out_path: str | None = None       # record: dump path
-        self.gt_map: dict | None = None           # oracle: input_ids -> output_ids
+        self.gt_map: dict | None = None           # oracle/pin: input_ids -> output_ids
+        # PIN mode: a select1/score_fallback arm whose committed tokens are
+        # forced onto a standalone trajectory (gt_map) so every arm follows the
+        # SAME path (no FP-tie divergence), while still building its own draft
+        # chain and recomputing its own eagle features. Reuses the oracle
+        # GT-forcing machinery (verify override + post-verify rewrite) WITHOUT
+        # the oracle selection logic (the chain is built by the calib/raw rule).
+        self.pin_active = False
         self.gt: dict = {}                        # rid -> gt output list (or None)
         self.gt_offtrack: dict = {}               # rid -> bool (FP divergence)
         self.gt_pos: list | None = None           # per-row L at stash time
+        # Per-row GT continuation [num_steps+1] used to OVERRIDE the verify
+        # target_predict (argmax) in oracle mode -> commit follows GT exactly
+        # (no FP-tie divergence/runaway); see _install_verify_greedy_oracle.
+        self.gt_predict_override: list | None = None
         self.gt_stats = {"matched": 0, "unmatched": 0, "offtrack": 0}
         # Suffix tail-append config (0 = disabled = original behavior).
         self.tail_max = tail_max
@@ -146,6 +158,16 @@ class _ChainHybridState:
         self.chains: list | None = None     # per-row chain tokens chosen so far
         self.pending: list = []             # records awaiting flush
         self._warned: set = set()
+        # Online-calibration state (set in patch_chain_hybrid when active).
+        self.online: "_OnlineWindowCalibrator | None" = None
+        self.online_pairs_path: str | None = None
+        self.online_pending: list = []      # online_pairs rows awaiting flush
+        # Transient per-step decision store for the post-verify q_target join.
+        # flush() empties self.pending before chain_forward runs, so the join
+        # reads this instead. rid -> {depth: (eagle_tok, eagle_p, suffix_tok,
+        # suffix_p, eagle_cmp, suffix_cmp, chosen)}.
+        self.last_decisions: dict = {}
+        self.last_num_draft: int | None = None  # spec_info.draft_token_num (q-join offset)
 
     def warn_once(self, key: str, msg: str) -> None:
         if key not in self._warned:
@@ -165,6 +187,20 @@ class _ChainHybridState:
         except OSError as e:
             self.warn_once("log-write", str(e))
 
+    def flush_online(self) -> None:
+        if not self.online_pending or not self.online_pairs_path:
+            self.online_pending = []
+            return
+        records, self.online_pending = self.online_pending, []
+        if getattr(self.worker, "tp_rank", 0) != 0:
+            return
+        try:
+            with open(self.online_pairs_path, "a") as f:
+                for rec in records:
+                    f.write(json.dumps(rec) + "\n")
+        except OSError as e:
+            self.warn_once("online-pairs-write", str(e))
+
 
 _STATE: _ChainHybridState | None = None
 
@@ -182,15 +218,32 @@ _STATE: _ChainHybridState | None = None
 # prob the same way BEFORE lookup — mirrored here via ``wants_shrunk``.
 
 class _ServingIsoCalibrator:
-    """Frozen isotonic map suffix_p -> P(accept), loaded once at patch time."""
+    """Frozen step-function calibration map p -> P(accept), loaded once at patch
+    time. Two layouts, auto-detected from meta.per_position:
+      global        groups[grp] = {"x":[...],"y":[...]}            (one curve/grp)
+      per-position  groups[grp] = {"<depth>": {"x":[...],"y":[...]}, ...}
+    Any calibrator family (histogram/isotonic/logistic/beta) works — the map is
+    just a dense sampled (x ascending -> y) lookup; predict() never assumes a
+    fit family. predict(group, p, fallback, depth) ignores depth for global maps
+    and picks the depth's curve (nearest fitted depth <= depth, else deepest) for
+    per-position maps."""
 
     def __init__(self, blob: dict):
         import numpy as np
-        self._maps = {
-            grp: (np.asarray(m["x"], dtype=np.float64),
-                  np.asarray(m["y"], dtype=np.float64))
-            for grp, m in blob["groups"].items()
-        }
+        self.per_position = bool(blob.get("meta", {}).get("per_position"))
+        if self.per_position:
+            self._maps = {
+                grp: {int(d): (np.asarray(m["x"], dtype=np.float64),
+                               np.asarray(m["y"], dtype=np.float64))
+                      for d, m in dd.items()}
+                for grp, dd in blob["groups"].items()
+            }
+        else:
+            self._maps = {
+                grp: (np.asarray(m["x"], dtype=np.float64),
+                      np.asarray(m["y"], dtype=np.float64))
+                for grp, m in blob["groups"].items()
+            }
         self.wants_shrunk = bool(blob.get("meta", {}).get("shrink"))
 
     @classmethod
@@ -198,20 +251,483 @@ class _ServingIsoCalibrator:
         with open(path) as f:
             return cls(json.load(f))
 
-    def predict(self, group: str, p: float, fallback: float) -> float:
+    @staticmethod
+    def _lookup(xs, ys, p: float) -> float:
         import numpy as np
-        m = self._maps.get(group)
-        if m is None:
-            return fallback
-        xs, ys = m
         i = int(np.searchsorted(xs, p, side="right")) - 1
         if i < 0:
             i = 0
         v = float(ys[i])
         return v if v > 1e-6 else 1e-6
 
+    def predict(self, group: str, p: float, fallback: float,
+                depth: int = 0, **_) -> float:
+        m = self._maps.get(group)
+        if m is None:
+            return fallback
+        if self.per_position:
+            if depth in m:
+                xs, ys = m[depth]
+            else:  # fallback: nearest fitted depth <= depth, else deepest
+                le = [d for d in m if d <= depth]
+                xs, ys = m[max(le)] if le else m[max(m)]
+            return self._lookup(xs, ys, p)
+        xs, ys = m
+        return self._lookup(xs, ys, p)
+
 
 _CALIB: _ServingIsoCalibrator | None = None
+
+
+# Histogram bin grid for the online calibrator — fixed-width, matches
+# plot_calib_reliability.BIN_W (0.05 -> 20 bins) so the served histogram
+# calibrator and the offline per-depth graphs use identical bins.
+_ONLINE_NB = 20
+_ONLINE_BIN_W = 1.0 / _ONLINE_NB
+
+
+class _OnlineWindowCalibrator:
+    """Causal sliding-window calibrator to the target_p objective.
+
+    Same predict(group, p, fallback, depth) interface as _ServingIsoCalibrator
+    (so the select hook is unchanged), but the per-(group, depth) map is learned
+    ONLINE from a rolling window of (raw_prob, q_target) pairs ingested AFTER each
+    verify. A decision at step T only ever reflects ingests from steps < T (the
+    select hook runs during draft, before chain_forward ingests this step) — so it
+    is causal. The window is measured in CLOCK units (the global batch_counter for
+    continuous scope; per-rid decode_step for per_request scope); samples whose
+    clock falls outside [now-window, now] have their contribution removed exactly.
+    One algorithm per instance:
+      histogram  -> incremental per-bin (count, ysum); predict = bin mean. O(1).
+      isotonic   -> plot_calib_methods.fit_isotonic (handles continuous y).
+      logistic   -> fit_chain_hybrid_calib_perpos._fit_continuous (LinearRegression on p).
+      beta       -> _fit_continuous (LinearRegression on [ln p, ln(1-p)]).
+    Cold start: a (group,depth) cell with < min_samples (or, for histogram, an
+    empty bin) returns the raw fallback -> behaves exactly like raw select1 until
+    the window fills.
+    """
+
+    def __init__(self, method: str, window: int, min_samples: int = 50,
+                 refit_k: int = 0, scope: str = "continuous",
+                 label: str = "target_p", conditional: bool = False):
+        import collections
+        if method not in ("histogram", "isotonic", "logistic", "beta"):
+            raise RuntimeError(f"unknown online calib method {method!r}")
+        if label not in ("target_p", "accept_rate"):
+            raise RuntimeError(f"unknown online label {label!r}")
+        self.method = method
+        self.window = int(window)
+        self.min_samples = int(min_samples)
+        # label: "target_p" regresses raw_prob onto q_target (continuous, the
+        # target's softmax prob of the drafted token); "accept_rate" onto the
+        # binary accept event (drafted token == target's argmax at that row).
+        # conditional: ingest a depth only if the realized chain prefix was
+        # accepted through it (accept_len >= depth) -> per-step CONDITIONAL accept.
+        self.label = label
+        self.conditional = bool(conditional)
+        # histogram/isotonic are cheap -> refit every step; logistic/beta refit
+        # every refit_k steps to bound wall-clock (MAT is unaffected by calibrator
+        # latency, only wall-clock is).
+        self.refit_k = (int(refit_k) if refit_k and int(refit_k) > 0
+                        else (1 if method in ("histogram", "isotonic") else 8))
+        self.scope = scope
+        self.wants_shrunk = False  # target_p maps are never Jeffreys-shrunk
+        self._buf = collections.defaultdict(collections.deque)  # key->deque[(p,q,clock)]
+        self._fitted: dict = {}    # key->predict callable (iso/logistic/beta)
+        self._dirty: set = set()
+        self._bins: dict = {}      # key->(count[NB], ysum[NB])  (histogram)
+        self._fitfn = None         # lazily-imported fit function
+        self.ingested = 0          # diagnostics
+
+    @staticmethod
+    def _bin_idx(p: float) -> int:
+        i = int(float(p) / _ONLINE_BIN_W)
+        if i < 0:
+            return 0
+        return _ONLINE_NB - 1 if i >= _ONLINE_NB else i
+
+    def predict(self, group: str, p: float, fallback: float, depth: int = 0,
+                **_) -> float:
+        key = (group, int(depth))
+        buf = self._buf.get(key)
+        if buf is None or len(buf) < self.min_samples:
+            return fallback
+        if self.method == "histogram":
+            cb = self._bins.get(key)
+            if cb is None:
+                return fallback
+            count, ysum = cb
+            b = self._bin_idx(p)
+            if count[b] <= 0:
+                return fallback
+            v = float(ysum[b] / count[b])
+            return v if v > 1e-6 else 1e-6
+        fn = self._fitted.get(key)
+        if fn is None:
+            return fallback
+        try:
+            # fitted predictors (isotonic/_fit_continuous) expect a >=1-d input
+            # (sklearn isotonic rejects scalars); call with a 1-element list.
+            out = fn([float(p)])
+            v = float(out[0]) if hasattr(out, "__len__") else float(out)
+        except Exception:
+            return fallback
+        v = min(max(v, 0.0), 1.0)
+        return v if v > 1e-6 else 1e-6
+
+    def ingest(self, group: str, depth: int, raw_prob: float, q: float,
+               clock: int) -> None:
+        import numpy as np
+        key = (group, int(depth))
+        buf = self._buf[key]
+        buf.append((float(raw_prob), float(q), int(clock)))
+        self.ingested += 1
+        if self.method == "histogram":
+            cb = self._bins.get(key)
+            if cb is None:
+                cb = (np.zeros(_ONLINE_NB), np.zeros(_ONLINE_NB))
+                self._bins[key] = cb
+            count, ysum = cb
+            b = self._bin_idx(raw_prob)
+            count[b] += 1.0
+            ysum[b] += float(q)
+        cutoff = int(clock) - self.window
+        while buf and buf[0][2] <= cutoff:
+            op, oq, _oc = buf.popleft()
+            if self.method == "histogram":
+                count, ysum = self._bins[key]
+                ob = self._bin_idx(op)
+                count[ob] -= 1.0
+                ysum[ob] -= oq
+                if count[ob] < 0:
+                    count[ob] = 0.0  # fp guard
+        self._dirty.add(key)
+
+    def _get_fit_fn(self):
+        if self._fitfn is not None:
+            return self._fitfn
+        import sys
+        from pathlib import Path
+        sd = str(Path(__file__).resolve().parents[1] / "scripts")
+        if sd not in sys.path:
+            sys.path.insert(0, sd)
+        if self.method == "isotonic":
+            # isotonic handles both continuous q_target and 0/1 accept natively
+            from plot_calib_methods import fit_isotonic
+            self._fitfn = lambda p, y: fit_isotonic(p, y)[3]
+        elif self.label == "accept_rate":
+            # binary 0/1 label -> the REAL logistic/beta calibrators
+            from plot_calib_methods import fit_logistic, fit_beta
+            fn = fit_logistic if self.method == "logistic" else fit_beta
+            self._fitfn = lambda p, y, _fn=fn: _fn(p, y)[3]
+        else:  # target_p continuous -> LinearRegression analog (NOT real logistic)
+            from fit_chain_hybrid_calib_perpos import _fit_continuous
+            m = self.method
+            self._fitfn = lambda p, y, _m=m: _fit_continuous(_m, p, y)
+        return self._fitfn
+
+    def maybe_refit(self, clock: int) -> None:
+        if self.method == "histogram":
+            return  # incremental — nothing to batch-refit
+        if int(clock) % self.refit_k != 0 or not self._dirty:
+            return
+        import numpy as np
+        try:
+            fitfn = self._get_fit_fn()
+        except Exception as e:
+            logger.warning(f"online-calib fit import failed ({self.method}): {e}")
+            self._dirty.clear()
+            return
+        for key in list(self._dirty):
+            buf = self._buf.get(key)
+            if not buf or len(buf) < self.min_samples:
+                continue
+            n = len(buf)
+            p = np.fromiter((s[0] for s in buf), dtype=np.float64, count=n)
+            y = np.fromiter((s[1] for s in buf), dtype=np.float64, count=n)
+            try:
+                self._fitted[key] = fitfn(p, y)
+            except Exception:
+                pass  # keep prior fit; treat as cold only if never fit
+        self._dirty.clear()
+
+    def reset_request(self) -> None:
+        """per_request scope: drop all windowed state at a new request."""
+        self._buf.clear()
+        self._fitted.clear()
+        self._dirty.clear()
+        self._bins.clear()
+
+
+class _OnlineMultiFeatCalibrator:
+    """COMBO: online sliding-window MULTI-FEATURE per-proposer calibrator with the
+    accept-conditioned (alive-prefix) ingest. Like _OnlineWindowCalibrator but each
+    group keeps a window of (feature-vector, y) and refits a standardized logistic
+    (accept_rate) / linear (target_p) model instead of a 1-D map:
+      eagle  features = [eagle_p, depth]
+      suffix features = [suffix_p, log1p(count), log1p(total), match_len, depth]
+    No training/frozen map — learned at serving time from the rolling window.
+    predict() falls back to raw until the window holds >= min_samples."""
+    FEATS = {"eagle": ("eagle_p", "depth"),
+             "suffix": ("suffix_p", "log1p_count", "log1p_total", "match_len", "depth")}
+
+    def __init__(self, window: int, min_samples: int = 50, refit_k: int = 0,
+                 scope: str = "continuous", label: str = "accept_rate",
+                 conditional: bool = True):
+        import collections
+        if label not in ("target_p", "accept_rate"):
+            raise RuntimeError(f"unknown online label {label!r}")
+        self.method = "multifeat"
+        self.multifeat = True
+        self.window = int(window)
+        self.min_samples = int(min_samples)
+        self.refit_k = int(refit_k) if refit_k and int(refit_k) > 0 else 8
+        self.scope = scope
+        self.label = label
+        self.conditional = bool(conditional)
+        self.wants_shrunk = False
+        self._buf = collections.defaultdict(collections.deque)  # group->deque[(fv,y,clk)]
+        self._model = {}   # group->(mean,std,coef,intercept,kind)
+        self._dirty: set = set()
+        self.ingested = 0
+
+    def featvec(self, group, p, depth, count, total, match_len):
+        import numpy as np
+        out = []
+        for f in self.FEATS[group]:
+            if f in ("eagle_p", "suffix_p"):
+                out.append(float(p))
+            elif f == "depth":
+                out.append(float(depth))
+            elif f == "match_len":
+                if match_len is None:
+                    return None
+                out.append(float(match_len))
+            elif f == "log1p_count":
+                if count is None:
+                    return None
+                out.append(float(np.log1p(count)))
+            elif f == "log1p_total":
+                if total is None:
+                    return None
+                out.append(float(np.log1p(total)))
+        return np.asarray(out, dtype=np.float64)
+
+    def ingest(self, group, featvec, y, clock):
+        if featvec is None:
+            return
+        buf = self._buf[group]
+        buf.append((featvec, float(y), int(clock)))
+        self.ingested += 1
+        cutoff = int(clock) - self.window
+        while buf and buf[0][2] <= cutoff:
+            buf.popleft()
+        self._dirty.add(group)
+
+    def maybe_refit(self, clock: int) -> None:
+        if int(clock) % self.refit_k != 0 or not self._dirty:
+            return
+        import numpy as np
+        for g in list(self._dirty):
+            buf = self._buf.get(g)
+            if not buf or len(buf) < self.min_samples:
+                continue
+            X = np.array([b[0] for b in buf]); y = np.array([b[1] for b in buf])
+            mean = X.mean(0); std = X.std(0); std[std == 0] = 1.0
+            Xs = (X - mean) / std
+            try:
+                if self.label == "accept_rate":
+                    from sklearn.linear_model import LogisticRegression
+                    yb = (y >= 0.5).astype(int)
+                    if np.unique(yb).size < 2:
+                        continue  # single class in window -> keep prior fit
+                    m = LogisticRegression(max_iter=500).fit(Xs, yb)
+                    self._model[g] = (mean, std, m.coef_[0], float(m.intercept_[0]), "logistic")
+                else:
+                    from sklearn.linear_model import LinearRegression
+                    m = LinearRegression().fit(Xs, y)
+                    self._model[g] = (mean, std, m.coef_, float(m.intercept_), "linear")
+            except Exception:
+                pass
+        self._dirty.clear()
+
+    def predict(self, group, p, fallback, depth=0, count=None, total=None,
+                match_len=None, **_):
+        import numpy as np
+        mdl = self._model.get(group)
+        buf = self._buf.get(group)
+        if mdl is None or buf is None or len(buf) < self.min_samples:
+            return fallback
+        x = self.featvec(group, p, depth, count, total, match_len)
+        if x is None:
+            return fallback
+        mean, std, coef, intc, kind = mdl
+        z = intc + float(np.dot(coef, (x - mean) / std))
+        v = 1.0/(1.0+np.exp(-z)) if kind == "logistic" else min(max(z, 0.0), 1.0)
+        return float(v) if v > 1e-6 else 1e-6
+
+    def reset_request(self) -> None:
+        self._buf.clear(); self._model.clear(); self._dirty.clear()
+
+
+_ONLINE = None
+
+
+class _ServingMultiFeatCalibrator:
+    """Direction-2 MULTI-FEATURE per-proposer calibrator. Loads a frozen
+    fit_chain_hybrid_calib_multifeat map and evaluates the standardized
+    linear/logistic form at serving (no sklearn). Per-proposer (NOT fusion):
+      eagle  features = [eagle_p, depth]
+      suffix features = [suffix_p, log1p(count), log1p(total), match_len, depth]
+    predict() returns the raw fallback if a required feature is missing."""
+
+    def __init__(self, blob: dict):
+        import numpy as np
+        self.kind = blob.get("meta", {}).get("kind", "logistic")
+        self.wants_shrunk = False  # multi-feat uses raw suffix_p (no Jeffreys)
+        self._g = {}
+        for g, m in blob["groups"].items():
+            self._g[g] = {
+                "features": list(m["features"]),
+                "mean": np.asarray(m["mean"], float),
+                "std": np.asarray(m["std"], float),
+                "coef": np.asarray(m["coef"], float),
+                "intercept": float(m["intercept"]),
+                "kind": m["kind"]}
+
+    @classmethod
+    def load(cls, path: str) -> "_ServingMultiFeatCalibrator":
+        with open(path) as f:
+            return cls(json.load(f))
+
+    def _vec(self, feats, p, depth, count, total, match_len):
+        import numpy as np
+        out = []
+        for fn in feats:
+            if fn in ("eagle_p", "suffix_p"):
+                out.append(float(p))
+            elif fn == "depth":
+                out.append(float(depth))
+            elif fn == "match_len":
+                if match_len is None:
+                    return None
+                out.append(float(match_len))
+            elif fn == "log1p_count":
+                if count is None:
+                    return None
+                out.append(float(np.log1p(count)))
+            elif fn == "log1p_total":
+                if total is None:
+                    return None
+                out.append(float(np.log1p(total)))
+            else:
+                return None
+        return np.asarray(out, float)
+
+    def predict(self, group: str, p: float, fallback: float, depth: int = 0,
+                count=None, total=None, match_len=None, **_) -> float:
+        import numpy as np
+        m = self._g.get(group)
+        if m is None:
+            return fallback
+        x = self._vec(m["features"], p, depth, count, total, match_len)
+        if x is None:
+            return fallback
+        xs = (x - m["mean"]) / m["std"]
+        z = m["intercept"] + float(np.dot(m["coef"], xs))
+        if m["kind"] == "logistic":
+            return float(1.0 / (1.0 + np.exp(-z)))
+        return float(min(max(z, 0.0), 1.0))
+
+
+class _ServingDiscriminator:
+    """Joint logistic/beta discriminator: predicts P(pick suffix) from BOTH
+    proposers' features at once, replacing the per-proposer suffix_cmp>eagle_cmp
+    test. Per-proposer calibration can only see its own score; selection is a
+    joint function of both scores plus the trie evidence (count/total/match_len),
+    so we fit ONE model on the comparative label. Serving needs no sklearn — just
+    standardize, dot, sigmoid.
+
+    JSON blob (written by fit_chain_hybrid_discriminator.py):
+      {"kind":"logistic"|"beta", "feature_names":[...],
+       "mean":[...], "std":[...], "coef":[...], "intercept":float}
+    The feature VECTOR is built by features() below, which MUST match the fitter
+    exactly (the fitter imports this same staticmethod)."""
+
+    def __init__(self, blob: dict):
+        import numpy as np
+        self.kind = blob["kind"]
+        self.feature_names = list(blob.get("feature_names", []))
+        # depth is an OPTIONAL trailing feature (our-Bayes spec); a map fit without
+        # it has no "depth" name -> serving must not append it (keeps the feature
+        # vector byte-identical to the fit). Old maps therefore still load.
+        self.with_depth = "depth" in self.feature_names
+        self.accept_conditioned = bool(blob.get("accept_conditioned", False))
+        # GBM boundary arms (Panel-B ceiling / Bayes): a pickled sklearn
+        # HistGradientBoostingClassifier on (suffix_p, eagle_p, [depth]); apply
+        # predict_proba directly (no standardize/dot/sigmoid).
+        self.is_gbm = self.kind.startswith("gbm")
+        if self.is_gbm:
+            import base64
+            import pickle
+            self.model = pickle.loads(base64.b64decode(blob["model_b64"]))
+            return
+        self.mean = np.asarray(blob["mean"], dtype=np.float64)
+        self.std = np.asarray(blob["std"], dtype=np.float64)
+        self.coef = np.asarray(blob["coef"], dtype=np.float64)
+        self.intercept = float(blob["intercept"])
+
+    @classmethod
+    def load(cls, path: str) -> "_ServingDiscriminator":
+        with open(path) as f:
+            return cls(json.load(f))
+
+    @staticmethod
+    def features(kind: str, suffix_p, eagle_p, match_len,
+                 suffix_count, suffix_total, depth=None) -> list:
+        """Build the feature vector from the chosen 5-signal set. logistic uses
+        the two probs raw; beta encodes each prob as [ln p, ln(1-p)] (= beta
+        calibration generalised to multiple inputs). Non-prob signals
+        (match_len, count, total) enter both the same way. depth, when provided
+        (our-Bayes spec), is appended LAST so the with/without-depth vectors share
+        a prefix and old maps stay loadable."""
+        ml = float(match_len or 0.0)
+        c = float(suffix_count or 0.0)
+        n = float(suffix_total or 0.0)
+        sp = float(suffix_p if suffix_p is not None else 0.0)
+        ep = float(eagle_p if eagle_p is not None else 0.0)
+        if kind == "beta":
+            def lo(p):
+                p = min(max(p, 1e-4), 1.0 - 1e-4)
+                return [math.log(p), math.log(1.0 - p)]
+            feats = lo(sp) + lo(ep) + [ml, c, n]
+        else:
+            feats = [sp, ep, ml, c, n]
+        if depth is not None:
+            feats = feats + [float(depth)]
+        return feats
+
+    def predict(self, suffix_p, eagle_p, match_len,
+                suffix_count, suffix_total, depth=None) -> float:
+        import numpy as np
+        if self.is_gbm:
+            sp = float(suffix_p if suffix_p is not None else 0.0)
+            ep = float(eagle_p if eagle_p is not None else 0.0)
+            x = [sp, ep] + ([float(depth if depth is not None else 0)] if self.with_depth else [])
+            return float(self.model.predict_proba([x])[0, 1])
+        d = depth if self.with_depth else None
+        x = np.asarray(self.features(self.kind, suffix_p, eagle_p, match_len,
+                                     suffix_count, suffix_total, depth=d),
+                       dtype=np.float64)
+        z = (x - self.mean) / self.std
+        logit = float(self.coef @ z) + self.intercept
+        if logit >= 0:  # numerically stable sigmoid
+            return 1.0 / (1.0 + math.exp(-logit))
+        e = math.exp(logit)
+        return e / (1.0 + e)
+
+
+_DISC: _ServingDiscriminator | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +807,29 @@ def _decide_and_inject(st: _ChainHybridState, depth: int, topk_p, topk_index):
             except Exception as e:
                 st.warn_once("speculate", str(e))
 
+        # Eagle distributional confidence (capture-time, env-gated): entropy +
+        # top-2 margin of eagle's full next-token distribution, plus the draft's
+        # endorsement of the suffix candidate p_eagle(suffix_token). Stashed by
+        # the fast_topk wrapper for THIS step (it runs just before this hook).
+        if getattr(st, "log_eagle_dist", False):
+            ed = getattr(st, "eagle_dist", None)
+            if ed is not None and r < ed["entropy"].shape[0]:
+                rec["eagle_entropy"] = round(float(ed["entropy"][r]), 6)
+                rec["eagle_top2_margin"] = round(float(ed["margin"][r]), 6)
+                pr = ed["probs"]
+                t2d = getattr(st, "t2d", None)
+
+                def _peagle(tok, _pr=pr, _r=r, _t2d=t2d):
+                    di = (int(tok) if _t2d is None
+                          else _t2d.get(int(tok)))  # target id -> draft index
+                    if di is None or _r >= _pr.shape[0] or di >= _pr.shape[-1]:
+                        return 0.0  # token outside the draft's hot vocab
+                    return float(_pr[_r, di])
+
+                rec["p_eagle_eagle"] = round(_peagle(eagle_tok), 6)
+                if suffix_tok is not None:
+                    rec["p_eagle_suffix"] = round(_peagle(suffix_tok), 6)
+
         # ORACLE mode: the ground-truth token gt[L+depth] decides — eagle if
         # it matches, else suffix (injected) if it matches, else the chain is
         # dead here (proposal-limited selection ceiling).
@@ -336,7 +875,7 @@ def _decide_and_inject(st: _ChainHybridState, depth: int, topk_p, topk_index):
         suffix_cmp = suffix_p
         eagle_cmp = eagle_p
         if _CALIB is not None:
-            eagle_cmp = _CALIB.predict("eagle", eagle_p, eagle_p)
+            eagle_cmp = _CALIB.predict("eagle", eagle_p, eagle_p, depth=depth)
             rec["eagle_p_cal"] = round(eagle_cmp, 6)
             if suffix_p is not None:
                 p_in = suffix_p
@@ -348,25 +887,63 @@ def _decide_and_inject(st: _ChainHybridState, depth: int, topk_p, topk_index):
                             "no-counts",
                             "calib map wants Jeffreys-shrunk probs but the "
                             "suffix draft exposed no counts; using raw suffix_p")
-                suffix_cmp = _CALIB.predict("suffix", p_in, suffix_p)
+                suffix_cmp = _CALIB.predict("suffix", p_in, suffix_p, depth=depth,
+                                            count=suffix_count, total=suffix_total,
+                                            match_len=rec.get("match_len"))
                 rec["suffix_p_cal"] = round(suffix_cmp, 6)
 
         chosen_tok = eagle_tok
         if suffix_tok is not None:
             rec["agreement"] = suffix_tok == eagle_tok
-            if suffix_tok != eagle_tok and suffix_cmp is not None \
-                    and suffix_cmp > eagle_cmp:
-                if new_p is None:
-                    new_p = topk_p.clone()
-                    new_idx = topk_index.clone()
-                new_idx[r, 0] = suffix_tok
-                # Clamp keeps cumulative chain scores monotone non-increasing
-                # (probs are <= 1 by construction; defensive).
-                new_p[r, 0] = min(max(suffix_cmp, 0.0), 1.0)
-                chosen_tok = suffix_tok
-                rec["chosen"] = "suffix"
+            if suffix_tok != eagle_tok:
+                if _DISC is not None and suffix_p is not None:
+                    # Joint discriminator: P(pick suffix) from BOTH proposers'
+                    # features. The chain score stays the raw suffix_p (the
+                    # token's own prob, as in the raw arm) — the discriminator
+                    # only decides the pick, not the verifier's chain score.
+                    pick_p = _DISC.predict(suffix_p, eagle_p,
+                                           rec.get("match_len"),
+                                           suffix_count, suffix_total,
+                                           depth=depth)
+                    rec["disc_p"] = round(float(pick_p), 6)
+                    take = pick_p > 0.5
+                    score_val = suffix_p
+                else:
+                    take = (suffix_cmp is not None and suffix_cmp > eagle_cmp)
+                    score_val = suffix_cmp
+                if take:
+                    if new_p is None:
+                        new_p = topk_p.clone()
+                        new_idx = topk_index.clone()
+                    new_idx[r, 0] = suffix_tok
+                    # Clamp keeps cumulative chain scores monotone non-increasing
+                    # (probs are <= 1 by construction; defensive).
+                    new_p[r, 0] = min(max(score_val, 0.0), 1.0)
+                    chosen_tok = suffix_tok
+                    rec["chosen"] = "suffix"
 
+        # PIN: log the GT comparison (oracle_hit/gt_token) for analysis WITHOUT
+        # changing the served pick -- gt is precomputed when pin is active, so any
+        # arm (raw/calib/disc) gets per-decision selection-accuracy labels.
+        if st.pin_active and "oracle_hit" not in rec:
+            gt_list = st.gt.get(rid)
+            Lp = (st.gt_pos[r] if st.gt_pos is not None and r < len(st.gt_pos)
+                  else None)
+            gt_tok = (int(gt_list[Lp + depth]) if (gt_list is not None and Lp is not None
+                      and Lp + depth < len(gt_list)) else None)
+            rec["gt_token"] = gt_tok
+            if gt_tok is None:
+                rec["oracle_hit"] = "nogt"
+            else:
+                e_hit = eagle_tok == gt_tok
+                s_hit = (suffix_tok == gt_tok) if suffix_tok is not None else False
+                rec["oracle_hit"] = ("both" if (e_hit and s_hit) else "eagle" if e_hit
+                                     else "suffix" if s_hit else "none")
         chain.append(chosen_tok)
+        if st.online is not None:
+            # Transient store for the post-verify q_target join (flush() empties
+            # st.pending before chain_forward runs).
+            st.last_decisions.setdefault(rid, {})[depth] = rec
         st.pending.append(rec)
 
     return (new_p if new_p is not None else topk_p,
@@ -435,8 +1012,106 @@ def _inject_fallback_run(st: _ChainHybridState, depth: int, topk_p, topk_index):
             new_idx if new_idx is not None else topk_index)
 
 
+def _install_verify_greedy_oracle() -> None:
+    """Oracle teacher-forcing for sglang >=0.5.12: override the verify's
+    target_predict (= argmax of the target logits, eagle_info.verify) with the
+    recorded GT so the committed token (accepted chain prefix + bonus) follows
+    GT EXACTLY. Without this, greedy diverges from the recorded GT on FP
+    near-ties; the old force-to-GT (applied after forward_batch_generation) is
+    too late to fix the next-draft conditioning (built from verify_output inside
+    forward_batch_generation) -> divergence cascades into runaway generation
+    (past_gt_end ~1e6) and the draft is conditioned off-GT (eagle==gt collapses).
+    Forcing target_predict=GT makes verify NATURALLY commit GT and rebuild the
+    extend input from GT, with zero divergence. Linear chain (topk=1):
+    target_predict[r, j] = GT[gt_pos[r] + j] (root..step S); -1 past GT -> keep
+    the real argmax there (request is at/after EOS and finishes)."""
+    import sglang.srt.speculative.eagle_info as eagle_info
+    if getattr(eagle_info, "_chain_hybrid_verify_oracle_patched", False):
+        return
+    original = eagle_info.verify_tree_greedy_func
+
+    def patched(*args, **kwargs):
+        st = _STATE
+        ov = getattr(st, "gt_predict_override", None) if st is not None else None
+        tp = kwargs.get("target_predict")
+        if ov is not None and tp is not None and getattr(tp, "dim", None) \
+                and tp.dim() == 2:
+            try:
+                import torch
+                ov_t = torch.tensor(ov, dtype=tp.dtype, device=tp.device)
+                rows = min(tp.shape[0], ov_t.shape[0])
+                cols = min(tp.shape[1], ov_t.shape[1])
+                sub = ov_t[:rows, :cols]
+                mask = sub >= 0
+                tp[:rows, :cols] = torch.where(mask, sub, tp[:rows, :cols])
+            except Exception as e:
+                if st is not None:
+                    st.warn_once("verify-oracle-override", str(e))
+        return original(*args, **kwargs)
+
+    eagle_info.verify_tree_greedy_func = patched
+    eagle_info._chain_hybrid_verify_oracle_patched = True
+    logger.info(
+        "chain-hybrid: verify_tree_greedy_func oracle GT-override installed")
+
+
+def _install_eagle_dist_logging() -> None:
+    """Capture-time instrument (env SGLANG_CHAIN_HYBRID_LOG_EAGLE_DIST=1): wrap
+    fast_topk so eagle's FULL next-token distribution (the arg to fast_topk,
+    before the top-1 reduction) is summarised into entropy + top-2 margin and
+    stashed per step. The decision hook then records those + p_eagle(suffix_tok).
+    Adds a full-vocab reduction per draft step -> only for the small feature
+    capture, never the default path."""
+    import importlib
+    import torch
+    for modname in ("sglang.srt.speculative.eagle_worker",
+                    "sglang.srt.speculative.multi_layer_eagle_worker"):
+        try:
+            m = importlib.import_module(modname)
+        except Exception:
+            continue
+        if not hasattr(m, "fast_topk") \
+                or getattr(m, "_chain_hybrid_dist_patched", False):
+            continue
+        orig = m.fast_topk
+
+        def wrapped(probs, topk, dim=-1, _orig=orig):
+            st = _STATE
+            try:
+                if st is not None and probs is not None and probs.dim() == 2:
+                    p = probs.float()
+                    ent = -(p * torch.log(p + 1e-12)).sum(dim=-1)
+                    t2 = torch.topk(p, 2, dim=-1).values
+                    st.eagle_dist = {
+                        "entropy": ent.detach().cpu(),
+                        "margin": (t2[:, 0] - t2[:, 1]).detach().cpu(),
+                        "probs": p.detach()}
+            except Exception as e:
+                if st is not None:
+                    st.warn_once("eagle-dist", str(e))
+            return _orig(probs, topk, dim=dim)
+
+        m.fast_topk = wrapped
+        m._chain_hybrid_dist_patched = True
+    # Build target_id -> draft(hot-vocab) index map so p_eagle(token) can index
+    # the draft `probs` (which live in the reduced hot-token space; topk_index is
+    # remapped to target ids via hot_token_id at eagle_worker.py:873/929). None
+    # hot_token_id => draft uses full target vocab => direct indexing.
+    try:
+        hid = getattr(_STATE.worker, "hot_token_id", None)
+        _STATE.t2d = ({int(t): i for i, t in enumerate(hid.tolist())}
+                      if hid is not None else None)
+        logger.info("chain-hybrid: eagle-dist t2d map "
+                    f"({'None(full-vocab)' if _STATE.t2d is None else len(_STATE.t2d)})")
+    except Exception as e:
+        _STATE.t2d = None
+        _STATE.warn_once("t2d", str(e))
+    logger.info("chain-hybrid: eagle-distribution logging installed (fast_topk)")
+
+
 def _install_select_wrapper() -> None:
-    """Rebind eagle_worker module's select_top_k_tokens with the decision hook.
+    """Rebind select_top_k_tokens with the decision hook in EVERY module that
+    binds it by-name.
 
     draft_forward resolves select_top_k_tokens as a module global at call
     time and invokes it at the top of every draft step with exactly the
@@ -444,12 +1119,37 @@ def _install_select_wrapper() -> None:
     hot_token_id remap sites, so injected suffix tokens (full-vocab ids)
     are never remapped. Same rebind pattern as oracle_patch's
     organize_draft_results tracer.
-    """
-    import sglang.srt.speculative.eagle_worker as ew_module
 
-    if getattr(ew_module, "_chain_hybrid_select_patched", False):
+    sglang imports select_top_k_tokens by-name into BOTH eagle_worker and
+    multi_layer_eagle_worker (the MTP path, used on Qwen3.5-27B under
+    --disable-overlap-schedule); patching only eagle_worker would make the hook
+    a silent no-op on MTP. We rebind all available bindings (eagle_worker,
+    multi_layer_eagle_worker, spec_utils) to the same wrapper.
+    """
+    import importlib
+
+    mods = []
+    for modname in ("sglang.srt.speculative.eagle_worker",
+                    "sglang.srt.speculative.multi_layer_eagle_worker",
+                    "sglang.srt.speculative.spec_utils"):
+        try:
+            m = importlib.import_module(modname)
+        except Exception:
+            continue
+        if hasattr(m, "select_top_k_tokens"):
+            mods.append(m)
+    if not mods:
+        logger.warning("chain-hybrid: no select_top_k_tokens binding found")
         return
-    original = ew_module.select_top_k_tokens
+    # Capture the TRUE original from any module not yet patched (all modules
+    # import the same underlying function by-name).
+    original = None
+    for m in mods:
+        if not getattr(m, "_chain_hybrid_select_patched", False):
+            original = m.select_top_k_tokens
+            break
+    if original is None:
+        return  # every binding already patched
 
     def chain_hybrid_select(i, topk_p, topk_index, hidden_states, scores, topk):
         st = _STATE
@@ -475,9 +1175,15 @@ def _install_select_wrapper() -> None:
             st.warn_once("decide", str(e))
         return original(i, topk_p, topk_index, hidden_states, scores, topk)
 
-    ew_module.select_top_k_tokens = chain_hybrid_select
-    ew_module._chain_hybrid_select_patched = True
-    logger.info("chain-hybrid: select_top_k_tokens decision hook installed")
+    installed = []
+    for m in mods:
+        if getattr(m, "_chain_hybrid_select_patched", False):
+            continue
+        m.select_top_k_tokens = chain_hybrid_select
+        m._chain_hybrid_select_patched = True
+        installed.append(m.__name__.rsplit(".", 1)[-1])
+    logger.info(
+        f"chain-hybrid: select_top_k_tokens decision hook installed on {installed}")
 
 
 # ---------------------------------------------------------------------------
@@ -566,9 +1272,15 @@ def _tail_append(st: _ChainHybridState, spec_info) -> None:
             pass
 
     dev = spec_info.draft_token.device
+    # sglang 0.5.9 spelled these "retrive_*"; >=0.5.11 fixed to "retrieve_*".
+    _ri = "retrieve_index" if hasattr(spec_info, "retrieve_index") else "retrive_index"
+    _nx = ("retrieve_next_token" if hasattr(spec_info, "retrieve_next_token")
+           else "retrive_next_token")
+    _sb = ("retrieve_next_sibling" if hasattr(spec_info, "retrieve_next_sibling")
+           else "retrive_next_sibling")
     dtypes = {
         "positions": spec_info.positions.dtype,
-        "retrive": spec_info.retrive_index.dtype,
+        "retrive": getattr(spec_info, _ri).dtype,
         "mask": spec_info.custom_mask.dtype,
     }
 
@@ -580,11 +1292,11 @@ def _tail_append(st: _ChainHybridState, spec_info) -> None:
             ndt_old, seq_len, dev, dtypes)
         checks = [
             ("positions", torch.equal(pos0, spec_info.positions)),
-            ("retrive_index", torch.equal(ri0, spec_info.retrive_index)),
+            ("retrive_index", torch.equal(ri0, getattr(spec_info, _ri))),
             ("retrive_next_token",
-             torch.equal(nx0, spec_info.retrive_next_token)),
+             torch.equal(nx0, getattr(spec_info, _nx))),
             ("retrive_next_sibling",
-             torch.equal(sb0, spec_info.retrive_next_sibling)),
+             torch.equal(sb0, getattr(spec_info, _sb))),
             ("custom_mask", torch.equal(mk0, spec_info.custom_mask)),
         ]
         bad = [name for name, ok in checks if not ok]
@@ -629,9 +1341,9 @@ def _tail_append(st: _ChainHybridState, spec_info) -> None:
          torch.tensor(tail_tokens, dtype=spec_info.draft_token.dtype,
                       device=dev)])
     spec_info.positions = positions
-    spec_info.retrive_index = ri
-    spec_info.retrive_next_token = nx
-    spec_info.retrive_next_sibling = sb
+    setattr(spec_info, _ri, ri)
+    setattr(spec_info, _nx, nx)
+    setattr(spec_info, _sb, sb)
     spec_info.custom_mask = mask
     spec_info.spec_steps = int(spec_info.spec_steps) + t  # sizes accept_index
     spec_info.draft_token_num = ndt_new
@@ -681,6 +1393,8 @@ def _patch_draft(eagle_worker) -> None:
                 st.fallback_meta = None
             else:
                 st.batch_counter += 1
+                if st.online is not None:
+                    st.last_decisions = {}  # fresh per step (consumed post-verify)
                 stash = []
                 chains = []
                 fb_runs = []
@@ -703,7 +1417,7 @@ def _patch_draft(eagle_worker) -> None:
                             st.decode_step[rid] = 0
                         except Exception as e:
                             st.warn_once("start_request", str(e))
-                        if st.mode == "oracle":
+                        if st.mode == "oracle" or st.pin_active:
                             g = (st.gt_map or {}).get(
                                 tuple(req.origin_input_ids))
                             st.gt[rid] = list(g) if g is not None else None
@@ -711,6 +1425,19 @@ def _patch_draft(eagle_worker) -> None:
                             st.gt_stats[
                                 "matched" if g is not None else "unmatched"
                             ] += 1
+                            # Emit this rid's prompt ONCE so offline
+                            # target-prob capture can bridge rid -> input_ids
+                            # -> GT trajectory exactly. The decision log keys
+                            # rows by an opaque rid only, and greedy outputs can
+                            # collide across DISTINCT prompts (same continuation,
+                            # different input_ids), so a content-only bridge is
+                            # ambiguous; input_ids is the exact key (matches the
+                            # gt_map lookup above and gt_tokens.jsonl).
+                            st.pending.append({
+                                "type": "req", "rid": rid,
+                                "input_ids": [int(x)
+                                              for x in req.origin_input_ids],
+                            })
                             if g is None:
                                 st.warn_once(
                                     "gt-unmatched",
@@ -758,7 +1485,31 @@ def _patch_draft(eagle_worker) -> None:
                 st.chains = chains
                 st.fallback_runs = fb_runs if st.mode == "score_fallback" else None
                 st.fallback_meta = fb_meta if st.mode == "score_fallback" else None
-                st.gt_pos = gt_pos if st.mode == "oracle" else None
+                st.gt_pos = (gt_pos if (st.mode == "oracle" or st.pin_active)
+                             else None)
+                # Oracle/pin: precompute each row's GT continuation so the verify
+                # hook can override target_predict (= argmax) with GT, forcing
+                # the committed token (incl. the bonus) onto the GT trajectory.
+                # S+1 entries (root..last step); -1 past GT end (chain ends).
+                if st.mode == "oracle" or st.pin_active:
+                    # head chain (S+1) + optional suffix tail (tail_max): the
+                    # verify is one linear sequence [root,c1..cS,t1..tT], so
+                    # verify token k -> output position gt_pos[r]+k for the whole
+                    # length; override target_predict over head AND tail.
+                    s1 = int(eagle_worker.speculative_num_steps) + 1 \
+                        + int(st.tail_max)
+                    ov = []
+                    for r, (rid, _ctx) in enumerate(stash):
+                        g = st.gt.get(rid)
+                        L = gt_pos[r] if r < len(gt_pos) else None
+                        if g is not None and L is not None:
+                            ov.append([int(g[L + j]) if (L + j) < len(g) else -1
+                                       for j in range(s1)])
+                        else:
+                            ov.append([-1] * s1)
+                    st.gt_predict_override = ov
+                else:
+                    st.gt_predict_override = None
         except Exception as e:
             st.stash = None
             st.chains = None
@@ -773,6 +1524,10 @@ def _patch_draft(eagle_worker) -> None:
                     _tail_append(st, result)
                 except Exception as e:
                     st.warn_once("tail", str(e))
+            if st.online is not None:
+                # draft_token_num gives the per-request stride into the verify
+                # logits (req_offset = i*num_draft) for the post-verify q join.
+                st.last_num_draft = getattr(result, "draft_token_num", None)
             return result
         finally:
             st.stash = None
@@ -782,6 +1537,22 @@ def _patch_draft(eagle_worker) -> None:
             st.flush()
 
     eagle_worker.draft = chain_draft
+
+
+def _load_gt_map(path: str) -> dict:
+    """Load a gt_tokens.jsonl ({input_ids, output_ids} per line) into a
+    {tuple(input_ids): output_ids} map. Shared by oracle mode (selection
+    ceiling) and pin mode (force every arm's committed tokens onto this
+    standalone trajectory)."""
+    gt_map: dict = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            gt_map[tuple(rec["input_ids"])] = rec["output_ids"]
+    return gt_map
 
 
 def _dump_gt(st: _ChainHybridState, req) -> None:
@@ -803,6 +1574,97 @@ def _dump_gt(st: _ChainHybridState, req) -> None:
 # Forward wrapper: incremental trie updates + per-step accept records
 # ---------------------------------------------------------------------------
 
+def _online_ingest(st: "_ChainHybridState", eagle_worker, i: int, rid: str,
+                   accept_lens: list) -> None:
+    """Post-verify: read q_target for each depth's eagle/suffix token from the
+    stashed verify logits and feed (raw_prob, q_target) into the online window.
+
+    The chain verify input is [root, c_1, ..., c_S(, tail)]; the verify-logit row
+    at chain position k predicts the token at position k+1. A depth-d decision's
+    token sits at position d+1, so its q_target = softmax(verify_logits[req_offset
+    + d])[token_id] — read for BOTH eagle and suffix off the SAME row (loser not
+    censored), conditioned on the realized chain prefix. Tail rows are skipped
+    (their suffix_p is a cumulative path prob, not a single-edge prob)."""
+    import torch.nn.functional as F
+    vl = getattr(eagle_worker, "_oracle_stashed_verify_logits", None)
+    if vl is None:
+        st.warn_once("online-no-logits",
+                     "verify logits not stashed; online ingest skipped")
+        return
+    decs = st.last_decisions.get(rid)
+    if not decs:
+        return
+    nd = int(st.last_num_draft or vl.shape[0])
+    req_offset = i * nd
+    clock = (st.batch_counter if st.online.scope == "continuous"
+             else st.decode_step.get(rid, 0))
+    alen = int(accept_lens[i]) if i < len(accept_lens) else None
+    V = vl.shape[-1]
+    for depth, rec in decs.items():
+        if rec.get("tail"):
+            continue
+        # conditional (accept-conditioned): ingest a depth only if the realized
+        # chain prefix was accepted through it (accept_len >= depth) -> the
+        # per-step CONDITIONAL accept population, not the dead-chain pool.
+        if (st.online.conditional and alen is not None
+                and int(depth) > alen):
+            continue
+        row = req_offset + int(depth)
+        if row < 0 or row >= vl.shape[0]:
+            continue
+        probs = F.softmax(vl[row].float(), dim=-1)
+        # target's committed token at this row (= argmax | realized prefix).
+        # accept_rate label = (drafted token == committed); logged for both
+        # objectives so the offline reliability plot can recover the accept
+        # event for BOTH proposers (loser included), not just the chosen one.
+        committed = int(probs.argmax())
+        ep = rec.get("eagle_p")
+        et = rec.get("eagle_token")
+        q_eagle = None
+        mf = getattr(st.online, "multifeat", False)
+        if ep is not None and et is not None and 0 <= int(et) < V:
+            q_eagle = float(probs[int(et)])  # target prob (diag + target_p label)
+            y = (1.0 if int(et) == committed else 0.0) \
+                if st.online.label == "accept_rate" else q_eagle
+            if mf:
+                st.online.ingest(
+                    "eagle", st.online.featvec("eagle", ep, int(depth), None, None, None),
+                    y, clock)
+            else:
+                st.online.ingest("eagle", int(depth), ep, y, clock)
+        sp = rec.get("suffix_p")
+        stk = rec.get("suffix_token")
+        q_suffix = None
+        if sp is not None and stk is not None and 0 <= int(stk) < V:
+            q_suffix = float(probs[int(stk)])
+            y = (1.0 if int(stk) == committed else 0.0) \
+                if st.online.label == "accept_rate" else q_suffix
+            if mf:
+                st.online.ingest(
+                    "suffix", st.online.featvec(
+                        "suffix", sp, int(depth), rec.get("suffix_count"),
+                        rec.get("suffix_total"), rec.get("match_len")),
+                    y, clock)
+            else:
+                st.online.ingest("suffix", int(depth), sp, y, clock)
+        if st.online_pairs_path is not None:
+            st.online_pending.append({
+                "type": "online_pair", "rid": rid,
+                "decode_step": rec.get("decode_step"), "depth": int(depth),
+                "eagle_p": ep,
+                "q_eagle": round(q_eagle, 6) if q_eagle is not None else None,
+                "eagle_token": et,
+                "suffix_p": sp,
+                "q_suffix": round(q_suffix, 6) if q_suffix is not None else None,
+                "suffix_token": stk,
+                "committed_token": committed,
+                "eagle_p_online": rec.get("eagle_p_cal"),
+                "suffix_p_online": rec.get("suffix_p_cal"),
+                "chosen": rec.get("chosen"), "accept_len": alen,
+            })
+    st.last_decisions.pop(rid, None)
+
+
 def _patch_forward(eagle_worker) -> None:
     original_forward = eagle_worker.forward_batch_generation
 
@@ -817,8 +1679,12 @@ def _patch_forward(eagle_worker) -> None:
             if not is_decode:
                 return result
 
+            # sglang 0.5.12 renamed accept_length_per_req_cpu ->
+            # num_correct_drafts_per_req_cpu (GenerationBatchResult). Try both.
             accept_lens = list(
-                getattr(result, "accept_length_per_req_cpu", []) or [])
+                getattr(result, "accept_length_per_req_cpu", None)
+                or getattr(result, "num_correct_drafts_per_req_cpu", None)
+                or [])
 
             for i, req in enumerate(batch.reqs):
                 rid = req.rid
@@ -843,7 +1709,7 @@ def _patch_forward(eagle_worker) -> None:
                     # enters the next forward via its embedding, so the
                     # context stays self-consistent). The next-step chain
                     # seed (spec_info.verified_id) is mirrored below.
-                    if st.mode == "oracle":
+                    if st.mode == "oracle" or st.pin_active:
                         g = st.gt.get(rid)
                         if g is not None:
                             forced = False
@@ -881,6 +1747,13 @@ def _patch_forward(eagle_worker) -> None:
                         "accept_len": int(accept_lens[i]),
                     })
 
+                # Online calibration: post-verify q_target join + window ingest.
+                if st.online is not None and rid in st.last_decisions:
+                    try:
+                        _online_ingest(st, eagle_worker, i, rid, accept_lens)
+                    except Exception as e:
+                        st.warn_once("online-ingest", str(e))
+
                 if req.finished():
                     try:
                         st.cache.stop_request(rid)
@@ -892,7 +1765,13 @@ def _patch_forward(eagle_worker) -> None:
                     st.last_seen.pop(rid, None)
                     st.gt.pop(rid, None)
                     st.gt_offtrack.pop(rid, None)
+                    st.last_decisions.pop(rid, None)
+                    if st.online is not None and st.online.scope == "per_request":
+                        st.online.reset_request()
 
+            if st.online is not None:
+                st.online.maybe_refit(st.batch_counter)
+                st.flush_online()
             if st.batch_counter % GC_INTERVAL == 0:
                 _gc_stale(st)
                 if st.mode == "oracle":
@@ -945,13 +1824,17 @@ def _patch_verify_for_tail(eagle_worker) -> None:
     backend = _resolve_target_attn_backend(eagle_worker)
     server_ndt = eagle_worker.server_args.speculative_num_draft_tokens
 
-    def tail_verify(batch, spec_info):
+    def tail_verify(batch, *args, **kwargs):
+        # sglang 0.5.9 called verify(batch, spec_info); 0.5.12 calls verify(batch)
+        # with the verify input carried on the batch. Resolve spec_info either
+        # way (falls back to no override — safe — if it can't be found).
+        spec_info = args[0] if args else getattr(batch, "spec_info", None)
         ndt = getattr(spec_info, "draft_token_num", server_ndt)
         override = ndt != server_ndt
         if override:
             backend.num_draft_tokens = ndt
         try:
-            return original_verify(batch, spec_info)
+            return original_verify(batch, *args, **kwargs)
         finally:
             if override:
                 backend.num_draft_tokens = server_ndt
@@ -968,17 +1851,17 @@ def _patch_draft_extend_for_tail(eagle_worker) -> None:
     accept_len can exceed S (t >= next_pow2(S+1) - S - 1)."""
     original_fdead = eagle_worker.forward_draft_extend_after_decode
 
-    def tail_fdead(batch):
+    def tail_fdead(batch, *args, **kwargs):
         st = _STATE
         bump = st.last_tail_len if st is not None else 0
         if st is not None:
             st.last_tail_len = 0
         if bump <= 0:
-            return original_fdead(batch)
+            return original_fdead(batch, *args, **kwargs)
         saved = eagle_worker.speculative_num_steps
         eagle_worker.speculative_num_steps = saved + bump
         try:
-            return original_fdead(batch)
+            return original_fdead(batch, *args, **kwargs)
         finally:
             eagle_worker.speculative_num_steps = saved
 
@@ -988,6 +1871,38 @@ def _patch_draft_extend_for_tail(eagle_worker) -> None:
 # ---------------------------------------------------------------------------
 # Entry point (called from oracle_patch.patch_eagle_worker_full)
 # ---------------------------------------------------------------------------
+
+def _install_online_verify_stash(eagle_worker) -> None:
+    """Minimal stash of the target verify logits for the online calibrator's
+    post-verify q_target join. Mirrors ONLY the logit-stash branch of
+    oracle_patch._patch_verify_logits (no timing, no token-replay override),
+    because for chain-hybrid arms patch_eagle_worker_full's LATENCY_ONLY path
+    returns before the oracle stash is installed. The target verify forward
+    predicts, at each chain position k, the token following position k; so
+    chain_forward reads softmax(verify_logits[req_offset + d]) for the depth-d
+    eagle/suffix tokens (both against the same realized prefix)."""
+    if getattr(eagle_worker, "_chain_hybrid_verify_stash_patched", False):
+        return
+    tw = eagle_worker.target_worker
+    original_target_forward = tw.forward_batch_generation
+
+    def patched_target_forward(*args, **kwargs):
+        result = original_target_forward(*args, **kwargs)
+        try:
+            if kwargs.get("is_verify", False) and result.logits_output is not None:
+                logits = result.logits_output.next_token_logits
+                if logits is not None and logits.numel() > 0:
+                    eagle_worker._oracle_stashed_verify_logits = logits.detach().cpu()
+                else:
+                    eagle_worker._oracle_stashed_verify_logits = None
+        except Exception:
+            eagle_worker._oracle_stashed_verify_logits = None
+        return result
+
+    tw.forward_batch_generation = patched_target_forward
+    eagle_worker._chain_hybrid_verify_stash_patched = True
+    logger.info("chain-hybrid: online verify-logit stash installed")
+
 
 def patch_chain_hybrid(eagle_worker: "EAGLEWorker") -> None:
     global _STATE
@@ -1055,13 +1970,25 @@ def patch_chain_hybrid(eagle_worker: "EAGLEWorker") -> None:
             # Mamba-hybrid archs (Qwen3.5/qwen3-next): the speculative mamba
             # intermediate caches (intermediate_ssm / intermediate_conv_window
             # in memory_pool.py) are statically allocated with the SERVER's
-            # speculative_num_draft_tokens — a tail-extended verify would
-            # write past them. Unsupported until that pool can be oversized.
-            raise RuntimeError(
-                "SGLANG_CHAIN_HYBRID_TAIL is unsupported on Mamba-hybrid "
-                "models: speculative mamba intermediate caches are statically "
-                "sized to the server num_draft_tokens. Run with tail "
-                "disabled (SGLANG_CHAIN_HYBRID_TAIL=0).")
+            # speculative_num_draft_tokens. A tail-extended verify writes up to
+            # (num_steps + 1 + tail_max) intermediate states, so that pool MUST
+            # be oversized to >= that (launch with a larger
+            # --speculative-num-draft-tokens AND bypass server_args' topk==1
+            # force-reset) or it overflows -> silent corruption.
+            server_ndt = int(getattr(
+                eagle_worker.server_args, "speculative_num_draft_tokens", 0) or 0)
+            need = int(eagle_worker.speculative_num_steps) + 1 + tail_max
+            if server_ndt < need:
+                raise RuntimeError(
+                    "SGLANG_CHAIN_HYBRID_TAIL on Mamba-hybrid needs the mamba "
+                    f"spec cache oversized: server num_draft_tokens={server_ndt} "
+                    f"< num_steps+1+tail_max={need}. Re-launch with "
+                    f"--speculative-num-draft-tokens {need} (and the server_args "
+                    "topk==1 reset bypass: SGLANG_CHAIN_HYBRID_TAIL>0).")
+            logger.warning(
+                "chain-hybrid TAIL on Mamba-hybrid: relying on OVERSIZED mamba "
+                f"spec cache (num_draft_tokens={server_ndt} >= {need}). "
+                "EXPERIMENTAL — sanity-check accept lengths.")
 
     # Decision mode (default per-depth select-1). "score_fallback" mirrors
     # the simulator's hybrid_e3:t baseline; "record" dumps GT trajectories;
@@ -1082,21 +2009,101 @@ def patch_chain_hybrid(eagle_worker: "EAGLEWorker") -> None:
         mode=mode, score_threshold=score_threshold,
         fb_factor=fb_factor, fb_min_prob=fb_min_prob)
 
+    # Optional TRAJECTORY PIN. SGLANG_CHAIN_HYBRID_PIN points at a standalone
+    # gt_tokens.jsonl; when set on a select1/score_fallback arm, the committed
+    # tokens are forced onto that trajectory (same GT machinery oracle uses) so
+    # every arm follows the identical path despite greedy FP-tie flips, while
+    # each arm still builds its own draft chain. Ignored in oracle mode (which
+    # pins via SGLANG_CHAIN_HYBRID_GT) and rejected in record mode.
+    pin_path = os.environ.get("SGLANG_CHAIN_HYBRID_PIN")
+    if pin_path and mode == "record":
+        raise RuntimeError("SGLANG_CHAIN_HYBRID_PIN is incompatible with "
+                           "SGLANG_CHAIN_HYBRID_MODE=record")
+    _STATE.pin_active = bool(pin_path) and mode in ("select1", "score_fallback")
+    if _STATE.pin_active:
+        _STATE.gt_map = _load_gt_map(pin_path)
+
     # Optional suffix-prob calibration. SGLANG_CHAIN_HYBRID_CALIB points at a
     # frozen isotonic map; absent -> raw count-ratio comparison (the original
     # select-1). The map's meta.shrink decides whether suffix probs are
     # Jeffreys-shrunk before lookup (must match how the map was fitted).
-    global _CALIB
+    global _CALIB, _ONLINE
     calib_path = os.environ.get("SGLANG_CHAIN_HYBRID_CALIB")
-    if calib_path:
+    online_method = os.environ.get("SGLANG_CHAIN_HYBRID_ONLINE_CALIB")
+    if online_method:
+        # ONLINE sliding-window calibration to target_p. No frozen JSON; the
+        # per-(group,depth) map is learned at serving time from a window of the
+        # preceding prefix. Overrides any frozen SGLANG_CHAIN_HYBRID_CALIB.
+        window = int(os.environ.get("SGLANG_CHAIN_HYBRID_ONLINE_WINDOW", "256"))
+        min_samples = int(
+            os.environ.get("SGLANG_CHAIN_HYBRID_ONLINE_MIN_SAMPLES", "50"))
+        refit_k = int(os.environ.get("SGLANG_CHAIN_HYBRID_ONLINE_REFIT_K", "0"))
+        scope = os.environ.get("SGLANG_CHAIN_HYBRID_ONLINE_SCOPE", "continuous")
+        if scope not in ("continuous", "per_request"):
+            raise RuntimeError(f"unknown ONLINE_SCOPE={scope!r}")
+        label = os.environ.get("SGLANG_CHAIN_HYBRID_ONLINE_LABEL", "target_p")
+        conditional = os.environ.get(
+            "SGLANG_CHAIN_HYBRID_ONLINE_CONDITIONAL", "0") == "1"
+        if online_method == "multifeat":
+            # COMBO: windowed MULTI-FEATURE calibrator (window+multifeat+conditional)
+            _ONLINE = _OnlineMultiFeatCalibrator(
+                window, min_samples=min_samples, refit_k=refit_k, scope=scope,
+                label=label, conditional=conditional)
+        else:
+            _ONLINE = _OnlineWindowCalibrator(
+                online_method, window, min_samples=min_samples,
+                refit_k=refit_k, scope=scope, label=label, conditional=conditional)
+        _CALIB = _ONLINE
+        _STATE.online = _ONLINE
+        _STATE.online_pairs_path = os.environ.get(
+            "SGLANG_CHAIN_HYBRID_ONLINE_PAIRS",
+            "/tmp/sglang_chain_hybrid_online_pairs.jsonl")
+        # The verify-logit stash is OFF on the LATENCY_ONLY chain-hybrid path;
+        # install it here so the post-verify q_target join has the logits.
+        _install_online_verify_stash(eagle_worker)
+        calib_desc = (
+            f"ONLINE {online_method} (window={window} steps, scope={scope}, "
+            f"min_samples={min_samples}, refit_k={_ONLINE.refit_k}, "
+            f"label={label}{'+conditional' if conditional else ''}; "
+            f"pairs -> {_STATE.online_pairs_path})")
+    elif os.environ.get("SGLANG_CHAIN_HYBRID_MULTIFEAT"):
+        # Direction-2 multi-feature per-proposer calibrator (suffix uses
+        # prob+count+total+match_len, eagle uses prob; depth as a feature).
+        _ONLINE = None
+        mf_path = os.environ["SGLANG_CHAIN_HYBRID_MULTIFEAT"]
+        _CALIB = _ServingMultiFeatCalibrator.load(mf_path)
+        calib_desc = f"MULTI-FEAT calib (kind={_CALIB.kind}, map={mf_path})"
+    elif calib_path:
+        _ONLINE = None
         _CALIB = _ServingIsoCalibrator.load(calib_path)
         calib_desc = (f"calibrated (map={calib_path}, "
                       f"shrink={'jeffreys' if _CALIB.wants_shrunk else 'none'})")
     else:
+        _ONLINE = None
         _CALIB = None
-        calib_desc = "raw suffix_p (uncalibrated)"
+        calib_desc = "raw suffix_p > eagle_p (uncalibrated)"
+
+    # Optional joint discriminator (overrides the suffix_cmp>eagle_cmp test).
+    # SGLANG_CHAIN_HYBRID_DISC points at a frozen logistic/beta model fitted on
+    # the comparative label with both proposers' features; absent -> calib/raw.
+    global _DISC
+    disc_path = os.environ.get("SGLANG_CHAIN_HYBRID_DISC")
+    if disc_path:
+        _DISC = _ServingDiscriminator.load(disc_path)
+        calib_desc = (f"discriminator (kind={_DISC.kind}, "
+                      f"P(pick suffix)>0.5, depth={'yes' if _DISC.with_depth else 'no'}, "
+                      f"accept_cond={'yes' if _DISC.accept_conditioned else 'no'}, "
+                      f"map={disc_path})")
+    else:
+        _DISC = None
 
     _install_select_wrapper()
+    _STATE.log_eagle_dist = (
+        os.environ.get("SGLANG_CHAIN_HYBRID_LOG_EAGLE_DIST", "0") == "1")
+    if _STATE.log_eagle_dist:
+        _install_eagle_dist_logging()
+    if mode == "oracle" or _STATE.pin_active:
+        _install_verify_greedy_oracle()
     _patch_draft(eagle_worker)
     _patch_forward(eagle_worker)
     if tail_max > 0:
@@ -1117,22 +2124,17 @@ def patch_chain_hybrid(eagle_worker: "EAGLEWorker") -> None:
             raise RuntimeError(
                 "SGLANG_CHAIN_HYBRID_MODE=oracle requires "
                 "SGLANG_CHAIN_HYBRID_GT=<gt_tokens.jsonl from a record arm>")
-        gt_map: dict = {}
-        with open(gt_path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                rec = json.loads(line)
-                gt_map[tuple(rec["input_ids"])] = rec["output_ids"]
-        _STATE.gt_map = gt_map
+        _STATE.gt_map = _load_gt_map(gt_path)
         mode_desc = (f"mode=oracle (per-depth selection ceiling, "
-                     f"{len(gt_map)} GT trajectories from {gt_path})")
+                     f"{len(_STATE.gt_map)} GT trajectories from {gt_path})")
     elif mode == "score_fallback":
         mode_desc = (f"mode=score_fallback (suffix iff score>="
                      f"{score_threshold}, F={fb_factor}, T={fb_min_prob})")
     else:
-        mode_desc = f"mode=select1, decision={calib_desc} > eagle_p"
+        mode_desc = f"mode=select1, decision={calib_desc}"
+    if _STATE.pin_active:
+        mode_desc += (f" [PINNED to {len(_STATE.gt_map)} standalone "
+                      f"trajectories from {pin_path}]")
     logger.info(
         f"Chain-hybrid patch applied: {mode_desc}, {tail_desc}, "
         f"steps={eagle_worker.speculative_num_steps}, "

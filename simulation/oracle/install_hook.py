@@ -104,37 +104,52 @@ def _patch_spec_info(path: Path) -> None:
 
 
 def _patch_server_args(path: Path) -> None:
-    """Add SUFFIX to argparse choices and validation."""
+    """Add SUFFIX to argparse choices/validation, AND (for chain-hybrid tail on a
+    Mamba-hybrid + topk==1) bypass sglang's force-reset of
+    speculative_num_draft_tokens -> num_steps+1. The mamba spec cache is sized
+    from speculative_num_draft_tokens at server-args time (before the draft-worker
+    patch runs), so a tail-extended verify (num_draft_tokens = steps+1+tail_max)
+    must keep its oversized value when SGLANG_CHAIN_HYBRID_TAIL>0."""
     text = path.read_text()
+    orig = text
 
-    if '"SUFFIX"' in text:
-        return  # already patched
+    if '"SUFFIX"' not in text:
+        # 1. Add SUFFIX to argparse choices
+        text = text.replace(
+            'choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"]',
+            'choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "SUFFIX"]',
+        )
+        # 2. In validation (__post_init__), SUFFIX should be treated like NGRAM
+        #    (skip draft-model checks).
+        text = text.replace(
+            'if self.speculative_algorithm == "NGRAM":',
+            'if self.speculative_algorithm in ("NGRAM", "SUFFIX"):',
+        )
+        # 3. Draft model requirement check.
+        text = text.replace(
+            'self.speculative_algorithm != "NGRAM"',
+            'self.speculative_algorithm not in ("NGRAM", "SUFFIX")',
+        )
 
-    # 1. Add SUFFIX to argparse choices
-    text = text.replace(
-        'choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"]',
-        'choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "SUFFIX"]',
+    # 4. chain-hybrid tail: skip the topk==1 num_draft_tokens force-reset when
+    #    SGLANG_CHAIN_HYBRID_TAIL>0 so the oversized mamba spec cache survives.
+    reset_anchor = (
+        "                self.speculative_eagle_topk == 1\n"
+        "                and self.speculative_num_draft_tokens != self.speculative_num_steps + 1\n"
+        "            ):"
     )
+    if reset_anchor in text and "SGLANG_CHAIN_HYBRID_TAIL" not in text:
+        text = text.replace(
+            reset_anchor,
+            "                self.speculative_eagle_topk == 1\n"
+            "                and self.speculative_num_draft_tokens != self.speculative_num_steps + 1\n"
+            "                and int(__import__(\"os\").environ.get(\"SGLANG_CHAIN_HYBRID_TAIL\", \"0\") or \"0\") <= 0\n"
+            "            ):",
+        )
 
-    # 2. In validation (__post_init__), SUFFIX should be treated like NGRAM.
-    #    The key validation is: if speculative_algorithm == "NGRAM" → skip draft model checks.
-    #    We add SUFFIX to the same conditional.
-    #    Find: if self.speculative_algorithm == "NGRAM":
-    #    Replace with: if self.speculative_algorithm in ("NGRAM", "SUFFIX"):
-    text = text.replace(
-        'if self.speculative_algorithm == "NGRAM":',
-        'if self.speculative_algorithm in ("NGRAM", "SUFFIX"):',
-    )
-
-    # 3. Also handle the draft model requirement check:
-    #    speculative_algorithm != "NGRAM" → speculative_algorithm not in ("NGRAM", "SUFFIX")
-    text = text.replace(
-        'self.speculative_algorithm != "NGRAM"',
-        'self.speculative_algorithm not in ("NGRAM", "SUFFIX")',
-    )
-
-    path.write_text(text)
-    logger.info(f"Patched {path}")
+    if text != orig:
+        path.write_text(text)
+        logger.info(f"Patched {path}")
 
 
 def _patch_scheduler(path: Path) -> None:
@@ -186,6 +201,13 @@ def install_oracle_patch() -> None:
     _inject_oracle_into_worker(
         root / "srt" / "speculative" / "standalone_worker.py",
         "StandaloneWorker",
+    )
+
+    # Patch DFlashWorker (DFLASH algorithm) — distinct worker, no eagle-style
+    # draft()/verify(); inject the dedicated dflash latency patch.
+    _inject_dflash_into_worker(
+        root / "srt" / "speculative" / "dflash_worker.py",
+        "DFlashWorker",
     )
 
 
@@ -256,6 +278,47 @@ def _inject_oracle_into_worker(worker_path: Path, worker_name: str) -> None:
     text = text.replace(sentinel, patch_code)
     worker_path.write_text(text)
     logger.info(f"Installed oracle vanilla patch into {worker_path} ({worker_name})")
+
+
+DFLASH_IMPORT = "from simulation.oracle.oracle_patch import patch_dflash_worker"
+
+
+def _inject_dflash_into_worker(worker_path: Path, worker_name: str) -> None:
+    """Inject patch_dflash_worker call at the end of DFlashWorker.__init__."""
+    if not worker_path.exists():
+        logger.warning(f"{worker_path} not found, skipping dflash patch")
+        return
+    text = worker_path.read_text()
+    if DFLASH_IMPORT in text:
+        return  # already patched
+
+    if "from __future__ import annotations" not in text:
+        lines = text.split("\n")
+        insert_idx = 0
+        for i, line in enumerate(lines):
+            if not line.startswith("#") and line.strip():
+                insert_idx = i
+                break
+        lines.insert(insert_idx, "from __future__ import annotations")
+        text = "\n".join(lines)
+
+    sentinel = "self.draft_model = self.draft_model_runner.model"
+    if sentinel not in text:
+        logger.warning(
+            f"Could not find dflash __init__ sentinel in {worker_path}")
+        return
+
+    patch_code = (
+        sentinel + "\n\n"
+        f"        # Oracle dflash latency patch ({worker_name})\n"
+        "        import os as _os\n"
+        "        if _os.environ.get('SGLANG_ORACLE_VANILLA', '0') == '1':\n"
+        "            from simulation.oracle.oracle_patch import patch_dflash_worker\n"
+        "            patch_dflash_worker(self)\n"
+    )
+    text = text.replace(sentinel, patch_code, 1)
+    worker_path.write_text(text)
+    logger.info(f"Installed dflash patch into {worker_path} ({worker_name})")
 
 
 def _start_process_watchdog(max_children: int = 50, check_interval: int = 5):

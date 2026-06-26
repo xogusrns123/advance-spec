@@ -1,71 +1,43 @@
-FROM nvidia/cuda:12.2.2-devel-ubuntu22.04
+# DFlash / CUDA-13 stack.
+#
+# DFlash speculative decoding needs sglang>=0.5.11, which hard-pins torch==2.11
+# (cu130). Assembling that in-place on top of the old cu128 venv is ABI hell
+# (kernels / sgl-kernel / deep_gemm / torch c10 symbol mismatch), so we base on
+# the OFFICIAL sglang cu130 image where torch + sglang + sgl-kernel + deep_gemm
+# are pre-built and ABI-matched for Blackwell sm_120.
+#
+# 0.5.12 (not 0.5.13) avoids the DFlash accept_length anomaly (sglang#27924).
+FROM lmsysorg/sglang:v0.5.12-cu130
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    DEBIAN_FRONTEND=noninteractive
+# Project deps for ALL experiments (latency / DFlash + chain-hybrid + calibration
+# + bfcl_v4 agent). numpy/openai/datasets/tqdm/yaml are already in the base image.
+# NOTE: bfcl-eval pulls qwen-agent which pins numpy<2, so the base image's
+# numpy 2.x is downgraded to 1.26.x — harmless for these workloads (timing is
+# torch/cuda; offline analysis uses numpy/sklearn either way).
+RUN python3 -m pip install --no-cache-dir \
+    requests matplotlib psutil pyyaml tqdm pytest ruff \
+    scikit-learn ddgs langchain langchain-openai bfcl-eval ray
+
+# Vendored ArcticInference (patched: reversible undo + raw counts) for
+# SuffixDecoding / chain-hybrid. Builds the C++ `_C` extension (cmake) against
+# this image's torch + python. Patch is tracked under vendor/patches/.
+RUN git clone https://github.com/snowflakedb/ArcticInference.git /opt/ArcticInference \
+ && cd /opt/ArcticInference \
+ && git checkout fba641f8ffbaa25f6715140f4dc85692d6cf7465
+COPY vendor/patches/ArcticInference.patch /tmp/ArcticInference.patch
+RUN cd /opt/ArcticInference \
+ && git apply /tmp/ArcticInference.patch \
+ && python3 -m pip install . --no-deps \
+ && cd / && rm -rf /opt/ArcticInference /tmp/ArcticInference.patch
 
 WORKDIR /workspace
 
-# System dependencies + Python 3.11
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        software-properties-common \
-    && add-apt-repository ppa:deadsnakes/ppa && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends \
-        python3.11 python3.11-venv python3.11-dev \
-        build-essential git curl libnuma-dev \
-    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
-    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3 \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install uv
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
-
-# Layer 1: PyTorch (CUDA 12.2)
-RUN uv venv /opt/venv && \
-    . /opt/venv/bin/activate && \
-    uv pip install torch --extra-index-url https://download.pytorch.org/whl/cu122
-
-# Layer 2: SGLang + sgl-kernel (SM89/RTX 4090 호환)
-# Pin to 0.5.10.post1 — 0.5.9 has Qwen3.5 chat-output bugs (degenerate
-# 1-token EOS / "multiple multiple..." loops; see project_qwen35_9b_sglang_broken
-# memory). 0.5.10.post1 fixes them. --prerelease=allow needed because
-# 0.5.10.post1 depends on flash-attn-4>=4.0.0b4 (prerelease).
-RUN . /opt/venv/bin/activate && \
-    uv pip install --prerelease=allow "sglang[all]==0.5.10.post1" && \
-    uv pip install --force-reinstall "sgl-kernel>=0.1.0"
-
-# Layer 3: transformers (kept compatible with sglang 0.5.10.post1's pin to 5.3.0)
-# Earlier we pinned >=5.0.0 — 0.5.10.post1 brings 5.3.0 itself, so leave
-# the pip resolver to pick the compatible version.
-RUN . /opt/venv/bin/activate && \
-    uv pip install "transformers>=5.0.0,<5.4.0"
-
-# Layer 4: 프로젝트 의존성 + 유틸리티
-COPY pyproject.toml uv.lock ./
-RUN . /opt/venv/bin/activate && \
-    uv pip install numpy requests pyyaml matplotlib datasets pytest ruff \
-        arctic-inference ray openai bfcl-eval tqdm \
-        langchain langchain-openai psutil ddgs
-
-# Layer 5: SGLang 패치
-# 5a. Glm4MoeLiteModel enable_a2a_moe 버그
-RUN sed -i 's/if self.enable_a2a_moe and i > self.first_k_dense_replace:/if getattr(self, "enable_a2a_moe", False) and i > self.first_k_dense_replace:/' \
-    /opt/venv/lib/python3.11/site-packages/sglang/srt/models/deepseek_v2.py
-# 5b. Oracle vanilla hook (SGLANG_ORACLE_VANILLA=1일 때만 활성화)
-RUN EAGLE_PY=/opt/venv/lib/python3.11/site-packages/sglang/srt/speculative/eagle_worker.py && \
-    SENTINEL="self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)" && \
-    if ! grep -q "oracle_patch" "$EAGLE_PY"; then \
-        sed -i "s|$SENTINEL|$SENTINEL\n\n        # Oracle vanilla patch: log draft tokens per step\n        import os as _os\n        if _os.environ.get('SGLANG_ORACLE_VANILLA', '0') == '1':\n            from simulation.oracle.oracle_patch import patch_eagle_worker_full\n            patch_eagle_worker_full(self)|" "$EAGLE_PY"; \
-    fi
-
-# Layer 6: 소스코드
-COPY . .
-RUN . /opt/venv/bin/activate && \
-    uv pip install --no-deps -e ".[dev]"
-
-ENV PATH="/opt/venv/bin:$PATH" \
-    SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
-
-CMD ["bash"]
+# Project source is bind-mounted at /workspace (see docker-compose.yml). sglang
+# source patches are applied at RUNTIME (they live in /sgl-workspace, reset on
+# rebuild), by the experiment scripts:
+#   - oracle latency / chain-hybrid hooks: `python -m simulation.oracle.install_hook`
+#     (called automatically by measure_*.py before each server boot)
+#   - STANDALONE draft arch fix (Qwen3.5): `python simulation/oracle/patch_sglang_standalone.py`
+# Keep the container alive for `docker exec`.
+ENTRYPOINT []
+CMD ["sleep", "infinity"]

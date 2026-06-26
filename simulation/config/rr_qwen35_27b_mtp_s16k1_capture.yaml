@@ -56,7 +56,7 @@ infra:
   gpu_ids: [0]  # GPU0 = RTX PRO 6000 Blackwell (96GB), tp1
   attention_backend: triton       # Blackwell sm_120
   sampling_backend: pytorch
-  cuda_home: /usr/local/cuda-12.8
+  cuda_home: /usr/local/cuda  # container drifted 12.8 -> 13.0; nvcc lives here (sm_120 OK)
 
 output:
   root: simulation/results

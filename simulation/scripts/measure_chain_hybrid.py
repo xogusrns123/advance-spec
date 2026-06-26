@@ -88,7 +88,30 @@ WORKLOAD_REGISTRY: dict[str, dict] = {
 ARM_NAMES = ("baseline", "hybrid_e3", "record",
              "select1", "select1_calib", "select1_calib_jeffreys",
              "select1_calib_offline", "select1_calib_jeffreys_offline",
+             "select1_calib_histogram", "select1_calib_isotonic",
+             "select1_calib_logistic", "select1_calib_beta",
+             "select1_online_histogram", "select1_online_isotonic",
+             "select1_online_logistic", "select1_online_beta",
+             "select1_online_multifeat",
+             "select1_disc_logistic", "select1_disc_beta",
+             "select1_mono", "select1_bayes",
+             "select1_multifeat",
              "select1_oracle", "suffix")
+
+# ONLINE calibration arms: NO pre-fit JSON. The per-(group,depth) calibration
+# map is learned at serving time from a sliding window of the preceding prefix,
+# calibrated to target_p (q_target read off the verify logits post-verify). One
+# algorithm per arm. Deliberately NOT in CALIB_MAP_FILE (no map-existence check,
+# no fit phase) — build_env sets SGLANG_CHAIN_HYBRID_ONLINE_* instead.
+ONLINE_METHOD = {
+    "select1_online_histogram": "histogram",
+    "select1_online_isotonic": "isotonic",
+    "select1_online_logistic": "logistic",
+    "select1_online_beta": "beta",
+    # COMBO: windowed MULTI-FEATURE online calibrator (suffix prob+count+total+
+    # match_len, eagle prob; depth feature) — serving-time multivariate fit.
+    "select1_online_multifeat": "multifeat",
+}
 
 # Calibrated arms: each loads a frozen isotonic suffix-prob map fitted from the
 # raw select1 arm's decision log (so select1 must run first in the same dir).
@@ -101,6 +124,26 @@ CALIB_MAP_FILE = {
     "select1_calib_jeffreys": "calib_jeffreys.json",
     "select1_calib_offline": "calib_noshrink.json",
     "select1_calib_jeffreys_offline": "calib_jeffreys.json",
+    # PER-POSITION per-method maps (meta.per_position=true), fit in the fit phase
+    # by fit_chain_hybrid_calib_perpos.py. The serving calibrator selects the
+    # per-depth curve. These are the "O4" calibrated-selection arms.
+    "select1_calib_histogram": "calib_pp_histogram.json",
+    "select1_calib_isotonic": "calib_pp_isotonic.json",
+    "select1_calib_logistic": "calib_pp_logistic.json",
+    "select1_calib_beta": "calib_pp_beta.json",
+}
+
+# Discriminator arms: JOINT logistic/beta model fitted on the comparative label
+# (which proposer == GT) with BOTH proposers' features [suffix_p, eagle_p,
+# match_len, suffix_count, suffix_total]. Unlike calibration (per-proposer,
+# marginal accept-prob), the discriminator sees both scores + trie evidence at
+# once. Maps are fit by fit_chain_hybrid_discriminator.py from a TRAIN-slice
+# oracle decision log (labels exist only in oracle mode) and placed in out_dir.
+DISC_MAP_FILE = {
+    "select1_disc_logistic": "disc_logistic.json",
+    "select1_disc_beta": "disc_beta.json",
+    "select1_mono": "disc_gbm_mono.json",
+    "select1_bayes": "disc_gbm_bayes.json",
 }
 
 
@@ -140,7 +183,8 @@ def build_server_cmd(args, arm: str, preset: dict) -> list[str]:
             "--speculative-draft-model-path", preset["draft_model"],
             "--speculative-num-steps", str(args.steps),
             "--speculative-eagle-topk", "1",
-            "--speculative-num-draft-tokens", str(args.steps + 1),
+            "--speculative-num-draft-tokens",
+            str(args.spec_num_draft_tokens or (args.steps + 1)),
         ]
     cmd += [
         "--tool-call-parser", preset["tool_call_parser"],
@@ -148,6 +192,14 @@ def build_server_cmd(args, arm: str, preset: dict) -> list[str]:
         "--max-running-requests", "1",
         "--kv-cache-dtype", args.kv_cache_dtype,
         "--disable-cuda-graph",
+        # sglang >=0.5.12 routes EAGLE/EAGLE3/MTP to the V2 spec workers
+        # (eagle_worker_v2.EAGLEWorkerV2) whenever overlap scheduling is on
+        # (enable_overlap = not disable_overlap_schedule, spec_info.py). The
+        # oracle/chain-hybrid install_hook only patches the LEGACY EAGLEWorker,
+        # so with overlap on the patch never engages (zero instrumentation, no
+        # GT dump). Forcing overlap off selects the legacy worker the patch
+        # targets. (No-op on pre-V2 sglang; overlap gives ~nothing at bs=1.)
+        "--disable-overlap-schedule",
         # RTX 4090s have no P2P peer access; SGLang falls back anyway but
         # warns loudly per rank — disable explicitly.
         "--disable-custom-all-reduce",
@@ -163,9 +215,14 @@ def build_server_cmd(args, arm: str, preset: dict) -> list[str]:
 
 def build_env(args, arm: str, timing_log: Path, decision_log: Path,
               calib_map: Path | None = None, gt_out: Path | None = None,
-              gt_file: Path | None = None) -> dict:
+              gt_file: Path | None = None, disc_map: Path | None = None,
+              pin_file: Path | None = None) -> dict:
     env = os.environ.copy()
     env["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
+    # SGLang 2.9.1 + CuDNN 9.10 raises on a Conv3d perf bug; Qwen3.5 (Mamba)
+    # trips it, text-only is safe to bypass (see project_qwen35_cudnn_check;
+    # run_experiment.py does the same).
+    env.setdefault("SGLANG_DISABLE_CUDNN_CHECK", "1")
     # Eagle arms get the LATENCY_ONLY instrumentation via the worker-init
     # hook; the suffix arm uses SuffixWorker (not an EAGLEWorker), so the
     # oracle env vars are irrelevant there and left unset.
@@ -182,6 +239,12 @@ def build_env(args, arm: str, timing_log: Path, decision_log: Path,
         env["SGLANG_CHAIN_HYBRID_LOG"] = str(decision_log)
         if calib_map is not None:
             env["SGLANG_CHAIN_HYBRID_CALIB"] = str(calib_map)
+        # Direction-2 multi-feature per-proposer calibrator (its own env; the
+        # serving patch prefers it over a 1-D CALIB map).
+        if arm == "select1_multifeat" and getattr(args, "multifeat_map", None):
+            env["SGLANG_CHAIN_HYBRID_MULTIFEAT"] = str(args.multifeat_map)
+        if disc_map is not None:
+            env["SGLANG_CHAIN_HYBRID_DISC"] = str(disc_map)
         if arm == "hybrid_e3":
             env["SGLANG_CHAIN_HYBRID_MODE"] = "score_fallback"
             env["SGLANG_CHAIN_HYBRID_SCORE_THRESHOLD"] = str(
@@ -195,6 +258,27 @@ def build_env(args, arm: str, timing_log: Path, decision_log: Path,
         if arm == "select1_oracle":
             env["SGLANG_CHAIN_HYBRID_MODE"] = "oracle"
             env["SGLANG_CHAIN_HYBRID_GT"] = str(gt_file)
+        # PIN: force committed tokens onto the standalone trajectory (select1/
+        # calib/hybrid_e3 arms). The patch ignores this in oracle mode and
+        # rejects it in record mode, so the caller only sets pin_file for the
+        # pinnable arms.
+        if pin_file is not None and arm not in ("record", "select1_oracle"):
+            env["SGLANG_CHAIN_HYBRID_PIN"] = str(pin_file)
+        # ONLINE calibration arms: learn the per-(group,depth) map at serving
+        # time from a sliding window (target_p). No frozen JSON; the patch reads
+        # q_target off the verify logits post-verify.
+        if arm in ONLINE_METHOD:
+            env["SGLANG_CHAIN_HYBRID_ONLINE_CALIB"] = ONLINE_METHOD[arm]
+            env["SGLANG_CHAIN_HYBRID_ONLINE_WINDOW"] = str(args.online_window)
+            env["SGLANG_CHAIN_HYBRID_ONLINE_MIN_SAMPLES"] = str(
+                args.online_min_samples)
+            env["SGLANG_CHAIN_HYBRID_ONLINE_REFIT_K"] = str(args.online_refit_k)
+            env["SGLANG_CHAIN_HYBRID_ONLINE_SCOPE"] = args.online_scope
+            env["SGLANG_CHAIN_HYBRID_ONLINE_LABEL"] = args.online_label
+            if args.online_conditional:
+                env["SGLANG_CHAIN_HYBRID_ONLINE_CONDITIONAL"] = "1"
+            env["SGLANG_CHAIN_HYBRID_ONLINE_PAIRS"] = str(
+                decision_log.parent / f"online_pairs_{arm}.jsonl")
         # Suffix tail append (route b) is part of every chain-hybrid arm by
         # default; --tail-max-tokens 0 turns it off (ablation).
         if args.tail_max_tokens > 0:
@@ -238,6 +322,8 @@ def run_agent(args, workload: dict, out_file: Path, env: dict,
             cmd += ["--include-category", args.include_category]
         if offset:
             cmd += ["--offset", str(offset)]
+        if getattr(args, "exclude_ids", None):
+            cmd += ["--exclude-ids", args.exclude_ids]
 
     log_path = out_file.parent / f"{out_file.stem}_agent.log"
     t0 = time.perf_counter()
@@ -274,6 +360,9 @@ def main() -> int:
     parser.add_argument("--include-category", default=None,
                         help="bfcl_v4 agent --include-category substring "
                              "filter (e.g. 'web_search')")
+    parser.add_argument("--exclude-ids", default=None,
+                        help="bfcl_v4 agent --exclude-ids: comma-separated "
+                             "bfcl_ids to drop (e.g. repetition loopers).")
     parser.add_argument("--arms", default="baseline,select1,suffix",
                         help=f"Comma list from {ARM_NAMES}")
     parser.add_argument("--suffix-num-draft-tokens", type=int, default=64,
@@ -292,6 +381,37 @@ def main() -> int:
     parser.add_argument("--tail-check", action="store_true",
                         help="Enable per-step reconstruction bit-check "
                              "(SGLANG_CHAIN_HYBRID_TAIL_CHECK=1, debug)")
+    parser.add_argument("--online-window", type=int, default=256,
+                        help="select1_online_* arms: sliding-window size in "
+                             "decode steps (clock units) for the online "
+                             "target_p calibrator")
+    parser.add_argument("--online-min-samples", type=int, default=50,
+                        help="select1_online_* arms: per-(group,depth) samples "
+                             "required before the online map leaves cold-start "
+                             "(raw fallback) ")
+    parser.add_argument("--online-refit-k", type=int, default=0,
+                        help="select1_online_* arms: refit cadence in steps for "
+                             "logistic/beta (0 = method default: 1 hist/iso, 8 "
+                             "logistic/beta); histogram is always incremental")
+    parser.add_argument("--online-scope", default="continuous",
+                        choices=["continuous", "per_request"],
+                        help="select1_online_* arms: window rolls across the "
+                             "whole task stream (continuous) or resets per "
+                             "request (per_request)")
+    parser.add_argument("--online-label", default="target_p",
+                        choices=["target_p", "accept_rate"],
+                        help="select1_online_* arms: regress onto q_target "
+                             "(continuous) or the binary accept event (drafted "
+                             "token == target argmax at that row)")
+    parser.add_argument("--multifeat-map", default=None,
+                        help="select1_multifeat arm: path to a "
+                             "fit_chain_hybrid_calib_multifeat map (suffix uses "
+                             "prob+count+total+match_len, eagle uses prob, depth "
+                             "as feature). Served via SGLANG_CHAIN_HYBRID_MULTIFEAT.")
+    parser.add_argument("--online-conditional", action="store_true",
+                        help="select1_online_* arms: ingest a depth only if the "
+                             "realized chain prefix was accepted through it "
+                             "(accept_len >= depth) -> per-step conditional accept")
     parser.add_argument("--hybrid-score-threshold", type=float, default=5.0,
                         help="hybrid_e3 arm: use the suffix run iff its "
                              "score >= this (sim hybrid_e3:t)")
@@ -308,6 +428,46 @@ def main() -> int:
     parser.add_argument("--context-length", type=int, default=None)
     parser.add_argument("--output", required=True,
                         help="Summary JSON; raw logs are copied next to it")
+    parser.add_argument("--replay-all", action="store_true",
+                        help="Every measured arm REPLAYS the record arm's "
+                             "conversation (byte-identical prompts + tool "
+                             "outputs), so all arms decode the SAME trajectory "
+                             "and MAT isolates draft/selection quality (removes "
+                             "live-tool/FP trajectory variance). Requires the "
+                             "'record' arm, which is forced to run first.")
+    parser.add_argument("--replay-existing", action="store_true",
+                        help="Replay the EXISTING out_dir/agent_results_record.json "
+                             "for every measured arm WITHOUT re-running the record "
+                             "arm — to re-run a single arm (e.g. a crashed one) "
+                             "within-run-fair vs a prior full run. Don't pass "
+                             "'record' in --arms.")
+    parser.add_argument("--pin-trajectory", action="store_true",
+                        help="Force EVERY chain-hybrid arm's committed tokens onto "
+                             "the standalone trajectory in out_dir/gt_tokens.jsonl "
+                             "(the same file the oracle arm uses), so all arms follow "
+                             "the IDENTICAL token path despite greedy FP-tie flips "
+                             "while each still builds its own draft chain and "
+                             "recomputes its own eagle features. Requires --replay-all "
+                             "or --replay-existing (prompts must match the trajectory's "
+                             "input_ids). The 'record'/'select1_oracle' arms are "
+                             "unaffected (oracle pins via its own GT).")
+    parser.add_argument("--spec-num-draft-tokens", type=int, default=None,
+                        help="Override --speculative-num-draft-tokens (default "
+                             "steps+1). Use to OVERSIZE the static Mamba spec "
+                             "cache for the suffix tail on Qwen3.5/27B (set to "
+                             "steps+1+tail_max). Requires the server_args topk==1 "
+                             "force-reset bypass (auto via SGLANG_CHAIN_HYBRID_TAIL).")
+    parser.add_argument("--skip-calib-fit", action="store_true",
+                        help="Do NOT re-fit calibration maps in the fit phase; "
+                             "use the maps already placed in out_dir (e.g. fit "
+                             "offline from an oracle-trajectory log). Still applies "
+                             "the test offset = --train-n-tasks.")
+    parser.add_argument("--jeffreys", action="store_true",
+                        help="Fit the per-position calibration maps on the "
+                             "Jeffreys-shrunk suffix prob (c+0.5)/(n+1) instead "
+                             "of the raw count ratio c/n (meta.shrink=jeffreys; "
+                             "serving applies the same shrink before lookup). "
+                             "Affects the select1_calib_<method> arms.")
     parser.add_argument("--extra-args", nargs=argparse.REMAINDER, default=[],
                         help="Passed through to sglang.launch_server")
     args = parser.parse_args()
@@ -326,6 +486,15 @@ def main() -> int:
             + [a for a in arms if is_select1_family(a) and a != "select1"
                and a not in CALIB_MAP_FILE]
             + calib_arms)
+    if args.replay_all:
+        if "record" not in arms:
+            parser.error("--replay-all requires the 'record' arm (it produces "
+                         "the canonical conversation every other arm replays)")
+        # record must run first so its conversation exists for the replays.
+        arms = ["record"] + [a for a in arms if a != "record"]
+    if args.pin_trajectory and not (args.replay_all or args.replay_existing):
+        parser.error("--pin-trajectory requires --replay-all or --replay-existing "
+                     "(prompts must match the trajectory's input_ids to pin)")
 
     preset = MODEL_PRESETS[args.preset]
     workload = WORKLOAD_REGISTRY[args.workload]
@@ -373,7 +542,14 @@ def main() -> int:
     # (no fit phase) so single-arm add-on runs share the test slice of a
     # previous train/test run.
     eval_offset = args.train_n_tasks if args.train_n_tasks > 0 else 0
-    if calib_arms and args.train_n_tasks > 0:
+    if calib_arms and args.train_n_tasks > 0 and args.skip_calib_fit:
+        print("=" * 72, file=sys.stderr)
+        print("SKIP-CALIB-FIT: using pre-placed calib maps in out_dir; "
+              f"eval offset = {eval_offset} (no fit-phase re-fit)", file=sys.stderr)
+        summary["train_n_tasks"] = args.train_n_tasks
+        summary["eval_offset"] = eval_offset
+        _save()
+    if calib_arms and args.train_n_tasks > 0 and not args.skip_calib_fit:
         print("=" * 72, file=sys.stderr)
         print(f"FIT PHASE: raw select1 on {args.train_n_tasks} train tasks "
               f"(offset 0) -> calibration maps", file=sys.stderr)
@@ -412,6 +588,22 @@ def main() -> int:
         print("  fitting calibration maps from train decision log", file=sys.stderr)
         if subprocess.call(fit_cmd2, cwd=str(REPO_ROOT)) != 0:
             sys.exit("FIT PHASE: calibration fit failed")
+        # Per-position per-method maps for any select1_calib_<method> arm
+        # (calib_pp_*.json). Depth-indexed; see fit_chain_hybrid_calib_perpos.py.
+        if any(CALIB_MAP_FILE.get(a, "").startswith("calib_pp_")
+               for a in calib_arms):
+            pp_cmd = [sys.executable,
+                      str(REPO_ROOT
+                          / "simulation/scripts/fit_chain_hybrid_calib_perpos.py"),
+                      "--decision-log", str(kept_fit_dec),
+                      "--out-dir", str(out_dir)]
+            if args.jeffreys:
+                pp_cmd.append("--jeffreys")
+            print(f"  fitting per-position calibration maps"
+                  f"{' (Jeffreys suffix)' if args.jeffreys else ''}",
+                  file=sys.stderr)
+            if subprocess.call(pp_cmd, cwd=str(REPO_ROOT)) != 0:
+                sys.exit("FIT PHASE: per-position calibration fit failed")
         eval_offset = args.train_n_tasks
         summary["train_n_tasks"] = args.train_n_tasks
         summary["eval_offset"] = eval_offset
@@ -433,7 +625,10 @@ def main() -> int:
 
         timing_log = Path(f"/tmp/sglang_ch_timing_{arm}_p{args.port}.jsonl")
         decision_log = Path(f"/tmp/sglang_ch_decisions_{arm}_p{args.port}.jsonl")
-        for p in (timing_log, decision_log):
+        # build_env sets the online-pairs dump to decision_log.parent (= /tmp);
+        # clear stale copies so the per-arm online_pairs file is fresh.
+        online_pairs_log = decision_log.parent / f"online_pairs_{arm}.jsonl"
+        for p in (timing_log, decision_log, online_pairs_log):
             p.unlink(missing_ok=True)
 
         calib_map = None
@@ -447,20 +642,43 @@ def main() -> int:
                 print(f"ERROR: {arm}: {arm_row['error']}", file=sys.stderr)
                 continue
 
+        disc_map = None
+        if arm in DISC_MAP_FILE:
+            disc_map = out_dir / DISC_MAP_FILE[arm]
+            if not disc_map.exists():
+                arm_row = {"error": f"disc map missing: {disc_map} "
+                                    f"(fit with fit_chain_hybrid_discriminator.py "
+                                    f"from a train-slice oracle log)"}
+                summary["arms"][arm] = arm_row
+                _save()
+                print(f"ERROR: {arm}: {arm_row['error']}", file=sys.stderr)
+                continue
+
         # GT plumbing: the record arm dumps gt_tokens.jsonl; the oracle arm
         # consumes it AND replays the record arm's conversation.
         gt_path = out_dir / "gt_tokens.jsonl"
-        gt_out = gt_file = replay_file = None
+        gt_out = gt_file = replay_file = pin_file = None
         if arm == "record":
             gt_path.unlink(missing_ok=True)  # no stale mixing across runs
             gt_out = gt_path
-        if arm == "select1_oracle":
-            gt_file = gt_path
-            replay_file = out_dir / "agent_results_record.json"
-            missing = [str(p) for p in (gt_file, replay_file)
-                       if not p.exists()]
+        else:
+            # Oracle needs the GT; it also replays the record conversation so
+            # GT positions align. Under --replay-all EVERY measured arm replays
+            # that same conversation, so all arms decode the identical
+            # trajectory (fair MAT — no live-tool/FP divergence).
+            if arm == "select1_oracle":
+                gt_file = gt_path
+            if arm == "select1_oracle" or args.replay_all or args.replay_existing:
+                replay_file = out_dir / "agent_results_record.json"
+            # --pin-trajectory: force this arm's committed tokens onto the same
+            # standalone gt_tokens.jsonl (oracle pins via its own GT, so skip it).
+            if (args.pin_trajectory and is_chain_hybrid_arm(arm)
+                    and arm != "select1_oracle"):
+                pin_file = gt_path
+            missing = [str(p) for p in (gt_file, replay_file, pin_file)
+                       if p is not None and not p.exists()]
             if missing:
-                arm_row = {"error": f"oracle inputs missing: {missing} "
+                arm_row = {"error": f"inputs missing: {missing} "
                                     f"(run the record arm first)"}
                 summary["arms"][arm] = arm_row
                 _save()
@@ -468,7 +686,8 @@ def main() -> int:
                 continue
 
         env = build_env(args, arm, timing_log, decision_log, calib_map,
-                        gt_out=gt_out, gt_file=gt_file)
+                        gt_out=gt_out, gt_file=gt_file, disc_map=disc_map,
+                        pin_file=pin_file)
         cmd = build_server_cmd(args, arm, preset)
 
         server_log = out_dir / f"server_{arm}.log"
@@ -507,6 +726,12 @@ def main() -> int:
                 kept_dec = out_dir / f"decisions_{arm}.jsonl"
                 shutil.copyfile(decision_log, kept_dec)
                 arm_row["decision_log"] = str(kept_dec)
+            # Online-calibration arms also dump (raw_prob, q_target) pairs for
+            # the per-depth graphs; copy them next to the decision log.
+            if arm in ONLINE_METHOD and online_pairs_log.exists():
+                kept_pairs = out_dir / f"online_pairs_{arm}.jsonl"
+                shutil.copyfile(online_pairs_log, kept_pairs)
+                arm_row["online_pairs"] = str(kept_pairs)
 
             summary["arms"][arm] = arm_row
             _save()
