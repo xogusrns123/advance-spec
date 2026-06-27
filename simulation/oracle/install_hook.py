@@ -179,7 +179,12 @@ def install_oracle_patch() -> None:
     patch_eagle_worker_full() works for both.
     """
     import os
-    if os.environ.get("SGLANG_ORACLE_VANILLA", "0") != "1":
+    # Run when oracle/latency instrumentation OR chain-hybrid is requested. The
+    # injected worker tails are no-ops at runtime unless their own env gate is
+    # set, so installing under either flag is safe and lets a chain-hybrid run
+    # engage even if SGLANG_ORACLE_VANILLA is not also set.
+    if (os.environ.get("SGLANG_ORACLE_VANILLA", "0") != "1"
+            and os.environ.get("SGLANG_CHAIN_HYBRID", "0") != "1"):
         return
 
     root = _get_sglang_root()
@@ -281,16 +286,52 @@ def _inject_oracle_into_worker(worker_path: Path, worker_name: str) -> None:
 
 
 DFLASH_IMPORT = "from simulation.oracle.oracle_patch import patch_dflash_worker"
+# Sentinel that marks the CURRENT (dispatch) injection. Bump if the injected
+# block below changes so already-patched container files get rewritten.
+DFLASH_DISPATCH_MARKER = "patch_chain_hybrid_dflash"
+# The legacy latency-only injection (pre-chain-hybrid). Replaced in place when
+# found so we don't end up with two injected blocks.
+DFLASH_OLD_BLOCK = (
+    "\n\n"
+    "        # Oracle dflash latency patch (DFlashWorker)\n"
+    "        import os as _os\n"
+    "        if _os.environ.get('SGLANG_ORACLE_VANILLA', '0') == '1':\n"
+    "            from simulation.oracle.oracle_patch import patch_dflash_worker\n"
+    "            patch_dflash_worker(self)\n"
+)
+
+
+def _dflash_patch_block(worker_name: str) -> str:
+    """Injected DFlashWorker.__init__ tail. Dispatches at runtime:
+      SGLANG_CHAIN_HYBRID=1 -> per-position select-1 chain-hybrid patch;
+      else SGLANG_ORACLE_VANILLA=1 -> latency-only timing patch."""
+    return (
+        "\n\n"
+        f"        # Oracle / chain-hybrid DFlash patch ({worker_name})\n"
+        "        import os as _os\n"
+        "        if _os.environ.get('SGLANG_CHAIN_HYBRID', '0') == '1':\n"
+        "            from simulation.oracle.chain_hybrid_patch import patch_chain_hybrid_dflash\n"
+        "            patch_chain_hybrid_dflash(self)\n"
+        "        elif _os.environ.get('SGLANG_ORACLE_VANILLA', '0') == '1':\n"
+        "            from simulation.oracle.oracle_patch import patch_dflash_worker\n"
+        "            patch_dflash_worker(self)\n"
+    )
 
 
 def _inject_dflash_into_worker(worker_path: Path, worker_name: str) -> None:
-    """Inject patch_dflash_worker call at the end of DFlashWorker.__init__."""
+    """Inject the DFlash oracle/chain-hybrid dispatch into DFlashWorker.__init__.
+
+    Idempotent and self-updating: if a previous (latency-only) injection exists
+    it is replaced with the dispatch block, so the same container file works for
+    both the latency runs and the new chain-hybrid select-1 runs."""
     if not worker_path.exists():
         logger.warning(f"{worker_path} not found, skipping dflash patch")
         return
     text = worker_path.read_text()
-    if DFLASH_IMPORT in text:
-        return  # already patched
+    new_block = _dflash_patch_block(worker_name)
+
+    if DFLASH_DISPATCH_MARKER in text:
+        return  # already has the current dispatch injection
 
     if "from __future__ import annotations" not in text:
         lines = text.split("\n")
@@ -302,23 +343,24 @@ def _inject_dflash_into_worker(worker_path: Path, worker_name: str) -> None:
         lines.insert(insert_idx, "from __future__ import annotations")
         text = "\n".join(lines)
 
+    # Upgrade an existing legacy latency-only injection in place.
+    if DFLASH_OLD_BLOCK in text:
+        text = text.replace(DFLASH_OLD_BLOCK, new_block, 1)
+        worker_path.write_text(text)
+        logger.info(f"Upgraded dflash patch -> dispatch in {worker_path} "
+                    f"({worker_name})")
+        return
+
     sentinel = "self.draft_model = self.draft_model_runner.model"
     if sentinel not in text:
         logger.warning(
             f"Could not find dflash __init__ sentinel in {worker_path}")
         return
 
-    patch_code = (
-        sentinel + "\n\n"
-        f"        # Oracle dflash latency patch ({worker_name})\n"
-        "        import os as _os\n"
-        "        if _os.environ.get('SGLANG_ORACLE_VANILLA', '0') == '1':\n"
-        "            from simulation.oracle.oracle_patch import patch_dflash_worker\n"
-        "            patch_dflash_worker(self)\n"
-    )
-    text = text.replace(sentinel, patch_code, 1)
+    text = text.replace(sentinel, sentinel + new_block, 1)
     worker_path.write_text(text)
-    logger.info(f"Installed dflash patch into {worker_path} ({worker_name})")
+    logger.info(f"Installed dflash dispatch patch into {worker_path} "
+                f"({worker_name})")
 
 
 def _start_process_watchdog(max_children: int = 50, check_interval: int = 5):

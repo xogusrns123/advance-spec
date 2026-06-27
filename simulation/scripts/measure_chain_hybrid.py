@@ -72,6 +72,25 @@ MODEL_PRESETS: dict[str, dict] = {
         "extra_server_args": ["--disable-radix-cache",
                               "--context-length", "131072"],
     },
+    # DFlash (z-lab block/diffusion drafter) on Blackwell GPU-0. DFlash drafts a
+    # whole block per step (no eagle topk / num-steps); block_size ==
+    # --speculative-num-draft-tokens. The chain-hybrid patch hooks DFlashWorker
+    # (sole worker for DFLASH), so --disable-overlap-schedule is required.
+    # Blackwell needs triton attention + pytorch sampling (project_blackwell_env)
+    # and the cu130 image (project_dflash_cu130_official_image). 8B fits at
+    # mem 0.70 (project_dflash_vs_suffix). Trained block = 16.
+    "qwen3_8b_dflash": {
+        "model": "Qwen/Qwen3-8B",
+        "draft_model": "z-lab/Qwen3-8B-DFlash-b16",
+        "tool_call_parser": "qwen25",
+        "speculative_algorithm": "DFLASH",
+        "is_dflash": True,
+        "block_size": 16,
+        "extra_server_args": ["--attention-backend", "triton",
+                              "--sampling-backend", "pytorch",
+                              "--disable-piecewise-cuda-graph",
+                              "--disable-radix-cache"],
+    },
 }
 
 WORKLOAD_REGISTRY: dict[str, dict] = {
@@ -176,6 +195,16 @@ def build_server_cmd(args, arm: str, preset: dict) -> list[str]:
             "--speculative-algorithm", "SUFFIX",
             "--speculative-num-draft-tokens", str(args.suffix_num_draft_tokens),
         ]
+    elif preset.get("is_dflash"):
+        # DFlash block drafter: block_size == --speculative-num-draft-tokens.
+        # No eagle topk / num-steps. The select-1 is applied by substituting
+        # tokens into the verify block (chain_hybrid_patch.patch_chain_hybrid_dflash).
+        block = args.spec_num_draft_tokens or preset.get("block_size", 16)
+        cmd += [
+            "--speculative-algorithm", "DFLASH",
+            "--speculative-draft-model-path", preset["draft_model"],
+            "--speculative-num-draft-tokens", str(block),
+        ]
     else:
         cmd += [
             "--speculative-algorithm",
@@ -223,6 +252,11 @@ def build_env(args, arm: str, timing_log: Path, decision_log: Path,
     # trips it, text-only is safe to bypass (see project_qwen35_cudnn_check;
     # run_experiment.py does the same).
     env.setdefault("SGLANG_DISABLE_CUDNN_CHECK", "1")
+    # DFlash runs on Blackwell GPU-0 (cu130 image). Pin GPU 0 (GPU 1 = um3maru)
+    # and skip the deep_gemm fp8 JIT compile (bf16 dense models never use it).
+    if MODEL_PRESETS[args.preset].get("is_dflash"):
+        env.setdefault("CUDA_VISIBLE_DEVICES", "0")
+        env.setdefault("SGLANG_ENABLE_JIT_DEEPGEMM", "0")
     # Eagle arms get the LATENCY_ONLY instrumentation via the worker-init
     # hook; the suffix arm uses SuffixWorker (not an EAGLEWorker), so the
     # oracle env vars are irrelevant there and left unset.

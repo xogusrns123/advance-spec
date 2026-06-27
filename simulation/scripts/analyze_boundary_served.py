@@ -31,7 +31,61 @@ CELLS = {
                "draft": "EAGLE3", "draft_color": "#1f77b4"},
     "mtp": {"dir": f"{ROOT}/qwen35_27b_ar", "title": "Qwen3.5-27B MTP", "tag": "mtp",
             "draft": "MTP", "draft_color": "#9467bd"},
+    # DFlash served via the sglang-native per-position select-1 patch (real
+    # accept_len + backfilled selacc; greedy auto-pins the trajectory, every arm
+    # --replays the record conversation). Same colour as the offline ladder.
+    # tag "dflash_served" (NOT "dflash") so the served figures sit beside the
+    # committed OFFLINE boundary_{selacc,mat}_dflash.png for validation.
+    "dflash": {"dir": f"{ROOT}/qwen3_8b_dflash_ar", "title": "Qwen3-8B DFlash (served)",
+               "tag": "dflash_served", "draft": "DFlash", "draft_color": "#17becf",
+               "single_from_oracle": True},
 }
+
+
+def single_proposer_mats(oracle_log):
+    """Single-proposer MAT (DFlash-only, suffix-only) as a counterfactual on the
+    SAME served pinned trajectory, simulated from the ORACLE arm's decision log.
+    The oracle arm accepts the deepest, so its log carries true GT (gt_token)
+    wherever either single proposer could still accept -> GT-complete (the raw
+    arm's log truncates GT at raw's own accept boundary, which would bias this).
+    DFlash-only = always pick the draft token; suffix-only = pick the suffix
+    token where available else the draft (matches analyze_boundary_dflash)."""
+    if not os.path.exists(oracle_log):
+        return None, None
+    chains = defaultdict(list)
+    for line in open(oracle_log):
+        line = line.strip()
+        if not line:
+            continue
+        o = json.loads(line)
+        if o.get("type") == "decision" and not o.get("tail"):
+            chains[(o["rid"], o["decode_step"])].append(o)
+    for k in chains:
+        chains[k].sort(key=lambda r: r["depth"])
+    d_ls, s_ls = [], []
+    for rs in chains.values():
+        da = sa = 0
+        d_alive = s_alive = True
+        for r in rs:
+            gt = r.get("gt_token")
+            if gt is None:           # past committed GT -> stop both
+                break
+            et = r.get("eagle_token"); xt = r.get("suffix_token")
+            if d_alive and et == gt:
+                da += 1
+            else:
+                d_alive = False
+            stok = xt if xt is not None else et
+            if s_alive and stok == gt:
+                sa += 1
+            else:
+                s_alive = False
+            if not d_alive and not s_alive:
+                break
+        d_ls.append(da); s_ls.append(sa)
+    d_mat = sum(d_ls) / max(len(d_ls), 1) if d_ls else None
+    s_mat = sum(s_ls) / max(len(s_ls), 1) if s_ls else None
+    return d_mat, s_mat
 
 
 def timing_mat(path):
@@ -97,9 +151,15 @@ def selacc_mat(path):
 def main():
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cell", choices=["eagle3", "mtp", "both"], default="both")
+    ap.add_argument("--cell", choices=["eagle3", "mtp", "dflash", "both", "all"],
+                    default="both")
     args = ap.parse_args()
-    items = CELLS.items() if args.cell == "both" else [(args.cell, CELLS[args.cell])]
+    # "both" = the original eagle3+mtp pair; "all" = every cell incl. dflash.
+    if args.cell in ("both", "all"):
+        keys = (["eagle3", "mtp"] if args.cell == "both" else list(CELLS))
+        items = [(k, CELLS[k]) for k in keys]
+    else:
+        items = [(args.cell, CELLS[args.cell])]
     for key, c in items:
         d = c["dir"]
         # best calib method by served selacc
@@ -127,19 +187,27 @@ def main():
                    "Selection accuracy by Panel-B boundary policy (SERVED, pinned)\n"
                    f"({c['title']}, all tasks; real serving)",
                    f"{FIGDIR}/boundary_selacc_{c['tag']}.png", fmt="{:.3f}", colors=cols)
-        # MAT: prepend the two single-proposer references (standalone served
-        # decoders: draft-only = baseline timing, suffix-only = suffix timing).
-        d_mat = timing_mat(f"{d}/timing_baseline.jsonl")
-        s_mat = timing_mat(f"{d}/timing_suffix.jsonl")
+        # MAT: prepend the two single-proposer references. eagle3/mtp use their
+        # standalone served timing logs; dflash (block drafter, no standalone
+        # select-1 decoder) simulates them on the shared pinned trajectory from
+        # the oracle arm's GT-complete log.
+        if c.get("single_from_oracle"):
+            d_mat, s_mat = single_proposer_mats(f"{d}/decisions_select1_oracle.jsonl")
+        else:
+            d_mat = timing_mat(f"{d}/timing_baseline.jsonl")
+            s_mat = timing_mat(f"{d}/timing_suffix.jsonl")
         m_labels, m_vals, m_cols = list(labels), list(mats), list(cols)
         if s_mat is not None:
             m_labels.insert(0, "suffix\nonly"); m_vals.insert(0, s_mat); m_cols.insert(0, C_SUFFIX)
         if d_mat is not None:
             m_labels.insert(0, f"{c['draft']}\nonly"); m_vals.insert(0, d_mat); m_cols.insert(0, c["draft_color"])
         print(f"  single-proposer (standalone served): {c['draft']}-only={d_mat}  suffix-only={s_mat}")
+        sp_note = ("single proposers = counterfactual on the pinned trajectory "
+                   "(from the oracle log)" if c.get("single_from_oracle")
+                   else "single proposers = standalone decode")
         ladder_bar(m_vals, m_labels, "MAT (served per-step accept length)",
                    "MAT by Panel-B boundary policy (SERVED)\n"
-                   f"({c['title']}, all tasks; real serving; single proposers = standalone decode)",
+                   f"({c['title']}, all tasks; real serving; {sp_note})",
                    f"{FIGDIR}/boundary_mat_{c['tag']}.png", fmt="{:.3f}", colors=m_cols)
 
 

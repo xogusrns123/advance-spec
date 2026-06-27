@@ -2139,3 +2139,573 @@ def patch_chain_hybrid(eagle_worker: "EAGLEWorker") -> None:
         f"Chain-hybrid patch applied: {mode_desc}, {tail_desc}, "
         f"steps={eagle_worker.speculative_num_steps}, "
         f"decision log -> {log_path}")
+
+
+# ===========================================================================
+# DFlash chain-hybrid: sglang-native per-position select-1 on the draft block
+# ===========================================================================
+#
+# DFlash (z-lab block/diffusion drafter) drafts a whole block of block_size
+# tokens in ONE non-causal forward inside
+# DFlashWorker._prepare_for_speculative_decoding, so there is NO per-depth
+# EAGLE chain loop and NO select_top_k_tokens hook. The per-position select-1
+# is instead applied by substituting tokens directly into the verify input's
+# draft_token block AFTER _prepare builds it and BEFORE the target verify
+# forward consumes it: the DFlash verify mask is positional / token-identity
+# based, and prepare_for_verify sets batch.input_ids = verify_input.draft_token
+# (same storage), so an IN-PLACE write to draft_token is seen by both the
+# target forward and verify with zero re-prepare.
+#
+# Greedy DFlash AUTO-PINS the trajectory. verify() (dflash_info.verify ->
+# compute_dflash_correct_drafts_and_bonus) commits exactly the longest block
+# prefix that matches the target's greedy argmax, plus the target's argmax
+# bonus at the first mismatch. So the committed sequence is the target-greedy
+# continuation REGARDLESS of which tokens we substitute into the block —
+# substitution changes only the ACCEPT LENGTH (= MAT), never the committed
+# tokens' identity. Two consequences, both simplifying vs the EAGLE path:
+#   * no trajectory PIN / GT force / verify override is needed (greedy pins it);
+#   * the per-decision GT (target greedy at each block position d) is recovered
+#     POST-verify, drift-free, from the request's OWN committed output_ids
+#     (committed[d] == GT at depth d for d in 0..accept_len), and oracle_hit is
+#     BACKFILLED onto the decision records there.
+# Only the ORACLE arm needs GT at decision time (to substitute the GT-matching
+# proposer), so it loads a record-arm GT dump; record mode produces it.
+#
+# Mirrors the offline capture (capture_dflash_vs_suffix.py) exactly: per-depth
+# autoregressive suffix query with the CHOSEN chain (== GT prefix on alive
+# depths, so selacc/MAT match), max_spec_tokens=1, temporary_extension; and
+# dflash_p = softmax(lm_head(draft_hidden)).max() recomputed from the same
+# hidden the sampler used.
+
+def _dflash_blocksize(st) -> int:
+    return int(getattr(st.worker, "block_size", 0) or 0)
+
+
+def _install_dflash_prob_stash(worker) -> None:
+    """Wrap _greedy_sample_from_vocab_parallel_head so each block position's
+    max-softmax prob (the DFlash analog of eagle_p) is stashed next to the
+    argmax token the sampler returns (the sampler returns only argmax ids).
+    Recompute matches the offline capture's softmax(lm_head(draft_hidden)).max()
+    on the tp==1 / no-added-vocab fast path (the 8B serving config)."""
+    if getattr(worker, "_chain_hybrid_dflash_prob_patched", False):
+        return
+    import torch
+    orig = worker._greedy_sample_from_vocab_parallel_head
+
+    def wrapped(*, hidden_states, lm_head, chunk_size=256):
+        toks = orig(hidden_states=hidden_states, lm_head=lm_head,
+                    chunk_size=chunk_size)
+        st = _STATE
+        if st is None:
+            return toks
+        st._dflash_p_flat = None
+        try:
+            if hidden_states is not None and hidden_states.numel() > 0:
+                shard = lm_head.shard_indices
+                num_org = int(shard.num_org_elements)
+                num_added = int(shard.num_added_elements)
+                if num_added != 0:
+                    st.warn_once(
+                        "dflash-prob-added",
+                        "lm_head exposes added vocab; dflash_p computed over the "
+                        "base-vocab shard only (approximate)")
+                w = lm_head.weight
+                hs = (hidden_states if hidden_states.dtype == w.dtype
+                      else hidden_states.to(w.dtype))
+                logits = torch.matmul(hs, w[:num_org].T).float()
+                mp = torch.softmax(logits, dim=-1).max(dim=-1).values
+                st._dflash_p_flat = mp.detach().to("cpu")
+        except Exception as e:
+            st.warn_once("dflash-prob", str(e))
+            st._dflash_p_flat = None
+        return toks
+
+    worker._greedy_sample_from_vocab_parallel_head = wrapped
+    worker._chain_hybrid_dflash_prob_patched = True
+    logger.info("chain-hybrid DFlash: per-position prob stash installed "
+                "(_greedy_sample_from_vocab_parallel_head)")
+
+
+def _decide_block_dflash(st, dt_gpu, dt_cpu, dfp_2d, bs, b):
+    """Per-position select-1 over the DFlash block (positions 1..b-1; pos 0 is
+    the committed seed). Reads tokens/probs from CPU snapshots, writes chosen
+    suffix tokens back into dt_gpu IN PLACE (aliases batch.input_ids), and emits
+    per-depth decision records into st.pending + st._dflash_recidx (oracle_hit
+    backfilled post-verify, except oracle mode which sets it here from the GT
+    dump). depth d == block position d+1, logged 0-based so the join rule
+    accept_len >= depth+1 matches the EAGLE / offline convention.
+
+    The per-(row,depth) decision body mirrors _decide_and_inject; it is
+    duplicated rather than shared so the validated EAGLE/MTP path is untouched."""
+    for r, (rid, ctx_tail) in enumerate(st.stash):
+        chain = st.chains[r]
+        ds = st.decode_step.get(rid, 0)
+        recs_by_depth = st._dflash_recidx.setdefault((rid, ds), {})
+        for bp in range(1, b):
+            depth = bp - 1
+            eagle_tok = int(dt_cpu[r, bp])
+            eagle_p = (float(dfp_2d[r, depth]) if (dfp_2d is not None
+                       and depth < dfp_2d.shape[1]) else 0.0)
+            rec = {
+                "type": "decision", "rid": rid, "decode_step": ds,
+                "depth": depth, "eagle_token": eagle_tok,
+                "eagle_p": round(eagle_p, 6), "eagle_p_cal": None,
+                "suffix_token": None, "suffix_p": None, "suffix_count": None,
+                "suffix_total": None, "suffix_p_cal": None, "match_len": None,
+                "suffix_score": None, "chosen": "eagle3", "agreement": None,
+            }
+            suffix_tok = suffix_p = suffix_count = suffix_total = None
+            if rid in st.active:
+                try:
+                    ctx = (list(ctx_tail) + chain)[-st.cache.max_tree_depth:]
+                    if chain:
+                        with st.cache.temporary_extension(rid, chain):
+                            draft = st.cache.speculate(
+                                rid, ctx, max_spec_tokens=1, use_tree_spec=False)
+                    else:
+                        draft = st.cache.speculate(
+                            rid, ctx, max_spec_tokens=1, use_tree_spec=False)
+                    tok_ids = getattr(draft, "token_ids", None)
+                    if tok_ids is not None and len(tok_ids):
+                        suffix_tok = int(tok_ids[0])
+                        probs = getattr(draft, "probs", None)
+                        suffix_p = float(probs[0]) if (probs is not None
+                                                       and len(probs)) else 0.0
+                        rec["suffix_token"] = suffix_tok
+                        rec["suffix_p"] = round(suffix_p, 6)
+                        rec["match_len"] = int(getattr(draft, "match_len", 0) or 0)
+                        rec["suffix_score"] = round(float(
+                            getattr(draft, "score", 0.0) or 0.0), 4)
+                        counts = getattr(draft, "counts", None)
+                        if counts and suffix_p > 0.0:
+                            suffix_count = int(counts[0])
+                            suffix_total = int(round(suffix_count / suffix_p))
+                            rec["suffix_count"] = suffix_count
+                            rec["suffix_total"] = suffix_total
+                except Exception as e:
+                    st.warn_once("speculate-dflash", str(e))
+
+            # ORACLE mode: GT (from the record-arm dump) decides the chain.
+            if st.mode == "oracle":
+                gt_list = st.gt.get(rid)
+                L = (st.gt_pos[r] if st.gt_pos is not None
+                     and r < len(st.gt_pos) else None)
+                gt_tok = (int(gt_list[L + depth]) if (gt_list is not None
+                          and L is not None and L + depth < len(gt_list))
+                          else None)
+                rec["gt_token"] = gt_tok
+                rec["agreement"] = (suffix_tok == eagle_tok
+                                    if suffix_tok is not None else None)
+                chosen_tok = eagle_tok
+                hit = "nogt" if gt_tok is None else "none"
+                if gt_tok is not None:
+                    e_hit = eagle_tok == gt_tok
+                    s_hit = (suffix_tok == gt_tok
+                             if suffix_tok is not None else False)
+                    if e_hit:
+                        hit = "both" if s_hit else "eagle"
+                    elif s_hit:
+                        hit = "suffix"
+                        dt_gpu[r, bp] = suffix_tok
+                        chosen_tok = suffix_tok
+                        rec["chosen"] = "suffix"
+                rec["oracle_hit"] = hit
+                chain.append(chosen_tok)
+                recs_by_depth[depth] = rec
+                st.pending.append(rec)
+                continue
+
+            # select1 (raw / calibrated / discriminator) — identical to the
+            # EAGLE _decide_and_inject decision body.
+            suffix_cmp = suffix_p
+            eagle_cmp = eagle_p
+            if _CALIB is not None:
+                eagle_cmp = _CALIB.predict("eagle", eagle_p, eagle_p, depth=depth)
+                rec["eagle_p_cal"] = round(eagle_cmp, 6)
+                if suffix_p is not None:
+                    p_in = suffix_p
+                    if _CALIB.wants_shrunk:
+                        if suffix_count is not None and suffix_total:
+                            p_in = (suffix_count + 0.5) / (suffix_total + 1)
+                        else:
+                            st.warn_once(
+                                "no-counts-dflash",
+                                "calib map wants Jeffreys-shrunk probs but the "
+                                "suffix draft exposed no counts; using raw "
+                                "suffix_p")
+                    suffix_cmp = _CALIB.predict(
+                        "suffix", p_in, suffix_p, depth=depth,
+                        count=suffix_count, total=suffix_total,
+                        match_len=rec.get("match_len"))
+                    rec["suffix_p_cal"] = round(suffix_cmp, 6)
+
+            chosen_tok = eagle_tok
+            if suffix_tok is not None:
+                rec["agreement"] = suffix_tok == eagle_tok
+                if suffix_tok != eagle_tok:
+                    if _DISC is not None and suffix_p is not None:
+                        pick_p = _DISC.predict(suffix_p, eagle_p,
+                                               rec.get("match_len"),
+                                               suffix_count, suffix_total,
+                                               depth=depth)
+                        rec["disc_p"] = round(float(pick_p), 6)
+                        take = pick_p > 0.5
+                    else:
+                        take = (suffix_cmp is not None and suffix_cmp > eagle_cmp)
+                    if take:
+                        dt_gpu[r, bp] = suffix_tok
+                        chosen_tok = suffix_tok
+                        rec["chosen"] = "suffix"
+            chain.append(chosen_tok)
+            recs_by_depth[depth] = rec
+            st.pending.append(rec)
+
+
+def _patch_dflash_prepare(worker) -> None:
+    """Wrap _prepare_for_speculative_decoding: build the per-row committed-ctx
+    stash (pre-draft), then after the block is drafted run the per-position
+    select-1 and substitute chosen tokens into the verify block in place."""
+    original_prepare = worker._prepare_for_speculative_decoding
+
+    def chain_prepare(batch, draft_input):
+        st = _STATE
+        try:
+            is_decode = not (batch.forward_mode.is_extend()
+                             or batch.forward_mode.is_idle())
+        except Exception:
+            is_decode = True
+        if st is None or not is_decode:
+            return original_prepare(batch, draft_input)
+
+        st.batch_counter += 1
+        st._dflash_p_flat = None
+        stash = []
+        chains = []
+        gt_pos = []
+        try:
+            for req in batch.reqs:
+                rid = req.rid
+                if st.mode == "record":
+                    stash.append((rid, ())); chains.append([]); gt_pos.append(0)
+                    continue
+                if rid not in st.active:
+                    try:
+                        st.cache.start_request(rid, list(req.origin_input_ids))
+                        st.active.add(rid)
+                        # trie-feed pointer starts at 0 so the prefill bonus is
+                        # fed too (matches the EAGLE path's last_out_len=0).
+                        st.last_out_len[rid] = 0
+                        st.decode_step[rid] = 0
+                    except Exception as e:
+                        st.warn_once("start_request-dflash", str(e))
+                    if st.mode == "oracle" or st.pin_active:
+                        g = (st.gt_map or {}).get(tuple(req.origin_input_ids))
+                        st.gt[rid] = list(g) if g is not None else None
+                        st.gt_stats["matched" if g is not None
+                                    else "unmatched"] += 1
+                        st.pending.append({
+                            "type": "req", "rid": rid,
+                            "input_ids": [int(x) for x in req.origin_input_ids]})
+                        if g is None:
+                            st.warn_once(
+                                "gt-unmatched-dflash",
+                                "request prompt not in GT dump; running pure "
+                                "DFlash for unmatched requests")
+                st.decode_step[rid] = st.decode_step.get(rid, 0) + 1
+                st.last_seen[rid] = st.batch_counter
+                Lnow = len(req.output_ids or [])
+                ctx = (list(req.origin_input_ids)
+                       + list(req.output_ids))[-st.cache.max_tree_depth:]
+                stash.append((rid, ctx)); chains.append([]); gt_pos.append(Lnow)
+                # gt_pos for THIS step's commit-slice backfill / step accounting.
+                st._dflash_gtpos[(rid, st.decode_step[rid])] = Lnow
+        except Exception as e:
+            st.warn_once("dflash-prep-stash", str(e))
+            stash = None
+        st.stash = stash
+        st.chains = chains if stash is not None else None
+        gt_on = (stash is not None and (st.mode == "oracle" or st.pin_active))
+        st.gt_pos = gt_pos if gt_on else None
+        # Per-row GT continuation over the whole verify block [block_size], used
+        # by the verify-pin override to force target_predict (= the committed
+        # trajectory) onto the GT-dump path so EVERY arm follows the identical
+        # trajectory (greedy alone does NOT pin across arms — the substituted
+        # block changes the verify batch, flipping FP near-ties; see
+        # project_chain_hybrid_fp_nondeterminism). -1 past GT end.
+        if gt_on:
+            b = _dflash_blocksize(st)
+            ov = []
+            for r, (rid, _ctx) in enumerate(stash):
+                g = st.gt.get(rid)
+                L = gt_pos[r] if r < len(gt_pos) else None
+                if g is not None and L is not None:
+                    ov.append([int(g[L + j]) if (L + j) < len(g) else -1
+                               for j in range(b)])
+                else:
+                    ov.append([-1] * b)
+            st.gt_predict_override = ov
+        else:
+            st.gt_predict_override = None
+
+        result = original_prepare(batch, draft_input)
+
+        try:
+            if (st.stash is not None and st.mode != "record"):
+                vi = getattr(batch, "spec_info", None)
+                dt_flat = getattr(vi, "draft_token", None) if vi is not None else None
+                b = _dflash_blocksize(st)
+                bs = len(st.stash)
+                if dt_flat is not None and b > 1 and dt_flat.numel() == bs * b:
+                    dt_gpu = dt_flat.view(bs, b)
+                    dt_cpu = dt_gpu.detach().cpu()
+                    dfp = st._dflash_p_flat
+                    dfp_2d = (dfp.view(bs, b - 1) if (dfp is not None
+                              and dfp.numel() == bs * (b - 1)) else None)
+                    _decide_block_dflash(st, dt_gpu, dt_cpu, dfp_2d, bs, b)
+                elif dt_flat is not None:
+                    st.warn_once(
+                        "dflash-shape",
+                        f"draft_token numel={dt_flat.numel()} != bs*b="
+                        f"{bs*b} (b={b}); skipping select-1 this step")
+        except Exception as e:
+            st.warn_once("dflash-decide", str(e))
+        return result
+
+    worker._prepare_for_speculative_decoding = chain_prepare
+
+
+def _patch_dflash_forward(worker) -> None:
+    """Wrap forward_batch_generation: after the verify commits, backfill the
+    per-decision GT/oracle_hit from the request's own committed tokens, feed the
+    suffix trie the newly committed tokens, emit the per-step accept_len record,
+    and flush. record mode dumps GT trajectories at request finish."""
+    original_forward = worker.forward_batch_generation
+
+    def chain_forward(batch, *a, **k):
+        result = original_forward(batch, *a, **k)
+        st = _STATE
+        if st is None:
+            return result
+        try:
+            try:
+                is_decode = not (batch.forward_mode.is_extend()
+                                 or getattr(batch, "is_extend_in_batch", False)
+                                 or batch.forward_mode.is_idle())
+            except Exception:
+                is_decode = True
+            if not is_decode:
+                return result
+            for req in batch.reqs:
+                rid = req.rid
+                if st.mode == "record":
+                    if req.finished():
+                        _dump_gt(st, req)
+                    continue
+                if rid not in st.active:
+                    continue
+                ds = st.decode_step.get(rid, 0)
+                out = req.output_ids or []
+                gt_pos = st._dflash_gtpos.get((rid, ds), st.last_out_len.get(rid, 0))
+                committed = [int(t) for t in out[gt_pos:]]
+                n_committed = len(committed)
+                acc_len = max(0, n_committed - 1)
+
+                # Backfill GT + oracle_hit (drift-free: committed[d] == target
+                # greedy at depth d). oracle mode already set oracle_hit.
+                if st.mode != "oracle":
+                    recs = st._dflash_recidx.get((rid, ds), {})
+                    for depth, rec in recs.items():
+                        if "oracle_hit" in rec:
+                            continue
+                        gt_tok = committed[depth] if depth < n_committed else None
+                        rec["gt_token"] = gt_tok
+                        if gt_tok is None:
+                            rec["oracle_hit"] = "nogt"
+                        else:
+                            e_hit = rec.get("eagle_token") == gt_tok
+                            s_tok = rec.get("suffix_token")
+                            s_hit = (s_tok == gt_tok) if s_tok is not None else False
+                            rec["oracle_hit"] = ("both" if (e_hit and s_hit)
+                                                 else "eagle" if e_hit
+                                                 else "suffix" if s_hit else "none")
+
+                # Incremental trie update: feed every token committed since the
+                # last feed (out[last_out_len:] includes the first-step prefill
+                # bonus). add_active_response is the official Arctic semantics.
+                prev_fed = st.last_out_len.get(rid, 0)
+                if len(out) > prev_fed:
+                    try:
+                        st.cache.add_active_response(
+                            rid, [int(t) for t in out[prev_fed:]])
+                    except Exception as e:
+                        st.warn_once("add_active_response-dflash", str(e))
+                    st.last_out_len[rid] = len(out)
+
+                st.pending.append({"type": "step", "rid": rid,
+                                   "decode_step": ds, "accept_len": acc_len})
+                st._dflash_recidx.pop((rid, ds), None)
+                st._dflash_gtpos.pop((rid, ds), None)
+
+                if req.finished():
+                    try:
+                        st.cache.stop_request(rid)
+                    except Exception as e:
+                        st.warn_once("stop_request-dflash", str(e))
+                    st.active.discard(rid)
+                    st.last_out_len.pop(rid, None)
+                    st.decode_step.pop(rid, None)
+                    st.last_seen.pop(rid, None)
+                    st.gt.pop(rid, None)
+
+            if st.batch_counter % GC_INTERVAL == 0:
+                _gc_stale(st)
+                if st.mode == "oracle":
+                    logger.info(f"chain-hybrid DFlash oracle gt_stats: "
+                                f"{st.gt_stats}")
+            st.flush()
+        except Exception as e:
+            st.warn_once("dflash-forward-hook", str(e))
+        return result
+
+    worker.forward_batch_generation = chain_forward
+
+
+def _install_dflash_verify_pin() -> None:
+    """Force DFlash verify's target_predict onto the GT-dump trajectory (oracle +
+    pin). DFlashVerifyInput.verify computes target_predict = argmax(next_token_
+    logits).view(bs, block); the committed tokens are that argmax. We bias the
+    logits so argmax == GT[L+j] at every block position j (st.gt_predict_override,
+    set per step in the prepare wrapper), making verify NATURALLY commit the GT
+    trajectory regardless of the substituted block -> every arm follows the
+    IDENTICAL trajectory (fair MAT; differences come only from selection, i.e.
+    the accept length on that shared trajectory). -1 entries (past GT end) are
+    left as the real argmax so the request finishes naturally."""
+    import sglang.srt.speculative.dflash_info as di
+    if getattr(di.DFlashVerifyInput, "_chain_hybrid_pin_wrapped", False):
+        return
+    import torch
+    orig = di.DFlashVerifyInput.verify
+
+    def wrapped(self_vi, *, batch, logits_output, page_size):
+        st = _STATE
+        ov = getattr(st, "gt_predict_override", None) if st is not None else None
+        if ov is not None:
+            try:
+                lg = logits_output.next_token_logits  # [bs*block, vocab]
+                block = int(self_vi.draft_token_num)
+                bs = lg.shape[0] // max(block, 1)
+                bump = float(lg.max().item()) + 10.0
+                for r in range(min(bs, len(ov))):
+                    row = ov[r]
+                    for j in range(min(block, len(row))):
+                        g = row[j]
+                        if g is not None and g >= 0:
+                            lg[r * block + j, int(g)] = bump
+            except Exception as e:
+                if st is not None:
+                    st.warn_once("dflash-verify-pin", str(e))
+        return orig(self_vi, batch=batch, logits_output=logits_output,
+                    page_size=page_size)
+
+    di.DFlashVerifyInput.verify = wrapped
+    di.DFlashVerifyInput._chain_hybrid_pin_wrapped = True
+    logger.info("chain-hybrid DFlash: verify target_predict GT-pin installed")
+
+
+def patch_chain_hybrid_dflash(worker) -> None:
+    """Entry point for DFlash chain-hybrid select-1 (mirrors patch_chain_hybrid
+    for the EAGLE path). Installed by install_hook when SGLANG_CHAIN_HYBRID=1 on
+    a DFlashWorker. No topk / disable-cuda-graph / latency-only invariants:
+    DFlash drafts a block per step in Python (the substitution + suffix lookup
+    run regardless of target cuda-graph) and there is no force-accept to nullify.
+    Cross-arm fairness needs trajectory PINNING (SGLANG_CHAIN_HYBRID_PIN / oracle
+    GT): greedy alone does NOT pin across arms, since the substituted block
+    changes the verify batch and flips FP near-ties."""
+    global _STATE, _CALIB, _DISC, _ONLINE
+
+    # NOTE: block_size is NOT yet assigned when this runs — the install_hook
+    # dispatch fires early in DFlashWorker.__init__ (right after
+    # self.draft_model is set), before block_size is resolved. It is read
+    # lazily at decode time via _dflash_blocksize(st) (the prepare wrapper only
+    # fires after __init__ completes), where it is guaranteed set.
+
+    from hybrid_spec_decoding.suffix_decoding.suffix_tree import (
+        SuffixDecodingCache,
+    )
+    suffix_cache = SuffixDecodingCache(
+        max_tree_depth=64, max_cached_requests=100000, max_spec_tokens=1,
+        max_spec_factor=1.0, max_spec_offset=0.0, min_token_prob=0.1,
+        use_tree_spec=False, enable_undo=True)
+
+    log_path = os.environ.get(
+        "SGLANG_CHAIN_HYBRID_LOG",
+        "/tmp/sglang_chain_hybrid_dflash_decisions.jsonl")
+    mode = os.environ.get("SGLANG_CHAIN_HYBRID_MODE", "select1")
+    if mode not in ("select1", "record", "oracle"):
+        raise RuntimeError(
+            f"DFlash chain-hybrid mode must be select1/record/oracle, "
+            f"got {mode!r} (score_fallback/online/tail not supported).")
+
+    _STATE = _ChainHybridState(worker, suffix_cache, log_path, mode=mode)
+    _STATE._dflash_recidx = {}
+    _STATE._dflash_gtpos = {}
+    _STATE._dflash_p_flat = None
+
+    # Trajectory PIN (select1/calib/disc arms): force committed tokens onto a
+    # standalone GT dump so every arm follows the identical trajectory. oracle
+    # mode pins via its own GT (SGLANG_CHAIN_HYBRID_GT); record must not pin.
+    pin_path = os.environ.get("SGLANG_CHAIN_HYBRID_PIN")
+    if pin_path and mode == "record":
+        raise RuntimeError("SGLANG_CHAIN_HYBRID_PIN incompatible with mode=record")
+    _STATE.pin_active = bool(pin_path) and mode == "select1"
+    if _STATE.pin_active:
+        _STATE.gt_map = _load_gt_map(pin_path)
+
+    # Reuse the EAGLE serving calibrators / discriminator unchanged.
+    _ONLINE = None
+    calib_path = os.environ.get("SGLANG_CHAIN_HYBRID_CALIB")
+    mf_path = os.environ.get("SGLANG_CHAIN_HYBRID_MULTIFEAT")
+    if mf_path:
+        _CALIB = _ServingMultiFeatCalibrator.load(mf_path)
+        calib_desc = f"multifeat(kind={_CALIB.kind}, map={mf_path})"
+    elif calib_path:
+        _CALIB = _ServingIsoCalibrator.load(calib_path)
+        calib_desc = (f"calib(map={calib_path}, "
+                      f"shrink={'jeffreys' if _CALIB.wants_shrunk else 'none'})")
+    else:
+        _CALIB = None
+        calib_desc = "raw suffix_p > dflash_p (uncalibrated)"
+
+    disc_path = os.environ.get("SGLANG_CHAIN_HYBRID_DISC")
+    _DISC = _ServingDiscriminator.load(disc_path) if disc_path else None
+
+    if mode == "record":
+        _STATE.gt_out_path = os.environ.get(
+            "SGLANG_CHAIN_HYBRID_GT_OUT",
+            "/tmp/sglang_chain_hybrid_dflash_gt.jsonl")
+        mode_desc = f"mode=record (GT dump -> {_STATE.gt_out_path})"
+    elif mode == "oracle":
+        gt_path = os.environ.get("SGLANG_CHAIN_HYBRID_GT")
+        if not gt_path:
+            raise RuntimeError(
+                "DFlash chain-hybrid oracle mode requires SGLANG_CHAIN_HYBRID_GT")
+        _STATE.gt_map = _load_gt_map(gt_path)
+        mode_desc = (f"mode=oracle (selection ceiling, {len(_STATE.gt_map)} GT "
+                     f"trajectories from {gt_path})")
+    else:
+        mode_desc = (f"mode=select1, decision={calib_desc}"
+                     + (f", disc(kind={_DISC.kind}, P>0.5, "
+                        f"depth={'yes' if _DISC.with_depth else 'no'})"
+                        if _DISC is not None else ""))
+
+    if _STATE.pin_active:
+        mode_desc += f" [PINNED to {len(_STATE.gt_map)} trajectories from {pin_path}]"
+
+    _install_dflash_prob_stash(worker)
+    _patch_dflash_prepare(worker)
+    _patch_dflash_forward(worker)
+    if mode == "oracle" or _STATE.pin_active:
+        _install_dflash_verify_pin()
+    logger.info(
+        f"Chain-hybrid DFlash patch applied: {mode_desc}, "
+        f"block_size=(resolved at runtime), decision log -> {log_path}")
