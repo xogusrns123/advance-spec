@@ -2181,6 +2181,180 @@ def _dflash_blocksize(st) -> int:
     return int(getattr(st.worker, "block_size", 0) or 0)
 
 
+def _install_eagle3_aux_capture(worker, st) -> None:
+    """3-WAY (Option A) step 2a: make the EAGLE3 aux features available alongside
+    DFlash's. DFlash (the MAIN worker) captures only its own target layers
+    (HF[2,10,18,26,34] for Qwen3-8B-DFlash-b16, num_draft_layers=5); EAGLE3 needs
+    HF[2,18,33] and 33 is NOT in DFlash's set (it has 34) — and layer 34 is a poor
+    substitute (offline depth-0 hi-conf 99.5%->87.9%). So WIDEN the capture to the
+    UNION and slice each consumer's own chunks:
+      union = sorted(DFlash_HF ∪ [2, N//2, N-3]); the base model appends captured
+      aux in EXECUTION (== sorted) order so chunk i == union[i].
+      - DFlash: patch project_target_hidden to index its chunks out of the wider
+        concat before its fc (fc.in_features unchanged -> DFlash unaffected).
+      - EAGLE3-aux (step 2b): index chunks [union.index(L) for L in [2,N//2,N-3]].
+    Records the chunk maps on `st` for the EAGLE3 forward. No sglang core edits."""
+    import torch
+    target_model = worker.target_worker.model_runner.model
+    base = target_model.model                     # inner Qwen3Model (.layers_to_capture)
+    cur = list(getattr(base, "layers_to_capture", []))
+    if not cur:
+        raise RuntimeError(
+            "EAGLE3-aux: target model has no DFlash layers_to_capture set yet; "
+            "cannot widen capture (timing/ordering issue in install).")
+    ncfg = int(target_model.config.num_hidden_layers)
+    e3_hf = [2, ncfg // 2, ncfg - 3]              # sglang EAGLE3 default capture
+    union = sorted(set(cur) | set(e3_hf))
+    dflash_chunks = [union.index(x) for x in cur]
+    e3_chunks = [union.index(x) for x in e3_hf]
+    H = int(target_model.config.hidden_size)
+    base.layers_to_capture = union
+
+    draft = worker.draft_model
+    if not getattr(draft, "_e3_project_patched", False):
+        orig_proj = draft.project_target_hidden
+        nchunk = len(union)
+        sel = torch.tensor(dflash_chunks, device=worker.device, dtype=torch.long)
+
+        def patched_project(target_hidden, _orig=orig_proj, _sel=sel, _n=nchunk, _h=H):
+            # target_hidden: [N, nchunk*H] (wider union concat) -> pick DFlash chunks
+            N = int(target_hidden.shape[0])
+            th = target_hidden.view(N, _n, _h).index_select(1, _sel).reshape(N, -1)
+            return _orig(th)
+
+        draft.project_target_hidden = patched_project
+        draft._e3_project_patched = True
+
+    st._e3_union = union
+    st._e3_dflash_chunks = dflash_chunks
+    st._e3_chunks = e3_chunks
+    st._e3_hidden = H
+    st._e3_num_target_layers = ncfg
+    logger.info(
+        f"EAGLE3-aux capture widened: DFlash_HF={cur} e3_HF={e3_hf} "
+        f"union={union} dflash_chunks={dflash_chunks} e3_chunks={e3_chunks} H={H}")
+
+    _load_eagle3_aux(worker, st)
+    _wrap_dflash_append_for_e3(worker, st)
+
+
+def _load_eagle3_aux(worker, st) -> None:
+    """Load the hand-built EAGLE3 forward (validated all-depth offline) in-process
+    as the 3rd proposer, sharing the target's token embedding."""
+    import sys
+    sys.path.insert(0, "/workspace")
+    from simulation.scripts.experiments.eagle3_offline import (
+        Eagle3Offline, _eagle3_snapshot)
+    import torch
+    snap = os.environ.get("SGLANG_CHAIN_HYBRID_EAGLE3_SNAP") or _eagle3_snapshot()
+    st._e3 = Eagle3Offline(snap, device=worker.device, dtype=torch.bfloat16)
+    target_model = worker.target_worker.model_runner.model
+    embed = target_model.model.embed_tokens
+
+    def embed_fn(tokens):
+        t = tokens if isinstance(tokens, torch.Tensor) else torch.tensor(
+            tokens, device=worker.device)
+        if t.device != torch.device(worker.device):
+            t = t.to(worker.device)
+        return embed(t.to(torch.long))
+
+    st._e3_embed = embed_fn
+    st._e3_kv = None          # per-request committed cache (bs=1): see _e3_update
+    logger.info(f"EAGLE3-aux model loaded from {snap} (device={worker.device})")
+
+
+def _e3_update_committed(st, worker, batch, draft_input) -> None:
+    """Maintain the per-request EAGLE3 committed K/V cache (single draft layer)
+    INCREMENTALLY. Runs inside the _append_target_hidden_to_draft_kv wrapper BEFORE
+    the original consumes/resets draft_input.target_hidden. bs==1 (max-running=1).
+
+    Feature LAG (validated): the EAGLE3 K/V at committed position p uses the target
+    feature at p-1, so we carry the last feature across batches. The LAST committed
+    position of each call is the next block's root: its res3 + depth-0 proposal are
+    stashed for the upcoming _decide_block_dflash chain rollout."""
+    import torch
+    th = getattr(draft_input, "target_hidden", None)
+    if th is None or th.numel() == 0:
+        return
+    bs = batch.batch_size()
+    if bs != 1:
+        st.warn_once("e3-bs", f"EAGLE3-aux supports bs==1 only (got {bs}); skipping")
+        return
+    req = batch.reqs[0]
+    rid = req.rid
+    total_ctx = int(th.shape[0])
+    nchunk = len(st._e3_union); H = st._e3_hidden
+    chunks = torch.tensor(st._e3_chunks, device=th.device, dtype=torch.long)
+    e3_aux = th.view(total_ctx, nchunk, H).index_select(1, chunks).reshape(
+        total_ctx, len(st._e3_chunks) * H)                       # [N, 3H]
+
+    ctx_start = int(batch.seq_lens[0].item()) - total_ctx
+    seq = list(req.origin_input_ids) + list(req.output_ids or [])
+    toks = seq[ctx_start:ctx_start + total_ctx]
+    if len(toks) != total_ctx:
+        st.warn_once("e3-tokmap",
+                     f"token/ctx mismatch {len(toks)} vs {total_ctx} at "
+                     f"start={ctx_start} seqlen={len(seq)}; skipping e3 update")
+        return
+    tokens = torch.tensor(toks, device=worker.device, dtype=torch.long)
+    positions = torch.arange(ctx_start, ctx_start + total_ctx,
+                             device=worker.device, dtype=torch.long)
+
+    prev = st._e3_kv
+    fresh = prev is None or prev.get("rid") != rid or ctx_start == 0
+    if fresh:
+        k_old = v_old = None
+        lagged = torch.cat([e3_aux[:1], e3_aux[:-1]], dim=0)     # pos0 self (never compared)
+    else:
+        if prev["k"].shape[0] != ctx_start:
+            st.warn_once("e3-ctxdrift",
+                         f"e3 committed len {prev['k'].shape[0]} != ctx_start "
+                         f"{ctx_start}; rebuilding from this batch")
+            k_old = v_old = None
+            lagged = torch.cat([e3_aux[:1], e3_aux[:-1]], dim=0)
+        else:
+            k_old = prev["k"]; v_old = prev["v"]
+            lagged = torch.cat([prev["carried_feat"], e3_aux[:-1]], dim=0)
+    carried_feat = e3_aux[-1:].clone()                            # feature at last pos
+
+    # Build/extend the COMMITTED K/V only (positions with REAL captured target
+    # features, [0..root]). The next block's depth-0 root is the SEED (the last
+    # committed token = prev verify's bonus) at position root+1, whose target
+    # feature is captured only in the NEXT verify. EAGLE3's lag means depth-0 at
+    # the seed needs feat[seed-1] == carried_feat (already in hand) + embed(seed),
+    # so the depth-0 seed step is performed in _decide_block, not here.
+    out = st._e3.extend_kv(lagged, tokens, positions, st._e3_embed, k_old, v_old)
+    root = ctx_start + total_ctx - 1
+    st._e3_kv = {"rid": rid, "k": out["k"], "v": out["v"],
+                 "carried_feat": carried_feat, "root": root}
+    if os.environ.get("SGLANG_E3_DEBUG") == "1" and getattr(st, "_e3_dbg_n", 0) < 8:
+        st._e3_dbg_n = getattr(st, "_e3_dbg_n", 0) + 1
+        logger.info(
+            f"[E3DBG] fresh={fresh} ctx_start={ctx_start} total_ctx={total_ctx} "
+            f"root={root} seq_lens={int(batch.seq_lens[0].item())} "
+            f"len_out={len(req.output_ids or [])} toks[-3:]={toks[-3:]} "
+            f"pos[-3:]={positions[-3:].tolist()}")
+
+
+def _wrap_dflash_append_for_e3(worker, st) -> None:
+    """Wrap _append_target_hidden_to_draft_kv so the EAGLE3 committed K/V is
+    extended from the SAME captured target features (BEFORE the original resets
+    draft_input.target_hidden). The original is always run unchanged afterwards."""
+    if getattr(worker, "_e3_append_wrapped", False):
+        return
+    orig_append = worker._append_target_hidden_to_draft_kv
+
+    def wrapped(batch, draft_input):
+        try:
+            _e3_update_committed(st, worker, batch, draft_input)
+        except Exception as e:
+            st.warn_once("e3-update", str(e))
+        return orig_append(batch, draft_input)
+
+    worker._append_target_hidden_to_draft_kv = wrapped
+    worker._e3_append_wrapped = True
+
+
 def _install_dflash_prob_stash(worker) -> None:
     """Wrap _greedy_sample_from_vocab_parallel_head so each block position's
     max-softmax prob (the DFlash analog of eagle_p) is stashed next to the
@@ -2237,10 +2411,39 @@ def _decide_block_dflash(st, dt_gpu, dt_cpu, dfp_2d, bs, b):
 
     The per-(row,depth) decision body mirrors _decide_and_inject; it is
     duplicated rather than shared so the validated EAGLE/MTP path is untouched."""
+    e3_on = getattr(st, "_e3_enabled", False) and getattr(st, "_e3", None) is not None
     for r, (rid, ctx_tail) in enumerate(st.stash):
         chain = st.chains[r]
         ds = st.decode_step.get(rid, 0)
         recs_by_depth = st._dflash_recidx.setdefault((rid, ds), {})
+        # EAGLE3-aux per-block rollout (bs==1). The committed K/V [0..root] (real
+        # target features) + carried_feat (= feat[root]) were stashed by
+        # _e3_update_committed. The block's depth-0 root is the SEED at position
+        # root+1 (= dt_cpu[r,0], the last committed token / prev bonus); its EAGLE3
+        # forward uses fc(carried_feat) [the lag feature feat[seed-1]] + embed(seed)
+        # -> depth-0 proposal + res3 carried to the chain. depths>0 are rolled
+        # INCREMENTALLY (EAGLE3's depth-d proposal depends on the chosen chain).
+        e3 = None
+        if e3_on:
+            kv = getattr(st, "_e3_kv", None)
+            if kv is not None and kv.get("rid") == rid:
+                try:
+                    import torch as _t
+                    seed_tok = int(dt_cpu[r, 0])
+                    root_true = int(kv["root"]) + 1
+                    so = st._e3.extend_kv(
+                        kv["carried_feat"],
+                        _t.tensor([seed_tok], device=st._e3.device, dtype=_t.long),
+                        _t.tensor([root_true], device=st._e3.device, dtype=_t.long),
+                        st._e3_embed, kv["k"], kv["v"])
+                    e3 = {"root": root_true, "k": so["k"], "v": so["v"],
+                          "h_prev": so["res3"][-1:],
+                          "tok0": int(so["tok"][-1].item()),
+                          "p0": float(so["prob"][-1].item()),
+                          "ck": None, "cv": None}
+                except Exception as ex:
+                    st.warn_once("e3-seed", str(ex))
+                    e3 = None
         for bp in range(1, b):
             depth = bp - 1
             eagle_tok = int(dt_cpu[r, bp])
@@ -2254,6 +2457,25 @@ def _decide_block_dflash(st, dt_gpu, dt_cpu, dfp_2d, bs, b):
                 "suffix_total": None, "suffix_p_cal": None, "match_len": None,
                 "suffix_score": None, "chosen": "eagle3", "agreement": None,
             }
+            # EAGLE3-aux proposal for this depth (3rd proposer). depth 0 = the
+            # root prefill proposal; depth d>0 = one chain step fed the CHOSEN
+            # token at depth d-1 (chain[-1]) + EAGLE3's own carried res3.
+            if e3 is not None:
+                try:
+                    if depth == 0:
+                        e3_tok, e3_p = e3["tok0"], e3["p0"]
+                    else:
+                        prev_chosen = chain[-1]
+                        e3_tok, e3_p, e3_res3, e3["ck"], e3["cv"] = \
+                            st._e3.chain_step(
+                                e3["h_prev"], prev_chosen, e3["root"] + depth,
+                                st._e3_embed, e3["k"], e3["v"], e3["ck"], e3["cv"])
+                        e3["h_prev"] = e3_res3
+                    rec["e3_token"] = int(e3_tok)
+                    rec["e3_p"] = round(float(e3_p), 6)
+                except Exception as ex:
+                    st.warn_once("e3-rollout", str(ex))
+                    e3 = None
             suffix_tok = suffix_p = suffix_count = suffix_total = None
             if rid in st.active:
                 try:
@@ -2294,6 +2516,37 @@ def _decide_block_dflash(st, dt_gpu, dt_cpu, dfp_2d, bs, b):
                           and L is not None and L + depth < len(gt_list))
                           else None)
                 rec["gt_token"] = gt_tok
+                # 3-WAY CEILING arm (mode=oracle, e3 active): TEACHER-FORCE gt into
+                # EVERY block position so the target processes gt -> the captured
+                # target features (and thus EAGLE3's committed K/V) are gt-consistent
+                # for ALL arms (no substituted-token feature artifact; user-chosen
+                # option B). We LOG each proposer's proposal + per-proposer hit
+                # (==gt); selacc / block-anchored MAT / the oracle ceiling for EVERY
+                # policy (raw/calib/mono/bayes/oracle) are computed OFFLINE from this
+                # one log. The chain follows gt (re-speculation at every gt position).
+                if e3 is not None:
+                    e3_tok = rec.get("e3_token")
+                    d_hit = gt_tok is not None and eagle_tok == gt_tok
+                    e_hit = gt_tok is not None and e3_tok is not None and e3_tok == gt_tok
+                    s_hit = (gt_tok is not None and suffix_tok is not None
+                             and suffix_tok == gt_tok)
+                    rec["dflash_hit"] = bool(d_hit)
+                    rec["e3_hit"] = bool(e_hit)
+                    rec["suffix_hit"] = bool(s_hit)
+                    if gt_tok is None:
+                        rec["oracle_hit"] = "nogt"; chosen_tok = eagle_tok
+                    else:
+                        hits = [n for n, h in (("dflash", d_hit), ("e3", e_hit),
+                                               ("suffix", s_hit)) if h]
+                        rec["oracle_hit"] = "+".join(hits) if hits else "none"
+                        chosen_tok = gt_tok                  # teacher-force gt (clean feats)
+                        rec["chosen"] = "oracle"
+                        if gt_tok != eagle_tok:
+                            dt_gpu[r, bp] = gt_tok
+                    chain.append(chosen_tok)
+                    recs_by_depth[depth] = rec
+                    st.pending.append(rec)
+                    continue
                 rec["agreement"] = (suffix_tok == eagle_tok
                                     if suffix_tok is not None else None)
                 chosen_tok = eagle_tok
@@ -2311,6 +2564,27 @@ def _decide_block_dflash(st, dt_gpu, dt_cpu, dfp_2d, bs, b):
                         rec["chosen"] = "suffix"
                 rec["oracle_hit"] = hit
                 chain.append(chosen_tok)
+                recs_by_depth[depth] = rec
+                st.pending.append(rec)
+                continue
+
+            # 3-WAY select1 (e3 active): pick the highest-prob proposer among
+            # {dflash, e3, suffix}. RAW probs (calibrated/disc 3-way = 2c TODO).
+            # dflash is the default/tiebreak (it already populates the block).
+            if e3 is not None:
+                e3_tok = rec.get("e3_token")
+                e3_pp = rec.get("e3_p") or 0.0
+                best_name, best_tok, best_p = "dflash", eagle_tok, eagle_p
+                if e3_tok is not None and e3_pp > best_p:
+                    best_name, best_tok, best_p = "e3", e3_tok, e3_pp
+                if suffix_tok is not None and (suffix_p or 0.0) > best_p:
+                    best_name, best_tok, best_p = "suffix", suffix_tok, suffix_p
+                rec["agreement"] = (suffix_tok == eagle_tok
+                                    if suffix_tok is not None else None)
+                rec["chosen"] = best_name
+                if best_tok != eagle_tok:
+                    dt_gpu[r, bp] = best_tok
+                chain.append(best_tok)
                 recs_by_depth[depth] = rec
                 st.pending.append(rec)
                 continue
@@ -2700,6 +2974,12 @@ def patch_chain_hybrid_dflash(worker) -> None:
 
     if _STATE.pin_active:
         mode_desc += f" [PINNED to {len(_STATE.gt_map)} trajectories from {pin_path}]"
+
+    # 3-way (Option A): add EAGLE3 as a 3rd proposer alongside DFlash + suffix.
+    # Gated by SGLANG_CHAIN_HYBRID_EAGLE3 so the committed 2-way path is untouched.
+    _STATE._e3_enabled = os.environ.get("SGLANG_CHAIN_HYBRID_EAGLE3") == "1"
+    if _STATE._e3_enabled:
+        _install_eagle3_aux_capture(worker, _STATE)
 
     _install_dflash_prob_stash(worker)
     _patch_dflash_prepare(worker)
