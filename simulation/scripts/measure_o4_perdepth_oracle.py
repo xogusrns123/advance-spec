@@ -162,7 +162,7 @@ def main() -> int:
                         gt_out=gt_out, gt_file=gt_file)
         cmd = build_server_cmd(args, arm, preset)
         server_log = out_dir / f"server_{arm}.log"
-        agent_out = out_dir / f"agent_results_{arm}.json"
+        agent_out = out_dir / f"agent_trajectory_{arm}.json"
         log_fh = open(server_log, "w")
         proc = subprocess.Popen(cmd, env=env, stdout=log_fh, stderr=log_fh,
                                 cwd=str(REPO_ROOT))

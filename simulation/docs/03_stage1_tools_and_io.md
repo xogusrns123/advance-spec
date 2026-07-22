@@ -103,7 +103,7 @@ Mini-swe-agent 의 공식 SWE-Bench config (`benchmarks/swebench.yaml`) 에 매�
 
 ## 3. 결과 쓰기 — `simulation/pipeline/save_results.py`
 
-네 개의 agent 모두 `run_benchmark` 종료 시점에 `save_agent_results(output, output_path)` 를 정확히 한 번 호출한다. BFCLv4, SpecBench, SWE-Bench 는 추가로 매 request 후 `append_to_checkpoint` 를 호출한다.
+네 개의 agent 모두 `run_benchmark` 종료 시점에 `save_agent_trajectory(output, output_path)` 를 정확히 한 번 호출한다. BFCLv4, SpecBench, SWE-Bench 는 추가로 매 request 후 `append_to_checkpoint` 를 호출한다.
 
 ### 3.1 `_atomic_write_json(data, path)` (`save_results.py:14-28`)
 
@@ -125,7 +125,7 @@ Mini-swe-agent 의 공식 SWE-Bench config (`benchmarks/swebench.yaml`) 에 매�
 
 checkpoint 를 load (없으면 `{metadata: {}, questions: []}`) 하고 `question` 을 append, `metadata` 가 주어지면 set 한 뒤 atomic 하게 다시 write. per-request rewrite 비용은 oracle entries 가 dominant 하지만 partial 은 수십 MB 안에 머무르므로 acceptable.
 
-### 3.6 `save_agent_results(data, output_path)` (`save_results.py:115-157`)
+### 3.6 `save_agent_trajectory(data, output_path)` (`save_results.py:115-157`)
 
 **두 개의 파일** 을 쓴다:
 
@@ -139,7 +139,7 @@ Stage 2/3 은 full 파일을 읽는다. response 파일은 사람 검수 전용.
 
 ### 3.7 `finalize_checkpoint(output_path, metadata)` (`save_results.py:96-112`)
 
-partial load → `save_agent_results` 호출 → partial unlink. agent 들이 run 종료 시 방어적 cleanup 으로 호출하지만, 직접 `save_agent_results` + `unlink` 도 같이 호출한다.
+partial load → `save_agent_trajectory` 호출 → partial unlink. agent 들이 run 종료 시 방어적 cleanup 으로 호출하지만, 직접 `save_agent_trajectory` + `unlink` 도 같이 호출한다.
 
 ## 4. agent 결과 읽기 — `simulation/pipeline/_agent_io.py`
 

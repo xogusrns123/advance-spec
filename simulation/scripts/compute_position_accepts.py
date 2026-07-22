@@ -31,7 +31,7 @@ Output JSON has the same `position_accepts` schema as the simulator:
 
 Usage (one workload):
     python3 -m simulation.scripts.compute_position_accepts \\
-        --agent-results .../agent_results_eagle3.json \\
+        --agent-trajectory .../agent_results_eagle3.json \\
         --dataset .../dataset.jsonl \\
         --draft-model-drafts .../draft_model_drafts.jsonl \\
         --reslice-steps 8 --reslice-topk 8 \\
@@ -94,7 +94,7 @@ def _empty_stats(max_pos: int) -> Dict[str, List[int]]:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--agent-results", required=True)
+    ap.add_argument("--agent-trajectory", required=True)
     ap.add_argument("--dataset", default=None,
                     help="Required for BFCL prompt reconstruction; specbench "
                          "and swebench can usually omit.")
@@ -116,13 +116,13 @@ def main():
         eagle3_reslice = (args.capture_steps, args.capture_topk,
                           args.reslice_steps, args.reslice_topk)
 
-    print(f"[posacc] loading capture: {args.agent_results}", file=sys.stderr)
+    print(f"[posacc] loading capture: {args.agent_trajectory}", file=sys.stderr)
     t0 = time.time()
     records = assemble_records_from_artifacts(
-        agent_results_path=args.agent_results,
+        agent_trajectory_path=args.agent_trajectory,
         suffix_drafts_path=None,
         draft_model_drafts_path=args.draft_model_drafts,
-        mtp_agent_results_path=None,
+        mtp_agent_trajectory_path=None,
         exclude_path=args.exclude,
         model=args.model,
         dataset_path=args.dataset,
@@ -286,7 +286,7 @@ def main():
 
     out = {
         "metadata": {
-            "input_source": args.agent_results,
+            "input_source": args.agent_trajectory,
             "draft_model_drafts": args.draft_model_drafts,
             "max_position": max_pos,
             "reslice": (None if not eagle3_reslice

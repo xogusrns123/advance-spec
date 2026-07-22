@@ -1,8 +1,16 @@
 """
-SpecBench / MT-Bench agent for SGLang oracle trajectory collection.
+Spec-Bench agent for SGLang oracle trajectory collection.
 
-Multi-turn Q&A without tool calls. Sends each turn's user message,
-collects the assistant response, and logs oracle draft entries.
+Drives the standard Spec-Bench benchmark (hemingkx/Spec-Bench, ACL 2024):
+480 questions across six sub-tasks (80 each) — mt_bench (multi-turn
+conversation), translation, summarization, qa, math_reasoning (GSM8K),
+and rag. Built by simulation/scripts/build_specbench_dataset.py; each row
+carries a coarse `subtask` plus the upstream fine-grained `category`.
+
+No tool calls. Iterates each row's `turns` list, sending one user message
+per turn and collecting the assistant response (so single-turn tasks make
+one call, MT-Bench's two-turn rows make two), and logs oracle draft
+entries. This is generation-only, exactly as Spec-Bench prescribes.
 
 Output format is compatible with _extract_online() in simulation.pipeline._agent_io.
 
@@ -45,7 +53,7 @@ def load_specbench_dataset(
     path: str,
     num_requests: int | None = None,
 ) -> list[dict]:
-    """Load SpecBench/MT-Bench JSONL dataset."""
+    """Load Spec-Bench JSONL dataset (rows carry subtask/category/turns)."""
     records = []
     with open(path) as f:
         for line in f:
@@ -219,6 +227,7 @@ def run_benchmark(
     input_file: str,
     output_file: str,
     num_requests: int | None = None,
+    offset: int = 0,
     max_iterations: int = 1,  # unused, kept for CLI compat
     temperature: float = 0.0,
     max_tokens: int = 32768,
@@ -250,7 +259,7 @@ def run_benchmark(
 
     # Resume: skip questions already in checkpoint partial.
     from simulation.pipeline.save_results import (
-        load_checkpoint, append_to_checkpoint, save_agent_results,
+        load_checkpoint, append_to_checkpoint, save_agent_trajectory,
         checkpoint_path,
     )
     cp = load_checkpoint(output_file) if resume else None
@@ -268,6 +277,8 @@ def run_benchmark(
 
     pending = [item for item in dataset
                if str(item.get("question_id", "")) not in done]
+    if offset:                       # carve disjoint train/eval slices (held-out calib)
+        pending = pending[offset:]
     if num_requests is not None:
         pending = pending[:num_requests]
 
@@ -315,7 +326,7 @@ def run_benchmark(
         append_to_checkpoint(output_file, result, _meta())
 
     output = {"metadata": _meta(), "questions": questions}
-    save_agent_results(output, output_file)
+    save_agent_trajectory(output, output_file)
     try:
         checkpoint_path(output_file).unlink()
     except FileNotFoundError:
@@ -335,6 +346,8 @@ def main():
     parser.add_argument("--input-file", required=True)
     parser.add_argument("--output-file", required=True)
     parser.add_argument("--num-requests", type=int, default=None)
+    parser.add_argument("--offset", type=int, default=0,
+                        help="Skip the first N pending items (train/eval split)")
     parser.add_argument("--max-iterations", type=int, default=1,
                         help="Unused, kept for CLI compatibility")
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -353,6 +366,7 @@ def main():
         input_file=args.input_file,
         output_file=args.output_file,
         num_requests=args.num_requests,
+        offset=args.offset,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
         replay_path=args.replay,

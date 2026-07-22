@@ -31,9 +31,9 @@ FT applied to suffix calls: (F, T) ∈ FT_GRID. One run per FT pair.
 
 Usage:
   python3 -m simulation.evaluation.run_oracle_v12 \\
-    --agent-results .../agent_results_eagle3.json \\
+    --agent-trajectory .../agent_results_eagle3.json \\
     --dataset .../dataset.jsonl \\
-    --latency-config .../latency_config.json \\
+    --latency-data .../latency_data.json \\
     --model Qwen/Qwen3-14B \\
     --steps 2 --topk 16 \\
     --output /tmp/oracle_v12_<wl>_s2k16.json
@@ -91,24 +91,24 @@ def _interp(table: dict, B: int, fallback: float) -> float:
                                             - float(table[str(lo)]))
 
 
-def build_latency(latency_config: dict, steps: int, topk: int):
-    vanilla_ms = float(latency_config["vanilla_step_ms"])
-    tfwd_by_topk = latency_config.get("target_forward_ms_by_topk", {}) or {}
+def build_latency(latency_data: dict, steps: int, topk: int):
+    vanilla_ms = float(latency_data["vanilla_step_ms"])
+    tfwd_by_topk = latency_data.get("target_forward_ms_by_topk", {}) or {}
     if str(topk) in tfwd_by_topk:
         target_fwd = tfwd_by_topk[str(topk)]
     else:
-        target_fwd = latency_config.get("target_forward_ms", {})
+        target_fwd = latency_data.get("target_forward_ms", {})
 
-    e3draft_by_ts = latency_config.get("eagle3_draft_ms_by_topk_steps", {}) or {}
-    e3draft_by_s = latency_config.get("eagle3_draft_ms_by_steps", {}) or {}
+    e3draft_by_ts = latency_data.get("eagle3_draft_ms_by_topk_steps", {}) or {}
+    e3draft_by_s = latency_data.get("eagle3_draft_ms_by_steps", {}) or {}
     if str(topk) in e3draft_by_ts and str(steps) in e3draft_by_ts[str(topk)]:
         eagle3_table = e3draft_by_ts[str(topk)][str(steps)]
     elif str(steps) in e3draft_by_s:
         eagle3_table = e3draft_by_s[str(steps)]
     else:
-        eagle3_table = latency_config.get("eagle3_draft_ms", {})
+        eagle3_table = latency_data.get("eagle3_draft_ms", {})
 
-    suffix_speculate_ms = float(latency_config.get("suffix_speculate_ms", 0.0))
+    suffix_speculate_ms = float(latency_data.get("suffix_speculate_ms", 0.0))
 
     def target_forward(B: int) -> float:
         return _interp(target_fwd, max(B, 1), vanilla_ms)
@@ -383,10 +383,10 @@ def run_one_ft(records, target_forward, eagle3_draft, suffix_speculate_ms,
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--agent-results", required=True)
+    ap.add_argument("--agent-trajectory", required=True)
     ap.add_argument("--dataset", default=None)
     ap.add_argument("--responses", default=None)
-    ap.add_argument("--latency-config", required=True)
+    ap.add_argument("--latency-data", required=True)
     ap.add_argument("--model", default="Qwen/Qwen3-14B")
     ap.add_argument("--steps", type=int, default=2)
     ap.add_argument("--topk", type=int, default=16)
@@ -396,15 +396,15 @@ def main():
     ap.add_argument("--output", required=True)
     args = ap.parse_args()
 
-    with open(args.latency_config) as f:
+    with open(args.latency_data) as f:
         lc = json.load(f)
     target_forward, eagle3_draft, sfx_ms, vanilla_ms = build_latency(
         lc, args.steps, args.topk)
 
-    print(f"Loading capture: {args.agent_results}", file=sys.stderr)
+    print(f"Loading capture: {args.agent_trajectory}", file=sys.stderr)
     t0 = time.time()
     records = assemble_records_from_artifacts(
-        agent_results_path=args.agent_results,
+        agent_trajectory_path=args.agent_trajectory,
         dataset_path=args.dataset,
         responses_path=args.responses,
         model=args.model,
@@ -420,7 +420,7 @@ def main():
 
     out = {
         "metadata": {
-            "agent_results": args.agent_results,
+            "agent_trajectory": args.agent_trajectory,
             "model": args.model,
             "reslice": f"s{args.steps}k{args.topk}",
             "vanilla_ms": vanilla_ms,

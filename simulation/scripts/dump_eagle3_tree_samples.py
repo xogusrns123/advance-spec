@@ -36,7 +36,7 @@ def _decode_tokens(tokenizer, ids: List[int]) -> List[str]:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--agent-results", required=True)
+    ap.add_argument("--agent-trajectory", required=True)
     ap.add_argument("--dataset", default=None)
     ap.add_argument("--responses", default=None)
     ap.add_argument("--model", required=True,
@@ -55,11 +55,11 @@ def main():
     eagle3_reslice = (args.capture_steps, args.capture_topk,
                       args.reslice_steps, args.reslice_topk)
 
-    print(f"[dump] loading capture: {args.agent_results}", file=sys.stderr)
+    print(f"[dump] loading capture: {args.agent_trajectory}", file=sys.stderr)
     records = assemble_records_from_artifacts(
-        agent_results_path=args.agent_results,
+        agent_trajectory_path=args.agent_trajectory,
         suffix_drafts_path=None, draft_model_drafts_path=None,
-        mtp_agent_results_path=None, exclude_path=None,
+        mtp_agent_trajectory_path=None, exclude_path=None,
         model=args.model, dataset_path=args.dataset,
         responses_path=args.responses, eagle3_reslice=eagle3_reslice,
     )
@@ -98,7 +98,7 @@ def main():
 
     out = {
         "metadata": {
-            "input_source": args.agent_results,
+            "input_source": args.agent_trajectory,
             "model": args.model,
             "reslice": {"S": args.capture_steps, "K": args.capture_topk,
                         "s": args.reslice_steps, "k": args.reslice_topk},

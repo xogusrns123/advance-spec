@@ -8,7 +8,7 @@ Stage 3는 Stage 1 (`agent_results_eagle3.json`) 과 Stage 2 (`draft_model_draft
 
 | Flag | 의미 |
 |---|---|
-| `--agent-results` (required) | Stage 1 EAGLE3 oracle vanilla JSON. `assemble_records_from_artifacts()` 의 1차 입력 |
+| `--agent-trajectory` (required) | Stage 1 EAGLE3 oracle vanilla JSON. `assemble_records_from_artifacts()` 의 1차 입력 |
 | `--draft-model-drafts` | Stage 2 draft-LM JSONL. 없으면 `single:draft_model`, `hybrid_dm`, `extension_dmsfx*` 가 자동 비활성 |
 | `--dataset` | BFCL/SpecBench dataset.jsonl, prompt 재구성용 |
 | `--responses` | BFCL용 `agent_results_responses.json` (대화 turn 재구성에 필요) |
@@ -16,7 +16,7 @@ Stage 3는 Stage 1 (`agent_results_eagle3.json`) 과 Stage 2 (`draft_model_draft
 | `--exclude` | exclude id 파일 (`load_exclude_ids` in `_agent_io.py:24`) |
 | `--output` | per-budget 결과를 적을 JSON path |
 | `--budgets` (default `1,2,4,8,16,32,64`) | budget B sweep |
-| `--latency-config` | `simulation/config/latency/<preset>.json`. 없으면 stub config (vanilla=1ms) |
+| `--latency-data` | `simulation/config/latency/<preset>.json`. 없으면 stub config (vanilla=1ms) |
 | `--topk`, `--steps` | EAGLE3 hyperparam — latency table에서 per-(K,S) 행을 고를 때 사용 |
 | `--reslice-steps`, `--reslice-topk`, `--capture-steps`, `--capture-topk` | 4 개 묶음 — Stage 1 에서 `SGLANG_CAPTURE_FULL_POOL=1` 로 캡처한 full pool 을 (s', k') sub-tree 로 reslice. `(capture_S, capture_K)` 가 캡처 당시 config, `(reslice_S', reslice_K')` 가 재구성 target. 4 개 중 하나라도 빠지면 `parser.error`. 자세한 건 `09_pool_reslicer.md` |
 | `--print-summary` | stderr summary 출력 |
@@ -218,7 +218,7 @@ step_real = real_step_target_fn(ext_size) + real_step_draft_only_ms
 | `measure_eagle3_cost.py` | `target_forward_ms_by_topk[K][B]`, `eagle3_draft_ms_by_topk_steps[K][S][B]` (실제 SGLang EAGLE3 oracle latency 모드) |
 | `measure_draft_model_cost.py` | `draft_lm_tpot_ms_by_n` → `draft_lm_tpot_ms` (canonical n=3) |
 | `measure_suffix_cost.py` | `suffix_speculate_ms_by_workload` → median |
-| `compile_latency_config.py` | 위 3 개 cost JSON → 단일 `latency_config.json` 합성 |
+| `compile_latency_config.py` | 위 3 개 cost JSON → 단일 `latency_data.json` 합성 |
 | `simulation/scripts/experiments/remeasure_latency.sh` | 위 4개 wrapper |
 | `calibrate_latency.py` | ad-hoc TPOT 측정 (vanilla baseline 만) — production pipeline 과는 별도 |
 
@@ -279,14 +279,14 @@ speedup_per_ratio[r] = vanilla_time_ms / time_per_ratio[r]                   # v
 
 ```jsonc
 {
-  "metadata": {"input_source": <agent_results path>,
+  "metadata": {"input_source": <agent_trajectory path>,
                "n_steps": len(records),
                "budgets": [...]},
   "latency": {
     "vanilla_step_ms": ...,
     "proposers": ["draft_model", "eagle3", "mtp"?, "suffix"],
     "pairs":     ["draft_model+eagle3", ...],   // 보고용 메타
-    "has_latency_config": bool,
+    "has_latency_data": bool,
     "budget_sweep": [
       {
         "budget": B,
@@ -309,7 +309,7 @@ speedup_per_ratio[r] = vanilla_time_ms / time_per_ratio[r]                   # v
         "<prefix>_total_target_tokens_max": ...,
       }
     ],
-    "note": "latency_config not provided; ..."?    // stub config 시
+    "note": "latency_data not provided; ..."?    // stub config 시
   }
 }
 ```

@@ -26,7 +26,7 @@ small-LM proposal 을 step 별로 미리 수집해두는 단계이고, 산출물
 
 ```bash
 python -m simulation.pipeline.collect_draft_model \
-    --agent-results <agent_results_eagle3.json> \
+    --agent-trajectory <agent_results_eagle3.json> \
     --output <draft_model_drafts.jsonl> \
     --model <draft_lm_path> \
     --server-url http://localhost:31000 \

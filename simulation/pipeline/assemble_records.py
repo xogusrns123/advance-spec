@@ -94,7 +94,7 @@ def collect_step_records(
         provided, MTP drafts are attached to per_proposer along with
         per-node ``path_draft_p_t`` (when present).
     dm_capture_requests : list[dict], optional
-        STANDALONE-algorithm draft-model capture round (same agent_results
+        STANDALONE-algorithm draft-model capture round (same agent_trajectory
         format as eagle3). When matched by bfcl_id, supplies the
         tree-structured draft_model proposer with per-node
         ``path_draft_p_t`` instead of the flat-chain ``dm_by_key`` fallback.
@@ -411,10 +411,10 @@ def collect_step_records(
 
 
 def assemble_records_from_artifacts(
-    agent_results_path: str,
+    agent_trajectory_path: str,
     suffix_drafts_path: Optional[str] = None,
     draft_model_drafts_path: Optional[str] = None,
-    mtp_agent_results_path: Optional[str] = None,
+    mtp_agent_trajectory_path: Optional[str] = None,
     dm_capture_path: Optional[str] = None,
     exclude_path: Optional[str] = None,
     model: Optional[str] = None,
@@ -432,7 +432,7 @@ def assemble_records_from_artifacts(
     streaming=True (default): use ijson to parse `questions[]` one item at a
     time, run extract+collect per question, then release the parsed dict
     before reading the next. Avoids the multi-tens-of-GB peak from holding
-    the full agent_results dict + all_requests + records simultaneously.
+    the full agent_trajectory dict + all_requests + records simultaneously.
     streaming=False falls back to ``json.load`` (legacy path).
     """
     exclude_ids = load_exclude_ids(exclude_path) if exclude_path else set()
@@ -489,10 +489,10 @@ def assemble_records_from_artifacts(
 
     mtp_all_requests = None
     mtp_by_id: Optional[Dict[str, dict]] = None
-    if mtp_agent_results_path:
+    if mtp_agent_trajectory_path:
         # MTP path retains json.load for now (rarely used; keeps simple).
-        print(f"Loading MTP data: {mtp_agent_results_path}", file=sys.stderr)
-        with open(mtp_agent_results_path) as f:
+        print(f"Loading MTP data: {mtp_agent_trajectory_path}", file=sys.stderr)
+        with open(mtp_agent_trajectory_path) as f:
             mtp_data = json.load(f)
         mtp_all_requests = extract_requests(mtp_data, exclude_ids)
         print(f"MTP requests: {len(mtp_all_requests)}", file=sys.stderr)
@@ -501,7 +501,7 @@ def assemble_records_from_artifacts(
     dm_cap_all_requests = None
     dm_cap_by_id: Optional[Dict[str, dict]] = None
     if dm_capture_path:
-        # Standalone draft-model capture: same agent_results format as eagle3
+        # Standalone draft-model capture: same agent_trajectory format as eagle3
         # / MTP. Stream via ijson for large captures (e.g. swebench).
         print(f"Streaming dm-capture: {dm_capture_path}", file=sys.stderr)
         import ijson as _ijson_dm
@@ -517,8 +517,8 @@ def assemble_records_from_artifacts(
 
     if not streaming:
         # Legacy: load full JSON at once.
-        print(f"Loading: {agent_results_path}", file=sys.stderr)
-        with open(agent_results_path) as f:
+        print(f"Loading: {agent_trajectory_path}", file=sys.stderr)
+        with open(agent_trajectory_path) as f:
             data = json.load(f)
         all_requests = extract_requests(
             data, exclude_ids, None,
@@ -545,12 +545,12 @@ def assemble_records_from_artifacts(
     # question + accumulated records (small after reslice/truncation).
     import ijson
 
-    print(f"Streaming: {agent_results_path}", file=sys.stderr)
+    print(f"Streaming: {agent_trajectory_path}", file=sys.stderr)
     records: List[dict] = []
     t0 = time.time()
     n_questions = 0
     n_requests = 0
-    with open(agent_results_path, "rb") as f:
+    with open(agent_trajectory_path, "rb") as f:
         for q in ijson.items(f, "questions.item"):
             n_questions += 1
             single_data = {"questions": [q], "per_request": []}

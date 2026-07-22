@@ -21,7 +21,7 @@ BUDGETS="4,8,16,32,64"
 
 for bench in bfcl_v4 specbench swebench_verified; do
   CAP="$CAP_ROOT/${bench}_steps8_topk16_capture/agent_results_eagle3.json"
-  LAT="$CAP_ROOT/${bench}_steps8_topk16_capture/latency_config.json"
+  LAT="$CAP_ROOT/${bench}_steps8_topk16_capture/latency_data.json"
   EXC="$STEP_ROOT/_exclude/${bench}.txt"
 
   for sk in "2 16" "4 16" "6 16" "8 16"; do
@@ -34,8 +34,8 @@ for bench in bfcl_v4 specbench swebench_verified; do
     fi
     echo "[run] $bench s=$s k=$k → $OUT"
     cd $ROOT && python3 -m simulation.evaluation.run_tree_oracle_sim \
-      --agent-results "$CAP" \
-      --latency-config "$LAT" \
+      --agent-trajectory "$CAP" \
+      --latency-data "$LAT" \
       --exclude "$EXC" \
       --methods "$METHODS" \
       --budgets "$BUDGETS" \

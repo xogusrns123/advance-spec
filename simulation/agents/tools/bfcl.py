@@ -19,18 +19,42 @@ def _ddg_search_engine_query(
     max_results: int = 10,
     region: str = "us-en",
 ) -> list | dict:
-    """Replace SerpAPI with free duckduckgo-search (no API key required)."""
-    try:
-        try:
-            from ddgs import DDGS
-        except ImportError:
-            from duckduckgo_search import DDGS
+    """Replace SerpAPI with free duckduckgo-search (no API key required).
 
-        results = list(
-            DDGS().text(
-                keywords, region=region, max_results=max_results,
-            )
-        )
+    Bounded against DuckDuckGo rate-limiting: DDG throttles after a burst of
+    searches and the underlying HTTP call can then block/retry indefinitely,
+    hanging the whole (serial) collection on one task. We run the query in a
+    daemon worker thread with a HARD 30s wall — on timeout/error we return an
+    error dict, so the agent sees a failed search and moves on (a realistic
+    rate-limited-serving outcome) rather than the collection stalling."""
+    import threading
+
+    box: dict = {}
+
+    def _run():
+        try:
+            try:
+                from ddgs import DDGS
+            except ImportError:
+                from duckduckgo_search import DDGS
+            try:
+                ddgs = DDGS(timeout=15)
+            except TypeError:
+                ddgs = DDGS()
+            box["r"] = list(ddgs.text(keywords, region=region, max_results=max_results))
+        except Exception as e:  # noqa: BLE001 — surface as a search error, don't crash
+            box["e"] = e
+
+    th = threading.Thread(target=_run, daemon=True)
+    th.start()
+    th.join(30)
+    if th.is_alive():
+        return {"error": "web search timed out (DuckDuckGo rate-limited)"}
+    try:
+        if "e" in box:
+            return {"error": str(box["e"])}
+
+        results = box.get("r", [])
 
         filtered_results = [
             {

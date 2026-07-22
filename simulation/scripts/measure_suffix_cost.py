@@ -23,7 +23,7 @@ Usage:
     python3 simulation/scripts/measure_suffix_cost.py \\
         --workloads specbench,bfcl_v4,swebench \\
         --model Qwen/Qwen3-14B \\
-        --agent-results-dir simulation/results/qwen3_14b \\
+        --agent-trajectory-dir simulation/results/qwen3_14b \\
         --output results/latency/suffix_cost.json
 """
 
@@ -39,7 +39,7 @@ from pathlib import Path
 import numpy as np
 
 
-# Map workload name → candidate sub-directory names under --agent-results-dir.
+# Map workload name → candidate sub-directory names under --agent-trajectory-dir.
 WORKLOAD_DIR_CANDIDATES = {
     "specbench": ["specbench_steps2", "specbench", "specbench_req0-3"],
     "bfcl_v4":  ["bfcl_v4_steps2", "bfcl_v4", "bfcl_v4_req0-3"],
@@ -47,7 +47,7 @@ WORKLOAD_DIR_CANDIDATES = {
 }
 
 
-def _find_agent_results(base: Path, workload: str) -> Path | None:
+def _find_agent_trajectory(base: Path, workload: str) -> Path | None:
     """Locate agent_results_eagle3.json for a workload under base dir."""
     for cand in WORKLOAD_DIR_CANDIDATES.get(workload, []):
         p = base / cand / "agent_results_eagle3.json"
@@ -56,7 +56,7 @@ def _find_agent_results(base: Path, workload: str) -> Path | None:
     return None
 
 
-def _extract_trajectories(agent_results_path: Path) -> list[dict]:
+def _extract_trajectories(agent_trajectory_path: Path) -> list[dict]:
     """Read Stage 1's agent_results_eagle3.json and emit a list of dicts
     compatible with the cache-population API.
 
@@ -64,7 +64,7 @@ def _extract_trajectories(agent_results_path: Path) -> list[dict]:
     oracle_vanilla_entries record (one per LLM call). Output:
         {"bfcl_id", "per_call_tokens", "per_call_prompt_ids"}.
     """
-    with open(agent_results_path) as f:
+    with open(agent_trajectory_path) as f:
         data = json.load(f)
     trajectories: list[dict] = []
     for q in data.get("questions", []):
@@ -193,9 +193,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--workloads", default="specbench,bfcl_v4,swebench")
     parser.add_argument("--model", required=True,
-                        help="Model name (for reference only; agent_results "
+                        help="Model name (for reference only; agent_trajectory "
                              "already carry the right trajectories)")
-    parser.add_argument("--agent-results-dir", required=True,
+    parser.add_argument("--agent-trajectory-dir", required=True,
                         help="Directory whose sub-dirs contain "
                              "agent_results_eagle3.json per workload "
                              "(e.g. simulation/results/qwen3_14b)")
@@ -209,12 +209,12 @@ def main():
 
     from arctic_inference.suffix_decoding import SuffixDecodingCache
 
-    base = Path(args.agent_results_dir)
+    base = Path(args.agent_trajectory_dir)
     workloads = [w.strip() for w in args.workloads.split(",") if w.strip()]
 
     results = []
     for w in workloads:
-        ar = _find_agent_results(base, w)
+        ar = _find_agent_trajectory(base, w)
         if ar is None:
             print(f"SKIP {w}: no agent_results_eagle3.json under {base}",
                   file=sys.stderr)
@@ -279,10 +279,10 @@ def main():
             "max_spec_factor": args.max_spec_factor,
             "min_token_prob": args.min_token_prob,
             "use_tree_spec": True,
-            "source": "realistic replay — tree populated from agent_results",
+            "source": "realistic replay — tree populated from agent_trajectory",
         },
         "model": args.model,
-        "agent_results_dir": str(Path(args.agent_results_dir).resolve()),
+        "agent_trajectory_dir": str(Path(args.agent_trajectory_dir).resolve()),
         "results": results,
     }
     output_path = Path(args.output)

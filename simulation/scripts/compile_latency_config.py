@@ -1,4 +1,4 @@
-"""Compile measured target / draft / suffix costs into a Stage 6 latency_config.json.
+"""Compile measured target / draft / suffix costs into a Stage 6 latency_data.json.
 
 Reads the three per-measurement JSONs produced by the ``measure_*_cost.py``
 scripts and emits a single config that ``run_tree_oracle_sim.py`` (Stage 6)
@@ -22,7 +22,7 @@ Usage:
         --suffix-cost   results/latency/suffix_cost.json \\
         --canonical-steps 4 \\
         --draft-ref-n 3 \\
-        --output        simulation/results/qwen3_14b/latency_config.json
+        --output        simulation/results/qwen3_14b/latency_data.json
 """
 
 from __future__ import annotations

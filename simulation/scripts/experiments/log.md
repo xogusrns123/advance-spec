@@ -240,7 +240,7 @@ Reslicing makes BOTH methods absolutely faster but doesn't widen gap.
 
 ## Methodology rules
 
-- **Goal metric**: `*_speedup_real` from `tree_oracle_sim.json` (latency_config-based) — NOT `*_speedup` (ratio-based mat+1)
+- **Goal metric**: `*_speedup_real` from `tree_oracle_sim.json` (latency_data-based) — NOT `*_speedup` (ratio-based mat+1)
 - **Fairness**: hybrid uses paper-faithful suffix (max_spec_factor=1.0, min_token_prob=0.1); extension uses aggressive (4.0, 0.0) by DEFAULT but extension_sfx allows custom
 - **Sequential cost**: `step_cost = target_forward(ext_size) + eagle3_draft + n_actual_suffix_calls × suffix_speculate_ms`. Sequential, never `max()`
 - **No baseless waiting**: when partial captures provide signal, sim them now

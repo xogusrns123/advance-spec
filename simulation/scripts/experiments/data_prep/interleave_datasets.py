@@ -34,11 +34,16 @@ def interleave_jsonl(src: str, dst: str, key_fn) -> None:
         print(f"  {c}: {len(b)}")
 
 
-# specbench
+# specbench — key by the coarse 6-way `subtask` (mt_bench / translation /
+# summarization / qa / math_reasoning / rag), NOT the 14 fine `category`
+# labels, so an early-stopped prefix stays balanced across the subtasks
+# Spec-Bench reports (interleaving by category over-samples MT-Bench 8:1).
+# build_specbench_dataset.py is the source of truth and already emits this
+# ordering; this stanza keeps it consistent on a full re-interleave.
 interleave_jsonl(
     "/workspace/data/specbench/dataset.jsonl",
     "/workspace/data/specbench/dataset_interleaved.jsonl",
-    lambda e: e.get("category", "?"),
+    lambda e: e.get("subtask", e.get("category", "?")),
 )
 
 # bfcl_v4 stratified

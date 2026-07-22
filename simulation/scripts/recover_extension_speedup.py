@@ -112,14 +112,14 @@ def patch_file(fp: Path, latency_cfg: dict, dry_run: bool) -> int:
 def main():
     p = argparse.ArgumentParser()
     p.add_argument(
-        "--latency-config",
+        "--latency-data",
         default="/home/muchwater/advance-spec/simulation/config/latency/qwen3_14b.json")
     p.add_argument(
         "--glob",
         default="/home/muchwater/advance-spec/simulation/results/explorations/sim_*_full.json")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
-    with open(args.latency_config) as f:
+    with open(args.latency_data) as f:
         L = json.load(f)
     files = sorted(glob.glob(args.glob))
     print(f"patching {len(files)} files (dry_run={args.dry_run})", file=sys.stderr)

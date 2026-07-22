@@ -142,7 +142,7 @@ def main() -> None:
     plt.close(fig)
 
     # 3) absolute generation throughput (agent-level)
-    tps = [agent_tps(out_dir / f"agent_results_{a}.json") for a in ARMS]
+    tps = [agent_tps(out_dir / f"agent_trajectory_{a}.json") for a in ARMS]
     fig, ax = plt.subplots(figsize=(6.4, 4.2))
     bars = ax.bar(np.arange(len(ARMS)), tps, color=colors, width=0.55)
     for b, v in zip(bars, tps):

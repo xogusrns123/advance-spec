@@ -890,12 +890,12 @@ def run(
         print(f"[builder] loading tokenizer: {model}", file=sys.stderr)
         tokenizer = AutoTokenizer.from_pretrained(model)
 
-    agent_results_path = str(capture_root / "agent_results_eagle3.json")
-    latency_config_path = capture_root / "latency_config.json"
+    agent_trajectory_path = str(capture_root / "agent_results_eagle3.json")
+    latency_data_path = capture_root / "latency_data.json"
     target_forward: Optional[Dict[int, float]] = None
     eagle3_draft_ms: Optional[float] = None
-    if latency_config_path.exists():
-        with open(latency_config_path) as f:
+    if latency_data_path.exists():
+        with open(latency_data_path) as f:
             lat = json.load(f)
         target_forward = {
             int(k): float(v)
@@ -991,7 +991,7 @@ def run(
             pass
 
     try:
-        for (rid, cidx), recs in _stream_calls(agent_results_path, tokenizer):
+        for (rid, cidx), recs in _stream_calls(agent_trajectory_path, tokenizer):
             if stop_flag:
                 break
             if (rid, cidx) in completed_keys:

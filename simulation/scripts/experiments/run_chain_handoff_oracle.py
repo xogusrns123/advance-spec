@@ -32,7 +32,7 @@ plus a sidecar <output>.meta.json with counters and parameters.
 
 Usage (inside sglang-bench container, from /workspace):
   python3 -m simulation.scripts.experiments.run_chain_handoff_oracle \
-      --agent-results simulation/results/qwen3_14b/bfcl_v4_steps8_topk16_capture/agent_results_eagle3.json \
+      --agent-trajectory simulation/results/qwen3_14b/bfcl_v4_steps8_topk16_capture/agent_results_eagle3.json \
       --dataset data/bfcl_agent/dataset_stratified_interleaved.jsonl \
       --output simulation/results/chain_handoff_oracle/qwen3_14b/bfcl_v4_dense.jsonl.gz \
       [--limit-requests 20] [--validate-greedy 2000]
@@ -157,7 +157,7 @@ def _prefix_accept(chain, gt):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--agent-results", required=True)
+    ap.add_argument("--agent-trajectory", required=True)
     ap.add_argument("--dataset", default=None)
     ap.add_argument("--model", default="Qwen/Qwen3-14B")
     ap.add_argument("--output", required=True,
@@ -184,10 +184,10 @@ def main():
     )
     chain_depth = args.chain_depth or args.capture_steps
     records = assemble_records_from_artifacts(
-        agent_results_path=args.agent_results,
+        agent_trajectory_path=args.agent_trajectory,
         suffix_drafts_path=None,
         draft_model_drafts_path=None,
-        mtp_agent_results_path=None,
+        mtp_agent_trajectory_path=None,
         exclude_path=None,
         model=args.model,
         dataset_path=args.dataset,
@@ -232,7 +232,7 @@ def main():
     fh = gzip.open(out_path, "wt", compresslevel=4)
 
     meta = {
-        "agent_results": args.agent_results,
+        "agent_trajectory": args.agent_trajectory,
         "eagle3_reslice": [args.capture_steps, args.capture_topk,
                            chain_depth, 1],
         "spec_kwargs": spec_kwargs,

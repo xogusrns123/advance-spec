@@ -87,7 +87,7 @@ def main():
     # Compute paths relative to project root, then prefix host vs docker root.
     cap_rel = RESULTS_DIR_REL / f"{args.workload}_steps{args.capture_steps}_topk{args.capture_topk}_capture"
     agent_rel = cap_rel / "agent_results_eagle3.json"
-    latency_rel = cap_rel / "latency_config.json"
+    latency_rel = cap_rel / "latency_data.json"
     dataset_rel = DATASET_MAP[args.workload]
 
     # Sanity-check via host paths (always exist on host if mounted)
@@ -129,10 +129,10 @@ def main():
             out_json = out_json_host
         cmd_inner = [
             "python3", "-m", "simulation.evaluation.run_tree_oracle_sim",
-            "--agent-results", str(base / agent_rel),
+            "--agent-trajectory", str(base / agent_rel),
             "--dataset", str(base / dataset_rel),
             "--model", "Qwen/Qwen3-14B",
-            "--latency-config", str(base / latency_rel),
+            "--latency-data", str(base / latency_rel),
             "--steps", str(s), "--topk", str(k),
             "--reslice-steps", str(s), "--reslice-topk", str(k),
             "--capture-steps", str(args.capture_steps),

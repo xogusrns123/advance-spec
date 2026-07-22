@@ -305,7 +305,7 @@ def _recover_per_step_conf(cumulative: List[float],
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--agent-results", required=True)
+    ap.add_argument("--agent-trajectory", required=True)
     ap.add_argument("--dataset", default=None)
     ap.add_argument("--responses", default=None)
     ap.add_argument("--model", default=None)
@@ -318,12 +318,12 @@ def main():
                     help="Upper edge of score-axis bins (raw sum-of-probs). "
                          "Scores above this clamp to the last bin. Default 8.")
     ap.add_argument("--dm-capture-results", default=None,
-                    help="Path to STANDALONE draft-model agent_results JSON. "
+                    help="Path to STANDALONE draft-model agent_trajectory JSON. "
                          "When provided, draft_model proposer is added to the "
                          "calibration analysis with tree topology + "
                          "path_draft_p_t.")
     ap.add_argument("--mtp-capture-results", default=None,
-                    help="Path to MTP agent_results JSON (Qwen3.5-9B etc.). "
+                    help="Path to MTP agent_trajectory JSON (Qwen3.5-9B etc.). "
                          "When provided, mtp proposer is added to the "
                          "calibration analysis.")
     ap.add_argument("--output", required=True)
@@ -334,16 +334,16 @@ def main():
     eagle3_reslice = (args.capture_steps, args.capture_topk,
                       args.reslice_steps, args.reslice_topk)
 
-    print(f"[calib] loading capture: {args.agent_results}", file=sys.stderr)
+    print(f"[calib] loading capture: {args.agent_trajectory}", file=sys.stderr)
     if args.dm_capture_results:
         print(f"[calib] dm-capture: {args.dm_capture_results}", file=sys.stderr)
     if args.mtp_capture_results:
         print(f"[calib] mtp-capture: {args.mtp_capture_results}", file=sys.stderr)
     t0 = time.time()
     records = assemble_records_from_artifacts(
-        agent_results_path=args.agent_results,
+        agent_trajectory_path=args.agent_trajectory,
         suffix_drafts_path=None, draft_model_drafts_path=None,
-        mtp_agent_results_path=args.mtp_capture_results,
+        mtp_agent_trajectory_path=args.mtp_capture_results,
         dm_capture_path=args.dm_capture_results,
         exclude_path=args.exclude,
         model=args.model, dataset_path=args.dataset,
@@ -596,7 +596,7 @@ def main():
 
     out = {
         "metadata": {
-            "input_source": args.agent_results,
+            "input_source": args.agent_trajectory,
             "dataset": args.dataset,
             "responses": args.responses,
             "model": args.model,

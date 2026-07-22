@@ -283,7 +283,7 @@ def run_cell(name: str, cell: dict, args, turn1: list[dict],
     cmd = [
         sys.executable, "-m", "sglang.launch_server",
         "--model-path", model,
-        "--mem-fraction-static", cell["mem"],
+        "--mem-fraction-static", (args.mem or cell["mem"]),
         "--host", "0.0.0.0", "--port", str(args.port),
     ] + COMMON_FLAGS + cell["spec"]
 
@@ -370,6 +370,7 @@ def main() -> int:
     ap.add_argument("--cells", default="8b_eagle3,8b_small,27b_mtp,27b_small",
                     help=f"Comma list from {list(CELLS)}")
     ap.add_argument("--port", type=int, default=30055)
+    ap.add_argument("--mem", default="", help="override --mem-fraction-static for all cells")
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--out", default="simulation/results/latency/method_compare")
     args = ap.parse_args()

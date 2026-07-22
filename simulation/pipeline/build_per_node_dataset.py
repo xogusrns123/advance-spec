@@ -633,7 +633,7 @@ def _prepare_resume_state(
 
 
 def _stream_calls(
-    agent_results_path: str,
+    agent_trajectory_path: str,
     tokenizer=None,
 ) -> Iterator[Tuple[Tuple[str, int], List[dict]]]:
     """Stream per-call record groups, one (rid, call_idx) at a time.
@@ -645,7 +645,7 @@ def _stream_calls(
     dict between yields.
     """
     import ijson
-    with open(agent_results_path, "rb") as f:
+    with open(agent_trajectory_path, "rb") as f:
         for q in ijson.items(f, "questions.item"):
             single_data = {"questions": [q], "per_request": []}
             reqs = extract_requests(
@@ -693,18 +693,18 @@ def run(
         print(f"[builder] loading tokenizer: {model}", file=sys.stderr)
         tokenizer = AutoTokenizer.from_pretrained(model)
 
-    agent_results_path = str(capture_root / "agent_results_eagle3.json")
-    latency_config_path = capture_root / "latency_config.json"
+    agent_trajectory_path = str(capture_root / "agent_results_eagle3.json")
+    latency_data_path = capture_root / "latency_data.json"
     target_forward: Optional[Dict[int, float]] = None
-    if latency_config_path.exists():
-        with open(latency_config_path) as f:
+    if latency_data_path.exists():
+        with open(latency_data_path) as f:
             lat = json.load(f)
         # Keys are strings of pow-of-2 ints
         target_forward = {int(k): float(v)
                           for k, v in (lat.get("target_forward_ms") or {}).items()}
 
     print(f"[builder] benchmark={benchmark}", file=sys.stderr)
-    print(f"[builder] agent_results={agent_results_path}", file=sys.stderr)
+    print(f"[builder] agent_trajectory={agent_trajectory_path}", file=sys.stderr)
     print(f"[builder] output_dir={output_dir}", file=sys.stderr)
     print(f"[builder] soft_cap={soft_cap_nodes} shards={n_shards} "
           f"limit_steps={limit_steps} limit_requests={limit_requests}",
@@ -731,7 +731,7 @@ def run(
 
     stop_flag = False
     try:
-        for (rid, cidx), recs in _stream_calls(agent_results_path, tokenizer):
+        for (rid, cidx), recs in _stream_calls(agent_trajectory_path, tokenizer):
             if stop_flag:
                 break
             if (rid, cidx) in completed_keys:

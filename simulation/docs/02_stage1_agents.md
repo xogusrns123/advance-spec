@@ -8,7 +8,7 @@
 |-------------------------------------------|--------------|------------------------------|-----------------------------|
 | `simulation.agents.bfcl_agent`            | BFCLv3       | Native syntax (text decode)  | Multi-turn × multi-step     |
 | `simulation.agents.bfcl_v4_agent`         | BFCLv4       | Native syntax (text decode)  | Single-turn × multi-step    |
-| `simulation.agents.specbench_agent`       | SpecBench    | 없음                          | Multi-turn, tool 없음        |
+| `simulation.agents.specbench_agent`       | Spec-Bench   | 없음                          | 6 서브태스크, 1~2턴, tool 없음 |
 | `simulation.agents.swebench_agent`        | SWE-Bench    | LangChain `bind_tools`       | Single-turn × multi-step    |
 
 모든 agent 는 `is_oracle_enabled()` → `os.environ.get(
@@ -268,7 +268,7 @@ is_evaL_run=False)` (`bfcl_v4_agent.py:281-285`).
 - `--resume` 은 `simulation.pipeline.save_results.load_checkpoint` 를 통해 `<output_file>.partial` (또는 partial 이 없으면 finalized 파일) 을 읽는다. 이미 완료된 ID (`bfcl_id` 다음 `id` 로 매칭) 는 skip.
 - `--num-requests` 는 resume 필터 **이후에** 적용된다. 따라서 coordinator 가 `--num-requests 1 --resume` 를 반복 호출하면 호출 한 번에 새 request 한 개씩 진행된다.
 - 매 request 완료 후 `append_to_checkpoint` 가 `<output>.partial` 을 atomic 하게 다시 쓴다.
-- 실행 완료 시 `save_agent_results` 가 final 파일을 쓰고 partial 은 unlink.
+- 실행 완료 시 `save_agent_trajectory` 가 final 파일을 쓰고 partial 은 unlink.
 
 ### 2.8 실패 모드
 
@@ -295,17 +295,17 @@ step dict 는 BFCLv3 에서 `turn` 과 `finish_reason` 을 뺀 것과 같다. �
 
 ---
 
-## 3. `specbench_agent.py` (SpecBench / MT-Bench)
+## 3. `specbench_agent.py` (Spec-Bench)
 
 ### 3.1 입력 데이터셋 포맷
 
-`data/specbench/dataset.jsonl`. 각 record.
+표준 **Spec-Bench** (hemingkx/Spec-Bench, ACL 2024) — 480 문항 / 6 서브태스크 (각 80): `mt_bench` (멀티턴 대화), `translation`, `summarization`, `qa`, `math_reasoning` (GSM8K), `rag`. `simulation/scripts/build_specbench_dataset.py` 가 공식 `question.jsonl` (commit `66230f1` 에 고정) 을 받아 빌드하며, RR 은 `data/specbench/dataset_interleaved.jsonl` (서브태스크 round-robin) 을 사용한다. 각 record.
 
 ```json
-{"question_id": "<id>", "category": "<cat>", "turns": ["user msg 1", "user msg 2"]}
+{"question_id": <id>, "category": "<fine cat>", "subtask": "<6-way>", "turns": ["...", "..."], "reference": ["..."]}
 ```
 
-Loader: `load_specbench_dataset` (`specbench_agent.py:44-57`).
+`subtask` 는 6-way coarse 라벨 (Spec-Bench 가 speed-up 을 리포트하는 단위), `category` 는 upstream 의 fine-grained 14-라벨 (MT-Bench 8개 + 단일턴 5개) 을 그대로 보존. `mt_bench` 는 2턴, 나머지 5개 서브태스크는 1턴 — agent 의 `turns` loop 가 양쪽을 모두 처리한다 (단일턴은 call 1회). `reference` 는 일부 태스크에만 존재 (translation/summarization/math_reasoning/rag 는 전체, MT-Bench 는 일부). Loader: `load_specbench_dataset` (`specbench_agent.py`).
 
 ### 3.2 프롬프트 구성
 
@@ -572,7 +572,7 @@ mini-swe-agent 는 **submit tool 이 없다.** 대신:
 
 ## 5. Cross-agent invariant
 
-- 네 agent 모두 `simulation.pipeline.save_results.save_agent_results` 를 통해 최종 저장 JSON 을 구성한다. 이 함수는 full 파일과 `_response.json` light 파일 (oracle entry 가 카운트로 대체된 사본) 을 둘 다 쓴다. `03_stage1_tools_and_io.md` §3 참조.
+- 네 agent 모두 `simulation.pipeline.save_results.save_agent_trajectory` 를 통해 최종 저장 JSON 을 구성한다. 이 함수는 full 파일과 `_response.json` light 파일 (oracle entry 가 카운트로 대체된 사본) 을 둘 다 쓴다. `03_stage1_tools_and_io.md` §3 참조.
 - 네 agent 모두 per-question 출력을 `bfcl_id`, `instance_id`, `question_id` 중 하나로 키잉한다. `pipeline/_agent_io.py:215-217` 의 `_extract_bfcl` 은 읽을 때 이 세 키를 그 순서로 fall back 한다.
 - `messages` snapshot 은 LLM step 별 (BFCL agent) 또는 turn 별 (SWE-Bench, `turns_with_messages` 안) 로 저장된다. Stage 3 는 suffix-cache trie 용으로 prompt 를 re-tokenize 하기 위해 이들이 필요하다. SpecBench 는 per-step `messages` 필드가 없고 대신 `dataset.turns[]` 에서 재구성된다 (`pipeline/_agent_io.py:167-182`).
 - 하드코딩된 `max_tokens` (BFCL v3/v4 는 4096, SWE-Bench 는 4096, SpecBench 는 2048) 가 유일한 출력 길이 cap. `</think>` 등에 기반한 동적 stopping 은 없으며, thinking text 는 `completion_tokens` 에 빌링되고 `content` 에 기록된다.

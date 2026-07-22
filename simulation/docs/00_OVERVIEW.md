@@ -40,7 +40,7 @@ data/<workload>/dataset_*.jsonl
 │       per-(req,call) start_request 으로 LOCAL tree reset        │
 │     • greedy_tree_walk 으로 ground-truth 와 longest matched     │
 │       prefix 비교 → accept length                               │
-│     • latency_config.json 으로 step cost 계산 → speedup         │
+│     • latency_data.json 으로 step cost 계산 → speedup         │
 │     • optional: --reslice-steps/--reslice-topk 로 capture 한    │
 │       full pool 을 (s', k') sub-tree 로 잘라 시뮬레이션          │
 │   → tree_oracle_sim.json (+ 콘솔 summary)                      │
@@ -57,7 +57,7 @@ data/<workload>/dataset_*.jsonl
 ```
 
 `agent_results_eagle3.json` 옆에는 항상 `_response.json` (oracle entries 제거된
-사람용 사본) 도 함께 떨어진다. `simulation/pipeline/save_results.py:save_agent_results`
+사람용 사본) 도 함께 떨어진다. `simulation/pipeline/save_results.py:save_agent_trajectory`
 가 같은 호출에서 두 파일을 atomic write 한다.
 
 ---
@@ -70,7 +70,7 @@ data/<workload>/dataset_*.jsonl
 | 02 | [`02_stage1_agents.md`](02_stage1_agents.md) | benchmark 별 agent (`bfcl_v4_agent`, `specbench_agent`, `swebench_agent`) 의 입력 포맷, 프롬프트 구성, HTTP 호출, tool-call 파싱, iteration loop |
 | 03 | [`03_stage1_tools_and_io.md`](03_stage1_tools_and_io.md) | BFCL DDG monkey-patch, SWE-Bench tool 팩토리, `save_results.py` atomic write + checkpoint, `_agent_io.py` extraction, oracle 로그 JSON 스키마 |
 | 04 | [`04_stage2_draft_model.md`](04_stage2_draft_model.md) | Stage 2 본체 (`collect_draft_model.py`), per-step prefix 재구성, SGLang `/generate` 호출, JSONL 스키마 |
-| 05 | [`05_stage3_simulator_core.md`](05_stage3_simulator_core.md) | Stage 3 시뮬레이터 메인 루프, CLI flag, method dispatch, `greedy_tree_walk`, latency-config 스키마 + topk-aware lookup, output 컬럼 |
+| 05 | [`05_stage3_simulator_core.md`](05_stage3_simulator_core.md) | Stage 3 시뮬레이터 메인 루프, CLI flag, method dispatch, `greedy_tree_walk`, latency-data 스키마 + topk-aware lookup, output 컬럼 |
 | 06 | [`06_tree_knapsack.md`](06_tree_knapsack.md) | `tree_knapsack.py` greedy walk 구현, "knapsack" 명명 misnomer |
 | 07 | [`07_side_suffix_trajectory.md`](07_side_suffix_trajectory.md) | `run_side_suffix_trajectory.py` 사이드 도구 |
 | 08 | [`08_sglang_patches.md`](08_sglang_patches.md) | `simulation.oracle` 의 SGLang 디스크/런타임 패치 |
@@ -131,7 +131,7 @@ data/<workload>/dataset_*.jsonl
 | Workload | 한 줄 entry 핵심 필드 | 출처/포맷 |
 |---|---|---|
 | `bfcl_v4` | `bfcl_id`, `question`, `function`, `missed_function`, agentic 메타 | BFCL v4 (WebSearch + Memory) |
-| `specbench` | `question_id`, `category`, `turns: [str, str, ...]` | SpecBench / MT-Bench |
+| `specbench` | `question_id`, `category`, `subtask`, `turns: [str, ...]`, `reference?` | Spec-Bench (480, 6 서브태스크) |
 | `swebench_verified` | `instance_id`, `repo`, `problem_statement`, `gold_patch`, `image_name` | SWE-Bench Verified |
 | `longbench_lcc` / `longbench_repobench` | `_id`, `context`, `input`, `answers` | LongBench code subsets (specbench_agent 가 처리) |
 
@@ -214,14 +214,14 @@ per-question × per-method × per-budget 결과 + summary. 자세한 컬럼은
 - `mat` — 평균 accept length
 - `accept_rate`
 - `verify_tokens_mean` (실제 트리 크기)
-- `step_real_ms` (latency-config 기반)
+- `step_real_ms` (latency-data 기반)
 - `speedup_real` = `vanilla_step_ms × n_target_tokens / total_step_real_ms`
 
 ---
 
 ## Latency Model
 
-`simulation/config/latency/<preset>.json` 가 Stage 3 의 `--latency-config` 로 들어감.
+`simulation/config/latency/<preset>.json` 가 Stage 3 의 `--latency-data` 로 들어감.
 스키마 (qwen3_8b 예시):
 
 ```jsonc
@@ -240,7 +240,7 @@ per-question × per-method × per-budget 결과 + summary. 자세한 컬럼은
 - `measure_eagle3_cost.py` — target_forward / eagle3_draft (real-mode + `SGLANG_LATENCY_ONLY=1`)
 - `measure_draft_model_cost.py` — draft LM TPOT
 - `measure_suffix_cost.py` — suffix CPU cost (참고용)
-- `compile_latency_config.py` — 위 셋을 합쳐 `latency_config.json` 생성
+- `compile_latency_config.py` — 위 셋을 합쳐 `latency_data.json` 생성
 
 `simulation/scripts/experiments/remeasure_latency.sh` 가 위 4개를 한 번에 호출하는 wrapper.
 
@@ -290,7 +290,7 @@ Stage 3 의 `_interp` 는 measured key 사이는 linear interp, 측정 범위를
 
 3. **Stage 2 — Draft LM (선택)**
    필요시 `python -m simulation.pipeline.collect_draft_model ...` 직접 호출.
-   현재 RR 진행 시 `latency_config` 측정 외에는 draft_lm 사용 안 함.
+   현재 RR 진행 시 `latency_data` 측정 외에는 draft_lm 사용 안 함.
 
 4. **Stage 3 — Reslice sweep**
    ```bash

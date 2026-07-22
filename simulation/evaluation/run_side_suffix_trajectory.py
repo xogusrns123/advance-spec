@@ -23,7 +23,7 @@ pipeline output. Output directory is ``simulation/results/side_suffix_trajectory
 
 Usage:
     python3 -m simulation.evaluation.run_side_suffix_trajectory \\
-        --agent-results simulation/results/qwen3_8b/bfcl_v4/agent_results_eagle3.json \\
+        --agent-trajectory simulation/results/qwen3_8b/bfcl_v4/agent_results_eagle3.json \\
         --model Qwen/Qwen3-8B \\
         --budget 64 \\
         --output simulation/results/side_suffix_trajectory/qwen3_8b/bfcl_v4/B64/per_step.jsonl
@@ -229,7 +229,7 @@ def main():
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--agent-results", required=True,
+    parser.add_argument("--agent-trajectory", required=True,
                         help="Stage 1 EAGLE3 oracle-vanilla JSON path.")
     parser.add_argument("--model", required=True,
                         help="Target model name (for tokenizer).")
@@ -270,10 +270,10 @@ def main():
 
     t0 = time.time()
     records = assemble_records_from_artifacts(
-        agent_results_path=args.agent_results,
+        agent_trajectory_path=args.agent_trajectory,
         suffix_drafts_path=None,
         draft_model_drafts_path=None,
-        mtp_agent_results_path=None,
+        mtp_agent_trajectory_path=None,
         exclude_path=args.exclude,
         model=args.model,
         dataset_path=args.dataset,
@@ -315,7 +315,7 @@ def main():
 
     meta = {
         "script": "run_side_suffix_trajectory",
-        "agent_results_path": str(Path(args.agent_results).resolve()),
+        "agent_trajectory_path": str(Path(args.agent_trajectory).resolve()),
         "model": args.model,
         "budget": args.budget,
         "req_start": args.req_start,

@@ -1,0 +1,61 @@
+# ============================================================
+# Round-Robin Stage-1 capture — qwen3_14b, EAGLE3 FULL TREE
+# (steps=8, topk=8, num_draft_tokens=512 ~= "ndt=inf": server tree effectively
+# uncapped; capture_full_pool logs the COMPLETE draft pool regardless of ndt,
+# so the offline budget sweep can explore up to the full captured tree).
+#
+# Purpose (Goal-2 tree regime): capture EAGLE3's real draft TREE per step
+# (eagle3_pool_full = {draft_tokens, parent_list, path_probs} logged by the
+# oracle-vanilla hook with capture_full_pool) on bfcl_v4 web_search, 5 tasks
+# only (fast). Downstream: suffix tree sim on the same gt trajectory +
+# union-oracle (per-step max of eagle3-tree and suffix-tree gt-path accept),
+# swept over verify-node budget.
+#
+# Output dir: simulation/results/qwen3_14b/steps8_topk8_capture/
+#
+# Run (ONLY after GPU0 is free) with:
+#   docker exec -u root -d sglang-bench bash -c \
+#     "cd /workspace && python3 simulation/scripts/run_experiment.py \
+#       simulation/config/rr_qwen3_14b_tree_capture.yaml \
+#       > /tmp/rr_tree_14b.log 2>&1"
+# ============================================================
+name: rr_qwen3_14b_tree_capture
+
+model_preset: qwen3_14b
+
+stage1_steps: 8
+stage1_configs:
+  - topk: 8
+    num_draft_tokens: 457      # = "ndt=inf" for this (topk=8, steps=8) tree.
+                               # EAGLE score_list size = topk + (steps-1)*topk^2 = 8 + 7*64 = 456
+                               # candidate nodes; organize_draft_results does topk(score_list, ndt-1),
+                               # so the MAX valid ndt = 456 + 1 = 457 (captures the WHOLE tree, nothing
+                               # pruned). 512 overflowed -> "selected index k out of range" crash.
+
+round_robin:
+  enabled: true
+  capture_full_pool: true         # log the full EAGLE3 draft tree (token_ids/parents)
+  batch: 1
+  resume: true
+  context_length: 131072
+
+max_per_workload: 5               # 5 web_search tasks only (fast)
+
+workloads:
+  - bfcl_v4
+
+workload_overrides:
+  bfcl_v4:
+    max_iterations: 20
+    include_category: web_search
+
+infra:
+  port: 30012                     # distinct port (avoid clashing with other experiments)
+  gpu_ids: [0]                    # GPU0 = RTX PRO 6000 Blackwell — launch only when free
+  attention_backend: triton       # Blackwell sm_120 + EAGLE3 draft head_dim 80
+  sampling_backend: pytorch
+  cuda_home: /usr/local/cuda      # cu130 image: CUDA 13.0 toolkit (nvcc 13 natively supports sm_120);
+                                  # the old 12.8 path does not exist here and broke the RoPE JIT compile
+
+output:
+  root: simulation/results

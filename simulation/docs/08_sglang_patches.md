@@ -406,7 +406,7 @@ chat.completions.create(...) ─>  forward_batch_generation:
 oracle_entries = read_oracle_log(oracle_pos)
 step_data["spec_decode"] = {"oracle_vanilla_entries": oracle_entries}
 
-save_agent_results(...) ─> save_results.py:
+save_agent_trajectory(...) ─> save_results.py:
                               full JSON  : keep oracle_vanilla_entries
                               *_response : strip → oracle_entries_count int
 ```

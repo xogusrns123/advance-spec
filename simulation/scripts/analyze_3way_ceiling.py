@@ -24,9 +24,20 @@ import argparse, json
 from collections import defaultdict
 from pathlib import Path
 
-PROPOSERS = ("dflash", "e3", "suffix")
-TOKKEY = {"dflash": "eagle_token", "e3": "e3_token", "suffix": "suffix_token"}
-PKEY = {"dflash": "eagle_p", "e3": "e3_p", "suffix": "suffix_p"}
+# Slot layouts. 8B: DFlash is the served main worker (eagle_token field), EAGLE3 is
+# the in-process aux (e3_token). 27B: MTP is the served main worker (eagle_token),
+# DFlash is the decoupled-on-gt aux merged from dflash_proposals.jsonl (dflash_token).
+CELLS = {
+    "8b": {"names": ("dflash", "e3", "suffix"),
+           "tok": {"dflash": "eagle_token", "e3": "e3_token", "suffix": "suffix_token"},
+           "p": {"dflash": "eagle_p", "e3": "e3_p", "suffix": "suffix_p"}},
+    "27b": {"names": ("mtp", "dflash", "suffix"),
+            "tok": {"mtp": "eagle_token", "dflash": "dflash_token", "suffix": "suffix_token"},
+            "p": {"mtp": "eagle_p", "dflash": "dflash_p", "suffix": "suffix_p"}},
+}
+PROPOSERS = CELLS["8b"]["names"]
+TOKKEY = CELLS["8b"]["tok"]
+PKEY = CELLS["8b"]["p"]
 
 
 def load_chains(path):
@@ -89,10 +100,11 @@ def selacc_mat(chains, pick_of, subset=PROPOSERS):
 
 
 def pick_raw(r, av, probs):
-    """argmax raw prob among available; dflash is the default/tiebreak order."""
+    """argmax raw prob among available; PROPOSERS[0] (the served main) is the
+    default/tiebreak (iteration order favors earlier proposers on ties)."""
     best = None
     best_p = -2.0
-    for p in ("dflash", "e3", "suffix"):
+    for p in PROPOSERS:
         if p in av and probs[p] > best_p:
             best, best_p = p, probs[p]
     return best
@@ -106,7 +118,10 @@ def pick_oracle(hits_first):
         for p in hits_first:
             if p in hs:
                 return p
-        return "dflash" if "dflash" in av else (next(iter(av)) if av else None)
+        for p in PROPOSERS:                       # no hit: fall back to main, in order
+            if p in av:
+                return p
+        return next(iter(av)) if av else None
     return f
 
 
@@ -140,26 +155,104 @@ def ceiling_stats(chains, subset=PROPOSERS):
             "unique": dict(unique), "by_combo": dict(by_combo)}
 
 
+def loopy_rids(record_dir, decisions_file, thresh=0.5, n=4):
+    """rids whose gt output is a degenerate repetition loop (distinct-n ratio <
+    thresh) — e.g. a model reasoning loop that hits max_tokens. Such a request
+    UNFAIRLY inflates suffix (its trie predicts the repeats) and the whole MAT, so
+    we exclude it (the agent must be producing real tool-call trajectories for the
+    ceiling to be trustworthy)."""
+    dd = Path(record_dir)
+    reqs = {}                              # rid -> input_ids
+    for line in open(dd / decisions_file):
+        o = json.loads(line)
+        if o.get("type") == "req":
+            reqs[o["rid"]] = tuple(o["input_ids"])
+    gt = {}
+    if (dd / "gt_tokens.jsonl").exists():
+        for line in open(dd / "gt_tokens.jsonl"):
+            r = json.loads(line); gt[tuple(r["input_ids"])] = r["output_ids"]
+    bad = set()
+    info = {}
+    for rid, ids in reqs.items():
+        out = gt.get(ids)
+        if not out or len(out) < n + 1:
+            continue
+        g = [tuple(out[i:i + n]) for i in range(len(out) - n + 1)]
+        dr = len(set(g)) / max(len(g), 1)
+        info[rid] = (len(out), round(dr, 3))
+        if dr < thresh:
+            bad.add(rid)
+    return bad, info
+
+
+def merge_dflash(chains, path):
+    """Inject decoupled DFlash proposals (dflash_offline.py --emit) into the served
+    log rows by (rid, decode_step, depth) — for the 27B cell where DFlash runs on
+    the gt trajectory, not in the served loop."""
+    idx = {}
+    for (rid, ds), rs in chains.items():
+        for r in rs:
+            idx[(rid, ds, r["depth"])] = r
+    n = miss = 0
+    for line in open(path):
+        o = json.loads(line)
+        key = (o["rid"], o["decode_step"], o["depth"])
+        r = idx.get(key)
+        if r is None:
+            miss += 1; continue
+        r["dflash_token"] = o["dflash_token"]; r["dflash_p"] = o.get("dflash_p")
+        n += 1
+    print(f"merged {n} DFlash proposals ({miss} unmatched)")
+
+
 def main():
+    global PROPOSERS, TOKKEY, PKEY
     ap = argparse.ArgumentParser()
     ap.add_argument("--record-dir", required=True)
     ap.add_argument("--decisions-file", default="decisions_select1_oracle.jsonl")
+    ap.add_argument("--cell", choices=["8b", "27b"], default="8b")
+    ap.add_argument("--merge-dflash", default=None,
+                    help="dflash_proposals.jsonl to merge (27b cell)")
+    ap.add_argument("--exclude-loopy", action="store_true",
+                    help="drop requests whose gt output is a degenerate repetition "
+                         "loop (distinct-4 < --loopy-thresh) — they inflate suffix/MAT")
+    ap.add_argument("--loopy-thresh", type=float, default=0.5)
     ap.add_argument("--fig", action="store_true", help="emit selacc/MAT bar figures")
     args = ap.parse_args()
 
+    cell = CELLS[args.cell]
+    PROPOSERS = cell["names"]; TOKKEY = cell["tok"]; PKEY = cell["p"]
+    main_p, added_p, suffix_p = PROPOSERS         # (served-main, added-aux, suffix)
+
     log = Path(args.record_dir) / args.decisions_file
     chains = load_chains(log)
-    print(f"log: {log}  | chains(blocks)={len(chains)}  "
-          f"rows={sum(len(v) for v in chains.values())}")
+    print(f"cell={args.cell} proposers={PROPOSERS}  log: {log}  "
+          f"chains(blocks)={len(chains)}  rows={sum(len(v) for v in chains.values())}")
+    if args.exclude_loopy:
+        bad, info = loopy_rids(args.record_dir, args.decisions_file, args.loopy_thresh)
+        for rid in sorted(bad):
+            print(f"  [loopy] drop rid {rid[:12]} len={info[rid][0]} distinct4={info[rid][1]}")
+        before = len(chains)
+        chains = {k: v for k, v in chains.items() if k[0] not in bad}
+        print(f"excluded {len(bad)} loopy reqs -> blocks {before} -> {len(chains)}")
+    if args.merge_dflash:
+        merge_dflash(chains, args.merge_dflash)
+    # restrict to blocks where the added proposer is present (e.g. 27B reqs that
+    # DFlash skipped — corrupted/too-long — would otherwise count as added-misses).
+    if args.merge_dflash:
+        keep = {k for k, rs in chains.items()
+                if any(r.get(TOKKEY[added_p]) is not None for r in rs)}
+        dropped = len(chains) - len(keep)
+        chains = {k: chains[k] for k in keep}
+        print(f"kept {len(chains)} blocks with {added_p} proposals ({dropped} dropped)")
 
-    # ---- policies (label, picker, subset) --------------------------------- #
+    base2 = (main_p, suffix_p)
     policies = [
-        ("dflash-only", pick_raw, ("dflash",)),
-        ("e3-only", pick_raw, ("e3",)),
-        ("suffix-only", pick_raw, ("suffix",)),
-        ("2way raw\n(dflash+suffix)", pick_raw, ("dflash", "suffix")),
-        ("2way oracle\n(dflash+suffix)", pick_oracle(("dflash", "suffix")),
-         ("dflash", "suffix")),
+        (f"{main_p}-only", pick_raw, (main_p,)),
+        (f"{added_p}-only", pick_raw, (added_p,)),
+        (f"{suffix_p}-only", pick_raw, (suffix_p,)),
+        (f"2way raw\n({main_p}+{suffix_p})", pick_raw, base2),
+        (f"2way oracle\n({main_p}+{suffix_p})", pick_oracle(base2), base2),
         ("3way raw", pick_raw, PROPOSERS),
         ("3way oracle", pick_oracle(PROPOSERS), PROPOSERS),
     ]
@@ -170,15 +263,15 @@ def main():
         rows.append((lab, sa, mt))
         print(f"{lab.replace(chr(10),' '):28s} {sa:8.4f} {mt:8.4f}")
 
-    print("\n=== oracle ceiling (decisive-alive positions, 3-way subset) ===")
+    print("\n=== oracle ceiling (decisive-alive positions) ===")
     cs = ceiling_stats(chains, PROPOSERS)
-    cs2 = ceiling_stats(chains, ("dflash", "suffix"))
+    cs2 = ceiling_stats(chains, base2)
     print(f"positions={cs['positions']} nogt={cs['nogt']}")
     print(f"any-of-3 hit = {cs['any_hit']}  ({cs['any_hit']/max(cs['positions'],1):.3f})")
-    print(f"any-of-2 (dflash+suffix) hit = {cs2['any_hit']}  "
+    print(f"any-of-2 ({main_p}+{suffix_p}) hit = {cs2['any_hit']}  "
           f"({cs2['any_hit']/max(cs2['positions'],1):.3f})")
     exp = cs['any_hit'] - cs2['any_hit']
-    print(f"  -> EAGLE3 search-space expansion: +{exp} positions "
+    print(f"  -> {added_p} search-space expansion: +{exp} positions "
           f"(+{100*exp/max(cs2['any_hit'],1):.1f}% over 2-way)")
     print(f"per-proposer UNIQUE hits (only that proposer covers gt): {cs['unique']}")
     print(f"hit-combo breakdown: {cs['by_combo']}")
@@ -196,17 +289,19 @@ def main():
         labels = [r[0] for r in rows]
         cols = ["#1f77b4", "#2ca02c", "#8c564b", "#7f7f7f", "#9467bd",
                 "#7f7f7f", "#d62728"]
+        names_str = "+".join(PROPOSERS)
+        model = "Qwen3-8B" if args.cell == "8b" else "Qwen3.5-27B"
         ladder_bar([r[1] for r in rows], labels,
                    "decisive selection accuracy (alive-conditioned)",
-                   "3-way selection accuracy (DFlash+EAGLE3+suffix, SERVED, gt-path)\n"
-                   "Qwen3-8B  bfcl_v4 web_search",
-                   f"{figdir}/ceiling_selacc_3way.png", fmt="{:.3f}", colors=cols)
+                   f"3-way selection accuracy ({names_str}, SERVED, gt-path)\n"
+                   f"{model}  bfcl_v4 web_search",
+                   f"{figdir}/ceiling_selacc_3way_{args.cell}.png", fmt="{:.3f}", colors=cols)
         ladder_bar([r[2] for r in rows], labels,
                    "MAT (block-anchored accept length)",
-                   "3-way MAT (DFlash+EAGLE3+suffix, SERVED, gt-path)\n"
-                   "Qwen3-8B  bfcl_v4 web_search",
-                   f"{figdir}/ceiling_mat_3way.png", fmt="{:.3f}", colors=cols)
-        print(f"\nfigures -> {figdir}/ceiling_{{selacc,mat}}_3way.png")
+                   f"3-way MAT ({names_str}, SERVED, gt-path)\n"
+                   f"{model}  bfcl_v4 web_search",
+                   f"{figdir}/ceiling_mat_3way_{args.cell}.png", fmt="{:.3f}", colors=cols)
+        print(f"\nfigures -> {figdir}/ceiling_{{selacc,mat}}_3way_{args.cell}.png")
 
 
 if __name__ == "__main__":

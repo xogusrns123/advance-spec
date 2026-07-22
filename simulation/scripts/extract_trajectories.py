@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render chain-hybrid agent_results_*.json into a human-readable markdown
+"""Render chain-hybrid agent_trajectory_*.json into a human-readable markdown
 trajectory dump: per task, the user question, then each step's reasoning,
 tool call(s), and tool result(s), then the final answer. Runaway steps
 (degenerate repetition to max_tokens) are flagged and truncated head+tail.

@@ -12,7 +12,7 @@ EAGLE3 가 자연스럽게 만든 step trajectory 는 EAGLE3 자체 accept 에 �
 
 | Flag | 의미 |
 |---|---|
-| `--agent-results` (required) | Stage 1 EAGLE3 oracle vanilla JSON |
+| `--agent-trajectory` (required) | Stage 1 EAGLE3 oracle vanilla JSON |
 | `--model` (required) | tokenizer 로딩 (BFCL/SpecBench prompt 재구성) |
 | `--budget` (required) | EAGLE3 base budget B (단일 값; default 없음) |
 | `--output` (required) | per-step rows JSONL path. `meta.json` 도 같은 디렉토리에 쓴다 |
@@ -108,7 +108,7 @@ Notebook 에서:
 ```jsonc
 {
   "script": "run_side_suffix_trajectory",
-  "agent_results_path": <abs path>,
+  "agent_trajectory_path": <abs path>,
   "model": "...",
   "budget": int,
   "req_start": int|null, "req_end": int|null,

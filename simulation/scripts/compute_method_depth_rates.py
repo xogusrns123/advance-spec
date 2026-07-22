@@ -216,7 +216,7 @@ def _extract_anchor_subtree(tids: List[int], pids: List[int],
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--agent-results", required=True)
+    ap.add_argument("--agent-trajectory", required=True)
     ap.add_argument("--dataset", default=None)
     ap.add_argument("--responses", default=None)
     ap.add_argument("--model", default=None)
@@ -236,12 +236,12 @@ def main():
     eagle3_reslice = (args.capture_steps, args.capture_topk,
                       args.reslice_steps, args.reslice_topk)
 
-    print(f"[depth] loading capture: {args.agent_results}", file=sys.stderr)
+    print(f"[depth] loading capture: {args.agent_trajectory}", file=sys.stderr)
     t0 = time.time()
     records = assemble_records_from_artifacts(
-        agent_results_path=args.agent_results,
+        agent_trajectory_path=args.agent_trajectory,
         suffix_drafts_path=None, draft_model_drafts_path=None,
-        mtp_agent_results_path=None, exclude_path=args.exclude,
+        mtp_agent_trajectory_path=None, exclude_path=args.exclude,
         model=args.model, dataset_path=args.dataset,
         responses_path=args.responses, eagle3_reslice=eagle3_reslice,
     )
@@ -418,7 +418,7 @@ def main():
 
     out = {
         "metadata": {
-            "input_source": args.agent_results,
+            "input_source": args.agent_trajectory,
             "max_depth": max_d,
             "max_b": args.max_b, "max_e": args.max_e,
             "budget": args.budget,

@@ -644,7 +644,7 @@ def run_benchmark(
 
     # Resume: skip instances already in checkpoint partial.
     from simulation.pipeline.save_results import (
-        load_checkpoint, append_to_checkpoint, save_agent_results,
+        load_checkpoint, append_to_checkpoint, save_agent_trajectory,
         checkpoint_path,
     )
     cp = load_checkpoint(output_file) if resume else None
@@ -740,7 +740,7 @@ def run_benchmark(
         _cleanup_repos(repos_dir, base_commits)
 
     output = {"metadata": _meta(), "questions": questions}
-    save_agent_results(output, output_file)
+    save_agent_trajectory(output, output_file)
     try:
         checkpoint_path(output_file).unlink()
     except FileNotFoundError:

@@ -20,8 +20,8 @@ run_one() {
   rm -f $dump
   echo "[run] $bench s=$s B=64 → $dump"
   cd $ROOT && SIM_PER_STEP_JSONL=$dump python3 -m simulation.evaluation.run_tree_oracle_sim \
-    --agent-results "$CAP_ROOT/${bench}_steps8_topk16_capture/agent_results_eagle3.json" \
-    --latency-config "$CAP_ROOT/${bench}_steps8_topk16_capture/latency_config.json" \
+    --agent-trajectory "$CAP_ROOT/${bench}_steps8_topk16_capture/agent_results_eagle3.json" \
+    --latency-data "$CAP_ROOT/${bench}_steps8_topk16_capture/latency_data.json" \
     --exclude "$STEP_ROOT/_exclude/${bench}.txt" \
     --methods "$METHODS" \
     --budgets 64 \

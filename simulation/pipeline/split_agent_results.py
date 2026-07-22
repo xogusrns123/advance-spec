@@ -11,7 +11,7 @@ questions. The downstream collect_draft_model can run on each slice without
 the --shard flag (or with --shard 0/1 for compatibility).
 
 Usage:
-    python3 -m simulation.pipeline.split_agent_results \
+    python3 -m simulation.pipeline.split_agent_trajectory \
         --src   simulation/results/qwen3_14b/.../agent_results_eagle3.json \
         --out-pattern simulation/results/qwen3_14b/.../agent_results_eagle3_shard{i}.json \
         --num-shards 4

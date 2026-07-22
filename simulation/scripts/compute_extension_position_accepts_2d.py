@@ -214,7 +214,7 @@ def _build_extension_tree(
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--agent-results", required=True)
+    ap.add_argument("--agent-trajectory", required=True)
     ap.add_argument("--dataset", default=None)
     ap.add_argument("--responses", default=None)
     ap.add_argument("--model", default=None)
@@ -264,14 +264,14 @@ def main():
 
     print(f"[ext-2d] base_proposer={args.base_proposer} → "
           f"by_proposer key='{args.proposer_name}'", file=sys.stderr)
-    print(f"[ext-2d] loading capture: {args.agent_results}",
+    print(f"[ext-2d] loading capture: {args.agent_trajectory}",
           file=sys.stderr)
     t0 = time.time()
     records = assemble_records_from_artifacts(
-        agent_results_path=args.agent_results,
+        agent_trajectory_path=args.agent_trajectory,
         suffix_drafts_path=None,
         draft_model_drafts_path=args.draft_model_drafts,
-        mtp_agent_results_path=None,
+        mtp_agent_trajectory_path=None,
         exclude_path=args.exclude,
         model=args.model,
         dataset_path=args.dataset,
@@ -400,7 +400,7 @@ def main():
 
     out = {
         "metadata": {
-            "input_source": args.agent_results,
+            "input_source": args.agent_trajectory,
             "base_proposer": args.base_proposer,
             "draft_model_drafts": args.draft_model_drafts,
             "max_b": args.max_b,

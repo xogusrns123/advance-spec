@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scan all agent_results *_response.json under simulation/results for the
+"""Scan all agent_trajectory *_response.json under simulation/results for the
 bfcl_v4 runaway-repetition contamination (model loops "[call]</think>..." to
 max_tokens). Reports, per file: #tasks, #tasks with a runaway step (>20K chars),
 #tasks that executed 0 tools, and the % of generated text in runaway steps.

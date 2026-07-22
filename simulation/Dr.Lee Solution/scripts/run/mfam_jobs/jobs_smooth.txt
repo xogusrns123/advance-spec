@@ -1,0 +1,5 @@
+specbench rawhead_succ --head-cal raw --tail-cal succession
+bfcl rawhead_succ --head-cal raw --tail-cal succession
+swebench rawhead_succ --head-cal raw --tail-cal succession
+spider rawhead_succ --head-cal raw --tail-cal succession
+tau2 rawhead_succ --head-cal raw --tail-cal succession

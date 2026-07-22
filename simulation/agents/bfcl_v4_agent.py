@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -90,11 +91,21 @@ from simulation.agents.tools.bfcl import patch_websearch_in_globals, cleanup_glo
 # that the stop string consumes, and _strip_thinking recovers the first call even
 # when the loop is not stopped (e.g. replaying old captures).
 STOP_AFTER_CALL = ["]\n</think>", "]</think>", "]\n\n</think>"]
-MAX_GEN_TOKENS = 8192
+MAX_GEN_TOKENS = int(os.environ.get("BFCL_MAX_GEN_TOKENS", "8192"))
 
 # A BFCL execute-prompting tool call looks like "[func_name(...". Used to pick the
 # real action block out of the reasoning / loop artifacts.
 _CALL_RE = re.compile(r"\[\s*[A-Za-z_]\w*\s*\(")
+
+# Qwen3.5 emits URL args UNQUOTED, e.g. fetch_url_content(url=https://...), which
+# is invalid Python syntax -> the BFCL AST decoder raises -> the call is misread
+# as a final text answer and the agent loop stops early (web_search tasks die on
+# the fetch step). Wrap bare http(s) URLs in quotes before decoding.
+_BARE_URL_RE = re.compile(r"=\s*(https?://[^\s,)\]]+)")
+
+
+def _quote_bare_urls(s: str) -> str:
+    return _BARE_URL_RE.sub(lambda m: '="' + m.group(1) + '"', s)
 
 
 def _first_call_group(s: str) -> str:
@@ -400,7 +411,7 @@ def process_request(
             groups = _strip_thinking_calls(content)
             decoded_calls = []
             for g in groups:
-                decoded_calls += default_decode_execute_prompting(g)
+                decoded_calls += default_decode_execute_prompting(_quote_bare_urls(g))
         except Exception:
             # Decode failure = final text answer
             all_steps.append(step_data)
@@ -439,6 +450,17 @@ def process_request(
                 "role": "tool",
                 "content": str(exec_result),
             })
+
+    # Memory prereq: persist the cumulative memory state to the scenario snapshot
+    # (<scenario>_final.json) so dependent entries (later prereqs + the test case)
+    # load it. Mirrors BFCL base_handler, which calls _flush_memory_to_local_file()
+    # after each prereq conversation. Without this the prereq->test memory chain
+    # never builds and every non-first memory entry starts empty.
+    try:
+        if is_memory_prereq(entry_id) and involved_instances:
+            list(involved_instances.values())[0]._flush_memory_to_local_file()
+    except Exception as e:
+        all_steps.append({"type": "memory_flush", "step": -1, "error": str(e)})
 
     cleanup_globals(entry_id)
 
@@ -692,8 +714,8 @@ def run_benchmark(
 
     output = {"metadata": _meta(), "questions": questions}
 
-    from simulation.pipeline.save_results import save_agent_results
-    save_agent_results(output, output_file)
+    from simulation.pipeline.save_results import save_agent_trajectory
+    save_agent_trajectory(output, output_file)
     # Drop the now-redundant .partial
     from simulation.pipeline.save_results import checkpoint_path
     try:

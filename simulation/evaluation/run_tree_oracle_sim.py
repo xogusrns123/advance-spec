@@ -28,12 +28,12 @@ Forbidden methods (removed):
 
 Usage:
     python3 -m simulation.evaluation.run_tree_oracle_sim \\
-        --agent-results results/.../agent_results_eagle3.json \\
+        --agent-trajectory results/.../agent_results_eagle3.json \\
         --draft-model-drafts results/.../draft_model_drafts.jsonl \\
         --dataset data/specbench/dataset.jsonl \\
         --model Qwen/Qwen3-14B \\
         --budgets 1,2,4,8,16,32,64,128 \\
-        --latency-config simulation/config/latency/qwen3_14b.json \\
+        --latency-data simulation/config/latency/qwen3_14b.json \\
         --output simulation/results/.../tree_oracle_sim.json \\
         --print-summary
 """
@@ -2924,7 +2924,7 @@ def _discover_proposers(records: List[dict]) -> List[str]:
 def compute_latency_speedup(
     records: List[dict],
     budgets: List[int],
-    latency_config: dict,
+    latency_data: dict,
     topk: Optional[int] = None,
     steps: Optional[int] = None,
     method_filter: Optional[set] = None,
@@ -2943,7 +2943,7 @@ def compute_latency_speedup(
     Missing budgets in the per-B tables are linearly interpolated using the
     nearest measured bracket (and clamped at the extremes).
     """
-    vanilla_ms = latency_config["vanilla_step_ms"]
+    vanilla_ms = latency_data["vanilla_step_ms"]
     proposers = _discover_proposers(records)
 
     # --- Decomposed latencies ---
@@ -2955,8 +2955,8 @@ def compute_latency_speedup(
     #   eagle3_draft_ms_by_topk_steps[K][S][B]
     # When `topk` is supplied and the per-topk table exists, use it. Else
     # fall back to the legacy flat tables (cross-topk median / canonical topk).
-    tfwd_by_topk = latency_config.get("target_forward_ms_by_topk", {}) or {}
-    e3draft_by_ts = latency_config.get("eagle3_draft_ms_by_topk_steps", {}) or {}
+    tfwd_by_topk = latency_data.get("target_forward_ms_by_topk", {}) or {}
+    e3draft_by_ts = latency_data.get("eagle3_draft_ms_by_topk_steps", {}) or {}
 
     def _pick_topk_table(table_by_k: dict, label: str) -> dict:
         if not table_by_k:
@@ -2975,7 +2975,7 @@ def compute_latency_speedup(
 
     target_fwd = _pick_topk_table(tfwd_by_topk, "target_forward_ms_by_topk")
     if not target_fwd:
-        target_fwd = dict(latency_config.get("target_forward_ms", {}))
+        target_fwd = dict(latency_data.get("target_forward_ms", {}))
 
     eagle3_draft: dict = {}
     if e3draft_by_ts and topk is not None:
@@ -3002,10 +3002,10 @@ def compute_latency_speedup(
 
     if not eagle3_draft:
         # Fall back to legacy flat table (canonical topk/steps from compile)
-        eagle3_draft = dict(latency_config.get("eagle3_draft_ms", {}))
+        eagle3_draft = dict(latency_data.get("eagle3_draft_ms", {}))
 
-    legacy_verify = latency_config.get("verify_latencies_ms",
-                                       latency_config.get("eagle3_step_ms", {}))
+    legacy_verify = latency_data.get("verify_latencies_ms",
+                                       latency_data.get("eagle3_step_ms", {}))
 
     if not target_fwd and legacy_verify:
         # Derive from legacy: target_forward ≈ vanilla, eagle3_draft = remainder
@@ -3014,13 +3014,13 @@ def compute_latency_speedup(
             eagle3_draft[b_str] = max(float(step) - vanilla_ms, 0.0)
 
     # Per-proposer draft costs (non-EAGLE3)
-    draft_lm_tpot = float(latency_config.get("draft_lm_tpot_ms", 0.0) or 0.0)
+    draft_lm_tpot = float(latency_data.get("draft_lm_tpot_ms", 0.0) or 0.0)
     suffix_speculate_ms = float(
-        latency_config.get("suffix_speculate_ms", 0.0) or 0.0)
+        latency_data.get("suffix_speculate_ms", 0.0) or 0.0)
     # Draft-model chain length cap. Stage 3b (collect_draft_model.py) hard-codes
     # --max-draft-tokens=16; anything above that is filled by other proposers,
     # not by more draft forwards.
-    MAX_DRAFT_MODEL_N = int(latency_config.get("max_draft_model_n", 16))
+    MAX_DRAFT_MODEL_N = int(latency_data.get("max_draft_model_n", 16))
 
     def _interp(table: dict, B: int, fallback: float) -> float:
         """Linear interpolation on measured budgets.
@@ -4052,9 +4052,9 @@ def main():
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    # Input: Stage 1 agent_results + optional Stage 2 draft-model drafts.
+    # Input: Stage 1 agent_trajectory + optional Stage 2 draft-model drafts.
     # Records are assembled on the fly; suffix is drawn live in-sim.
-    parser.add_argument("--agent-results", required=True,
+    parser.add_argument("--agent-trajectory", required=True,
                         help="Stage 1 EAGLE3 agent_results_eagle3.json")
     parser.add_argument("--draft-model-drafts", default=None,
                         help="Stage 2 per-step draft-model JSONL")
@@ -4071,14 +4071,14 @@ def main():
                         help="Output JSON for simulation results")
     parser.add_argument("--budgets", default="1,2,4,8,16,32,64",
                         help="Comma-separated budget values for sweep")
-    parser.add_argument("--latency-config", default=None,
-                        help="Path to latency_config.json. "
+    parser.add_argument("--latency-data", default=None,
+                        help="Path to latency_data.json. "
                              "When omitted, MAT / accept-rate stats are still "
                              "reported but latency-aware speedup numbers are skipped.")
     parser.add_argument("--topk", type=int, default=None,
                         help="EAGLE3 topk used for this Stage 1 run. "
                              "When set, latency lookups pull from the "
-                             "per-topk tables in latency_config.json "
+                             "per-topk tables in latency_data.json "
                              "(target_forward_ms_by_topk / "
                              "eagle3_draft_ms_by_topk_steps).")
     parser.add_argument("--steps", type=int, default=None,
@@ -4136,17 +4136,17 @@ def main():
         assemble_records_from_artifacts,
     )
     records = assemble_records_from_artifacts(
-        agent_results_path=args.agent_results,
+        agent_trajectory_path=args.agent_trajectory,
         suffix_drafts_path=None,
         draft_model_drafts_path=args.draft_model_drafts,
-        mtp_agent_results_path=None,
+        mtp_agent_trajectory_path=None,
         exclude_path=args.exclude,
         model=args.model,
         dataset_path=args.dataset,
         responses_path=args.responses,
         eagle3_reslice=eagle3_reslice,
     )
-    input_source = args.agent_results
+    input_source = args.agent_trajectory
 
     # Per-position accept rates per proposer. Independent of method/budget —
     # purely a property of the draft tree vs ground-truth future.
@@ -4274,18 +4274,18 @@ def main():
         print(f"WARN: suffix position-accept pre-pass skipped: {_e}",
               file=_sys.stderr)
 
-    # Latency-aware simulation. When --latency-config is missing, feed a
+    # Latency-aware simulation. When --latency-data is missing, feed a
     # stub config (vanilla_step_ms=1.0, empty per-budget tables); speedup
     # numbers become placeholders but MAT is unaffected.
-    have_latency = bool(args.latency_config)
+    have_latency = bool(args.latency_data)
     if have_latency:
-        with open(args.latency_config) as f:
-            latency_config = json.load(f)
+        with open(args.latency_data) as f:
+            latency_data = json.load(f)
     else:
-        print("NOTE: --latency-config not provided; MAT is still reported "
+        print("NOTE: --latency-data not provided; MAT is still reported "
               "but speedup numbers will be stub values (not measured).",
               file=sys.stderr)
-        latency_config = {
+        latency_data = {
             "vanilla_step_ms": 1.0,
             "target_forward_ms": {},
             "eagle3_draft_ms": {},
@@ -4298,7 +4298,7 @@ def main():
                             if m.strip())
 
     latency_results = compute_latency_speedup(
-        records, budgets, latency_config,
+        records, budgets, latency_data,
         topk=args.topk, steps=args.steps,
         method_filter=method_filter)
 
@@ -4306,7 +4306,7 @@ def main():
         print_summary(budgets)
         try:
             print_latency_summary(latency_results, budgets,
-                                  latency_config["vanilla_step_ms"])
+                                  latency_data["vanilla_step_ms"])
             if not have_latency:
                 print("(WARNING: speedup columns above use stub latency; "
                       "only MAT is meaningful)", file=sys.stderr)
@@ -4346,10 +4346,10 @@ def main():
                  for j in range(i + 1, len(proposers))]
         all_methods = proposers + pairs
         output["latency"] = {
-            "vanilla_step_ms": latency_config["vanilla_step_ms"],
+            "vanilla_step_ms": latency_data["vanilla_step_ms"],
             "proposers": proposers,
             "pairs": pairs,
-            "has_latency_config": have_latency,
+            "has_latency_data": have_latency,
             "budget_sweep": [
                 {
                     "budget": B,
@@ -4366,7 +4366,7 @@ def main():
         }
         if not have_latency:
             output["latency"]["note"] = (
-                "latency_config not provided; MAT values are accurate but "
+                "latency_data not provided; MAT values are accurate but "
                 "speedup_* columns use stub latencies (not meaningful)")
 
         _rename_proposer_keys_inplace(output, args.proposer_label)

@@ -91,6 +91,23 @@ MODEL_PRESETS: dict[str, dict] = {
                               "--disable-piecewise-cuda-graph",
                               "--disable-radix-cache"],
     },
+    # DFlash serves as the MAIN worker on Qwen3.5-27B too (validated by boot:
+    # DFLASH draft runner + mamba intermediate_ssm spec cache allocate & decode
+    # fine — the "DFlash-27B can't serve" note in dflash_offline.py is stale for
+    # this sglang build). Same flags as 8B + 131072 context for the Mamba arch.
+    "qwen35_27b_dflash": {
+        "model": "Qwen/Qwen3.5-27B",
+        "draft_model": "z-lab/Qwen3.5-27B-DFlash",
+        "tool_call_parser": "qwen25",
+        "speculative_algorithm": "DFLASH",
+        "is_dflash": True,
+        "block_size": 16,
+        "extra_server_args": ["--attention-backend", "triton",
+                              "--sampling-backend", "pytorch",
+                              "--disable-piecewise-cuda-graph",
+                              "--disable-radix-cache",
+                              "--context-length", "131072"],
+    },
 }
 
 WORKLOAD_REGISTRY: dict[str, dict] = {
@@ -101,6 +118,14 @@ WORKLOAD_REGISTRY: dict[str, dict] = {
     "specbench": {
         "agent_module": "simulation.agents.specbench_agent",
         "dataset": "data/specbench/dataset_interleaved.jsonl",
+    },
+    "swebench": {
+        "agent_module": "simulation.agents.minisweagent_agent",  # official mini-swe-agent (textbased)
+        "dataset": "data/swebench_verified/dataset_interleaved.jsonl",
+    },
+    "gsm8k_humaneval": {  # single-turn math + code, via the proven specbench_agent (replay/oracle work)
+        "agent_module": "simulation.agents.specbench_agent",
+        "dataset": "data/gsm8k_humaneval/dataset_interleaved.jsonl",
     },
 }
 
@@ -115,6 +140,9 @@ ARM_NAMES = ("baseline", "hybrid_e3", "record",
              "select1_disc_logistic", "select1_disc_beta",
              "select1_mono", "select1_bayes",
              "select1_multifeat",
+             "select1_handrule",
+             "select1_branch",
+             "select1_handoff",
              "select1_oracle", "suffix")
 
 # ONLINE calibration arms: NO pre-fit JSON. The per-(group,depth) calibration
@@ -271,6 +299,13 @@ def build_env(args, arm: str, timing_log: Path, decision_log: Path,
     if is_chain_hybrid_arm(arm):
         env["SGLANG_CHAIN_HYBRID"] = "1"
         env["SGLANG_CHAIN_HYBRID_LOG"] = str(decision_log)
+        # eagle DISTRIBUTIONAL-confidence capture (entropy, top-2 margin, and
+        # p_eagle(suffix_token)): the untested signal for the confident-inversion
+        # region. Env-gated because it adds a full-vocab reduction per draft step;
+        # only enable for the feature-capture run. Recorded before the oracle
+        # branch, so the oracle arm gets these + gt_token/oracle_hit in one log.
+        if getattr(args, "log_eagle_dist", False):
+            env["SGLANG_CHAIN_HYBRID_LOG_EAGLE_DIST"] = "1"
         if calib_map is not None:
             env["SGLANG_CHAIN_HYBRID_CALIB"] = str(calib_map)
         # Direction-2 multi-feature per-proposer calibrator (its own env; the
@@ -292,6 +327,25 @@ def build_env(args, arm: str, timing_log: Path, decision_log: Path,
         if arm == "select1_oracle":
             env["SGLANG_CHAIN_HYBRID_MODE"] = "oracle"
             env["SGLANG_CHAIN_HYBRID_GT"] = str(gt_file)
+        if arm == "select1_branch":
+            # Cross-proposer branching: at a differ-depth with
+            # |eagle_cmp - suffix_cmp| < band (<= m per step), hang the loser
+            # token + its trie side run as verify siblings (tree surgery).
+            env["SGLANG_CHAIN_HYBRID_BRANCH"] = (
+                f"{args.branch_band},{args.branch_m},{args.branch_len}")
+        if arm == "select1_handrule":
+            # transparent linear-boundary selector (no map): suffix iff
+            # suffix_p > A*eagle_p + B. A/B from --handrule-a/--handrule-b.
+            env["SGLANG_CHAIN_HYBRID_HANDRULE_A"] = str(args.handrule_a)
+            env["SGLANG_CHAIN_HYBRID_HANDRULE_B"] = str(args.handrule_b)
+        if arm == "select1_handoff":
+            # Extension O3-deployable hand-off: DFlash head while dflash_p >=
+            # a*(t), then suffix tail. DEFAULT a*(t)=T(t)/(1+T(t)) with the
+            # per-position T(t) = the suffix run score (expected tail length).
+            # --handoff-t > 0 pins a FIXED T (ablation) for all positions.
+            env["SGLANG_CHAIN_HYBRID_HANDOFF"] = "1"
+            if args.handoff_t and args.handoff_t > 0:
+                env["SGLANG_CHAIN_HYBRID_HANDOFF_T"] = str(args.handoff_t)
         # PIN: force committed tokens onto the standalone trajectory (select1/
         # calib/hybrid_e3 arms). The patch ignores this in oracle mode and
         # rejects it in record mode, so the caller only sets pin_file for the
@@ -321,6 +375,9 @@ def build_env(args, arm: str, timing_log: Path, decision_log: Path,
             env["SGLANG_CHAIN_HYBRID_TAIL_MIN_PROB"] = str(args.tail_min_prob)
             if args.tail_check:
                 env["SGLANG_CHAIN_HYBRID_TAIL_CHECK"] = "1"
+        # Pre-warm the global suffix tree with a corpus (full-corpus regime).
+        if getattr(args, "suffix_prewarm", None):
+            env["SGLANG_CHAIN_HYBRID_SUFFIX_PREWARM"] = str(args.suffix_prewarm)
     if arm == "suffix":
         env["SGLANG_SUFFIX_CHAIN"] = "1"
         # SuffixWorker writes per-step accept/timing JSONL in the same
@@ -358,6 +415,17 @@ def run_agent(args, workload: dict, out_file: Path, env: dict,
             cmd += ["--offset", str(offset)]
         if getattr(args, "exclude_ids", None):
             cmd += ["--exclude-ids", args.exclude_ids]
+    elif args.workload == "specbench":
+        if offset:
+            cmd += ["--offset", str(offset)]
+    elif args.workload == "swebench":
+        cmd += ["--repos-dir", getattr(args, "swebench_repos_dir", None) or "data/swebench/repos"]
+        if args.max_iterations:
+            cmd += ["--max-iterations", str(args.max_iterations)]
+        if getattr(args, "swebench_tool_style", None):
+            cmd += ["--tool-style", args.swebench_tool_style]
+        if offset:
+            cmd += ["--offset", str(offset)]
 
     log_path = out_file.parent / f"{out_file.stem}_agent.log"
     t0 = time.perf_counter()
@@ -399,6 +467,23 @@ def main() -> int:
                              "bfcl_ids to drop (e.g. repetition loopers).")
     parser.add_argument("--arms", default="baseline,select1,suffix",
                         help=f"Comma list from {ARM_NAMES}")
+    parser.add_argument("--branch-band", type=float, default=0.3,
+                        help="select1_branch: branch when "
+                             "|eagle_cmp - suffix_cmp| < band")
+    parser.add_argument("--branch-m", type=int, default=2,
+                        help="select1_branch: max branch events per step")
+    parser.add_argument("--branch-len", type=int, default=16,
+                        help="select1_branch: max side-run tokens per branch")
+    parser.add_argument("--handrule-a", type=float, default=1.0,
+                        help="select1_handrule: linear boundary slope A in "
+                             "'pick suffix iff suffix_p > A*eagle_p + B'.")
+    parser.add_argument("--handrule-b", type=float, default=0.0,
+                        help="select1_handrule: linear boundary intercept B.")
+    parser.add_argument("--handoff-t", type=float, default=0.0,
+                        help="select1_handoff: 0 (default) = per-position "
+                             "a*(t)=T(t)/(1+T(t)) with T(t)=the suffix run score "
+                             "(expected tail length). >0 pins a FIXED T "
+                             "(ablation) for all positions.")
     parser.add_argument("--suffix-num-draft-tokens", type=int, default=64,
                         help="Verify tensor size for the suffix arm (the "
                              "chain draft is uncapped up to this minus 1)")
@@ -415,6 +500,11 @@ def main() -> int:
     parser.add_argument("--tail-check", action="store_true",
                         help="Enable per-step reconstruction bit-check "
                              "(SGLANG_CHAIN_HYBRID_TAIL_CHECK=1, debug)")
+    parser.add_argument("--suffix-prewarm", default=None,
+                        help="jsonl of {input_ids,output_ids} to PRE-WARM the "
+                             "global suffix tree before serving (serves the "
+                             "full-corpus suffix regime, incl self-match, for "
+                             "the chain-tail speedup study)")
     parser.add_argument("--online-window", type=int, default=256,
                         help="select1_online_* arms: sliding-window size in "
                              "decode steps (clock units) for the online "
@@ -491,6 +581,11 @@ def main() -> int:
                              "cache for the suffix tail on Qwen3.5/27B (set to "
                              "steps+1+tail_max). Requires the server_args topk==1 "
                              "force-reset bypass (auto via SGLANG_CHAIN_HYBRID_TAIL).")
+    parser.add_argument("--log-eagle-dist", action="store_true",
+                        help="capture eagle distributional-confidence features "
+                             "(entropy, top-2 margin, p_eagle(suffix_token)) into "
+                             "the decision log; adds a full-vocab reduction per "
+                             "draft step (use only for the feature-capture run)")
     parser.add_argument("--skip-calib-fit", action="store_true",
                         help="Do NOT re-fit calibration maps in the fit phase; "
                              "use the maps already placed in out_dir (e.g. fit "
@@ -725,7 +820,7 @@ def main() -> int:
         cmd = build_server_cmd(args, arm, preset)
 
         server_log = out_dir / f"server_{arm}.log"
-        agent_out = out_dir / f"agent_results_{arm}.json"
+        agent_out = out_dir / f"agent_trajectory_{arm}.json"
         log_fh = open(server_log, "w")
         proc = subprocess.Popen(cmd, env=env, stdout=log_fh, stderr=log_fh,
                                 cwd=str(REPO_ROOT))

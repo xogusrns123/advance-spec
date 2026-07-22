@@ -17,7 +17,7 @@ Output schema (one JSONL record per step):
 Usage:
     # SGLang backend
     python3 -m simulation.pipeline.collect_draft_model \\
-        --agent-results results/.../agent_results_eagle3.json \\
+        --agent-trajectory results/.../agent_results_eagle3.json \\
         --output simulation/results/.../draft_model_drafts.jsonl \\
         --model Qwen/Qwen3-0.6B \\
         --server-url http://localhost:31000 \\
@@ -260,7 +260,7 @@ def main():
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--agent-results", required=True,
+    parser.add_argument("--agent-trajectory", required=True,
                         help="Path to agent_results_eagle3.json")
     parser.add_argument("--output", required=True,
                         help="Output JSONL path")
@@ -329,8 +329,8 @@ def main():
 
     exclude_ids = load_exclude_ids(args.exclude) if args.exclude else set()
 
-    print(f"Loading: {args.agent_results}", file=sys.stderr)
-    with open(args.agent_results) as f:
+    print(f"Loading: {args.agent_trajectory}", file=sys.stderr)
+    with open(args.agent_trajectory) as f:
         data = json.load(f)
 
     tokenizer = None

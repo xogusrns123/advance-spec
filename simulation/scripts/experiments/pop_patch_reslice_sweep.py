@@ -126,10 +126,10 @@ def build_inner_cmd(workload, s, k):
     cap = DOCKER_ROOT / "simulation" / "results" / "qwen3_14b" / f"{workload}_steps8_topk16_capture"
     cmd = [
         "python3", "-m", "simulation.evaluation.run_tree_oracle_sim",
-        "--agent-results", str(cap / "agent_results_eagle3.json"),
+        "--agent-trajectory", str(cap / "agent_results_eagle3.json"),
         "--dataset", str(DOCKER_ROOT / DATASET_MAP[workload]),
         "--model", "Qwen/Qwen3-14B",
-        "--latency-config", str(cap / "latency_config.json"),
+        "--latency-data", str(cap / "latency_data.json"),
         "--steps", str(s), "--topk", str(k),
         "--reslice-steps", str(s), "--reslice-topk", str(k),
         "--capture-steps", "8", "--capture-topk", "16",

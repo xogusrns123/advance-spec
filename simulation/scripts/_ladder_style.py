@@ -11,6 +11,7 @@ ROLE = {
     "MTP":      "#9467bd",   # purple
     "suffix":   "#ff7f0e",   # orange
     "raw":      "#7f7f7f",   # gray
+    "roundrobin":"#8c564b",  # brown (blind no-score alternation baseline)
     "histogram":"#2ca02c",   # green
     "isotonic": "#17becf",   # cyan
     "logistic": "#e377c2",   # pink

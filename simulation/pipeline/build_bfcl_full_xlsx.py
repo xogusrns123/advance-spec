@@ -424,10 +424,10 @@ def main() -> None:
          "dump": "bfcl_v4_s4k16B64.jsonl"},
     ]
 
-    # Load latency_config for backbone-only cost lookups
+    # Load latency_data for backbone-only cost lookups
     latency_path = (
         Path("/workspace/simulation/results/qwen3_14b/"
-             "bfcl_v4_steps8_topk16_capture/latency_config.json"))
+             "bfcl_v4_steps8_topk16_capture/latency_data.json"))
     target_forward_ms: Dict[int, float] = {}
     if latency_path.exists():
         with open(latency_path) as f:

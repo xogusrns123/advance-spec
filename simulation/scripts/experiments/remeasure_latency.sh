@@ -80,7 +80,7 @@ fi
 # inference time but kept in the config for completeness).
 DRAFT_LM_NS=${DRAFT_LM_NS:-"1,2,3,5,8,16"}
 
-# Suffix cost is computed off existing agent_results — points at the
+# Suffix cost is computed off existing agent_trajectory — points at the
 # current results dir for this preset.
 AGENT_RESULTS_DIR=${AGENT_RESULTS_DIR:-/workspace/simulation/results/${PRESET}}
 
@@ -139,22 +139,22 @@ else
     --output "$OUTPUT_DIR/draft_model_cost.json"
 fi
 
-# 3. Suffix speculate cost (no server; reads agent_results)
+# 3. Suffix speculate cost (no server; reads agent_trajectory)
 echo ""
 echo "=== [3/4] Suffix speculate cost ==="
 if [ -d "$AGENT_RESULTS_DIR" ]; then
   python3 simulation/scripts/measure_suffix_cost.py \
     --workloads "$WORKLOADS" --model "$MODEL" \
-    --agent-results-dir "$AGENT_RESULTS_DIR" \
+    --agent-trajectory-dir "$AGENT_RESULTS_DIR" \
     --output "$OUTPUT_DIR/suffix_cost.json"
 else
   echo "WARN: agent results dir not found ($AGENT_RESULTS_DIR); skipping suffix cost." >&2
   echo "  -> reuse previous suffix_cost.json or rerun once Stage 1 has output." >&2
 fi
 
-# 4. Compile into latency_config.json
+# 4. Compile into latency_data.json
 echo ""
-echo "=== [4/4] Compile latency_config.json ==="
+echo "=== [4/4] Compile latency_data.json ==="
 COMPILE_ARGS=( --eagle3-cost "$OUTPUT_DIR/eagle3_cost.json" )
 [ -f "$OUTPUT_DIR/draft_model_cost.json" ] && COMPILE_ARGS+=( --draft-cost "$OUTPUT_DIR/draft_model_cost.json" )
 [ -f "$OUTPUT_DIR/suffix_cost.json" ]      && COMPILE_ARGS+=( --suffix-cost "$OUTPUT_DIR/suffix_cost.json" )

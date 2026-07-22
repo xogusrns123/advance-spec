@@ -147,6 +147,15 @@ class _ChainHybridState:
         self.tail_check = tail_check
         self.last_tail_len = 0   # tokens appended this step; consumed by the
                                  # draft-extend wrapper, reset at each draft
+        # Cross-proposer BRANCH (select1_branch arm; branch_m==0 = off): at a
+        # differ-depth with |eagle_cmp - suffix_cmp| < branch_band and budget
+        # left (<= branch_m per step), the LOSER token + its trie-drafted side
+        # run (<= branch_len) are hung as a verify SIBLING of the chosen token
+        # (_branch_append tensor surgery) so tree-verify resolves the pick.
+        self.branch_m = 0
+        self.branch_band = 0.3
+        self.branch_len = 16
+        self.branch_cands: list | None = None  # per-row [{depth, main_tok, side}]
         self.active: set = set()        # rids with start_request() done
         self.last_out_len: dict = {}    # rid -> len(output_ids) already fed to trie
         self.decode_step: dict = {}     # rid -> decode step counter (1-based)
@@ -729,10 +738,156 @@ class _ServingDiscriminator:
 
 _DISC: _ServingDiscriminator | None = None
 
+# Transparent hand-rule (env SGLANG_CHAIN_HYBRID_HANDRULE_A/B): a 2-D linear boundary
+# in (eagle_p, suffix_p) — pick suffix iff suffix_p > A*eagle_p + B. Readable 2-param
+# alternative to the GBM discriminator; designed offline (handrule_design2.py).
+_HANDRULE: tuple | None = None
+
+
+class _Sel3Selector:
+    """3-way per-proposer CALIBRATED selector for the served DFlash-aux path.
+
+    Loaded from a sel3_bundle.json (fit by select1_ladder/fit_3way_selector.py). For
+    each present proposer {main (MTP/eagle slot), dflash, suffix} it computes
+    P(token == gt) via that proposer's own model, and the 3-way branch argmaxes the
+    CALIBRATED scores instead of the raw softmax probs. This is the served realization
+    of the offline picks()/bayes (block-anchored MAT ~5.58 for 27B 3-way). The binary
+    _DISC (suffix-vs-eagle) does not extend to 3 proposers, hence a separate object.
+
+    method = gbm | logistic (env SGLANG_CHAIN_HYBRID_SEL3_METHOD; default gbm). gbm is a
+    pickled sklearn HGB and MUST be fit in the serving docker's sklearn.
+    """
+
+    def __init__(self, models, method, main_name):
+        self.models = models          # method -> proposer_name -> spec
+        self.method = method
+        self.main_name = main_name    # bundle name for the eagle/MTP slot
+        self._cache = {}              # proposer_name -> unpickled gbm
+
+    @classmethod
+    def load(cls, path: str, method: str) -> "_Sel3Selector":
+        with open(path) as f:
+            blob = json.load(f)
+        models = blob["models"]
+        if method not in models or not models[method]:
+            raise RuntimeError(f"sel3 bundle {path} has no '{method}' models")
+        names = list(models[method].keys())
+        main = next((n for n in names if n not in ("dflash", "suffix")), names[0])
+        return cls(models, method, main)
+
+    def _gbm(self, name):
+        m = self._cache.get(name)
+        if m is None:
+            import base64
+            import pickle
+            m = pickle.loads(base64.b64decode(self.models["gbm"][name]["model_b64"]))
+            self._cache[name] = m
+        return m
+
+    def score(self, name, prob, depth, match_len=0.0, lcnt=0.0) -> float:
+        spec = self.models[self.method].get(name)
+        if spec is None:                       # unknown proposer -> fall back to raw prob
+            return float(prob if prob is not None else 0.0)
+        fmap = {"prob": float(prob or 0.0), "depth": float(depth),
+                "match_len": float(match_len or 0.0), "lcnt": float(lcnt or 0.0)}
+        x = [fmap[f] for f in spec["features"]]
+        if self.method == "gbm":
+            return float(self._gbm(name).predict_proba([x])[0, 1])
+        mu = spec["mean"]; sd = spec["std"]; coef = spec["coef"]; b = spec["intercept"]
+        z = sum(coef[i] * ((x[i] - mu[i]) / sd[i]) for i in range(len(x))) + b
+        if z >= 0:
+            return 1.0 / (1.0 + math.exp(-z))
+        e = math.exp(z)
+        return e / (1.0 + e)
+
+
+_SEL3: "_Sel3Selector | None" = None
+
 
 # ---------------------------------------------------------------------------
 # Per-depth decision
 # ---------------------------------------------------------------------------
+
+def _install_dflash_aux(eagle_worker, st) -> None:
+    """27B 3-way: DFlash as an IN-PROCESS aux proposer on the EAGLE/MTP main path.
+    DFlash-27B can't be the sglang main worker (Mamba cache-crop), so it runs in-loop:
+    forward hooks on the served target's DFlash layers capture aux during verify; a
+    forward wrapper feeds the COMMITTED aux to a stateful DFlashInLoop block drafter
+    (prefill resets it, decode commits acc+1 rows); _decide_and_inject drafts a block
+    at depth 0 (root = last committed) and exposes block[depth] as the 3rd proposer.
+    Reuses the served target's embedding + lm_head weight (no 2nd 27B target = no OOM)."""
+    import torch, sys
+    sys.path.insert(0, "/workspace/simulation/scripts/experiments")
+    from dflash_offline import DFlashOffline, DFlashInLoop
+    served = eagle_worker.target_worker.model_runner.model
+    draft_name = os.environ.get("SGLANG_CHAIN_HYBRID_DFLASH_DRAFT",
+                                "z-lab/Qwen3.5-27B-DFlash")
+    dfo = DFlashOffline.from_served(draft_name, served, device=eagle_worker.device)
+    st._dfa = dfo
+    st._dfa_loop = DFlashInLoop(dfo)
+    st._dfa_block = {}
+    st._dfa_cap = {}
+    st._dfa_layer_ids = dfo.layer_ids
+    st._dfa_last_outlen = {}
+
+    base = served.model
+    def mk_hook(L):
+        def hook(mod, inp, out):
+            # sglang decoder layers use the FUSED-residual flow: forward returns
+            # (hidden_states, residual) where the FULL residual stream (== HF
+            # output_hidden_states[L+1], what extract_context_feature/DFlash expects)
+            # is hidden_states + residual. out[0] alone is the pre-add MLP output
+            # (wrong). The HF offline model returns the full hidden as out[0].
+            if isinstance(out, tuple):
+                h = out[0] + out[1] if (len(out) >= 2 and out[1] is not None) else out[0]
+            else:
+                h = out
+            st._dfa_cap[L] = h.detach()
+        return hook
+    for L in dfo.layer_ids:
+        base.layers[L].register_forward_hook(mk_hook(L))
+
+    def _aux_concat():
+        if not st._dfa_cap or any(L not in st._dfa_cap for L in st._dfa_layer_ids):
+            return None
+        a = torch.cat([st._dfa_cap[L] for L in st._dfa_layer_ids], dim=-1)
+        return a if a.dim() == 3 else a.unsqueeze(0)        # -> [1, N, K*H]
+
+    orig_fwd = eagle_worker.forward_batch_generation
+    def wrapped_fwd(batch, *a, **k):
+        try:
+            is_extend = (batch.forward_mode.is_extend()
+                         or getattr(batch, "is_extend_in_batch", False))
+        except Exception:
+            is_extend = False
+        result = orig_fwd(batch, *a, **k)
+        try:
+            if len(batch.reqs) == 1:
+                req = batch.reqs[0]; aux = _aux_concat()
+                if is_extend:
+                    plen = len(req.origin_input_ids)
+                    st._dfa_loop.reset(aux[:, :plen, :] if aux is not None else None, plen)
+                    # +1: the prefill's bonus token is appended to output_ids AFTER
+                    # this wrapper runs, but it is NOT part of the next verify's
+                    # committed block (it is the block root). Count it now so the
+                    # first decode clen == that verify's commit == its captured aux.
+                    st._dfa_last_outlen[req.rid] = len(req.output_ids or []) + 1
+                else:
+                    out = req.output_ids or []
+                    clen = len(out) - st._dfa_last_outlen.get(req.rid, len(out))
+                    st._dfa_last_outlen[req.rid] = len(out)
+                    if os.environ.get("SGLANG_DFA_DEBUG") == "1":
+                        logger.info(f"[DFADBG commit] outlen={len(out)} clen={clen} "
+                                    f"aux_rows={None if aux is None else aux.shape[1]} "
+                                    f"loop_start={st._dfa_loop.start}")
+                    if aux is not None and clen > 0:
+                        st._dfa_loop.commit(aux[:, :clen, :], clen)
+        except Exception as e:
+            st.warn_once("dfa-commit", str(e))
+        return result
+    eagle_worker.forward_batch_generation = wrapped_fwd
+    logger.info(f"DFlash-aux installed (draft={draft_name}, layers={dfo.layer_ids})")
+
 
 def _decide_and_inject(st: _ChainHybridState, depth: int, topk_p, topk_index):
     """Run the suffix-vs-eagle3 decision for every batch row at this depth.
@@ -746,6 +901,16 @@ def _decide_and_inject(st: _ChainHybridState, depth: int, topk_p, topk_index):
     idx_cpu = topk_index.detach().cpu()
     new_p = None
     new_idx = None
+
+    # DFlash-aux (27B 3-way): at the block root (depth 0) draft the whole DFlash
+    # block once; block[d] is DFlash's proposal for this chain depth d. bs==1.
+    if depth == 0 and getattr(st, "_dfa_loop", None) is not None and st.stash:
+        try:
+            seed = int(st.stash[0][1][-1]) if st.stash[0][1] else None
+            recs = st._dfa_loop.draft_block(seed) if seed is not None else []
+            st._dfa_block = {d: (tok, p) for d, tok, p in recs}
+        except Exception as e:
+            st.warn_once("dfa-draft", str(e)); st._dfa_block = {}
 
     for r, (rid, ctx_tail) in enumerate(st.stash):
         eagle_tok = int(idx_cpu[r, 0])
@@ -769,6 +934,12 @@ def _decide_and_inject(st: _ChainHybridState, depth: int, topk_p, topk_index):
             "chosen": "eagle3",
             "agreement": None,
         }
+
+        # DFlash-aux proposal for this depth (3rd proposer; bs==1 row 0). Logged
+        # now; the 3-way select uses it once validated.
+        if getattr(st, "_dfa_block", None) and r == 0 and depth in st._dfa_block:
+            dft, dfp = st._dfa_block[depth]
+            rec["dflash_token"] = int(dft); rec["dflash_p"] = round(float(dfp), 6)
 
         suffix_tok = None
         suffix_p = None
@@ -846,6 +1017,11 @@ def _decide_and_inject(st: _ChainHybridState, depth: int, topk_p, topk_index):
                                 if suffix_tok is not None else None)
             chosen_tok = eagle_tok
             hit = "nogt" if gt_tok is None else "none"
+            # option B (SGLANG_CHAIN_HYBRID_GT_SUBST=1): TEACHER-FORCE gt into the
+            # chain at EVERY depth so the target processes gt and the captured
+            # features stay gt-consistent for all arms (clean 3-way ceiling, no
+            # substituted-token feature artifact). Default (off): legacy gt-on-hit.
+            gt_subst = os.environ.get("SGLANG_CHAIN_HYBRID_GT_SUBST") == "1"
             if gt_tok is not None:
                 e_hit = eagle_tok == gt_tok
                 s_hit = suffix_tok == gt_tok if suffix_tok is not None else False
@@ -853,6 +1029,16 @@ def _decide_and_inject(st: _ChainHybridState, depth: int, topk_p, topk_index):
                     hit = "both" if s_hit else "eagle"
                 elif s_hit:
                     hit = "suffix"
+                if gt_subst:
+                    if gt_tok != eagle_tok:
+                        if new_p is None:
+                            new_p = topk_p.clone()
+                            new_idx = topk_index.clone()
+                        new_idx[r, 0] = gt_tok
+                        new_p[r, 0] = 1.0
+                    chosen_tok = gt_tok
+                    rec["chosen"] = "gt"
+                elif (not e_hit) and s_hit:
                     if new_p is None:
                         new_p = topk_p.clone()
                         new_idx = topk_index.clone()
@@ -860,6 +1046,23 @@ def _decide_and_inject(st: _ChainHybridState, depth: int, topk_p, topk_index):
                     new_p[r, 0] = 1.0
                     chosen_tok = suffix_tok
                     rec["chosen"] = "suffix"
+                elif (not e_hit) and (not s_hit):
+                    # 3-way ceiling: neither eagle nor suffix covers gt, but the
+                    # DFlash block might. dfa_tok==gt here, so injecting it keeps
+                    # the chain gt-consistent (same as gt injection) while making
+                    # the SERVED oracle MAT reflect the TRUE 3-way search-space
+                    # expansion, not a 2-way (eagle+suffix) ceiling. Logged-only
+                    # when DFLASH_AUX is off (rec has no dflash_token).
+                    dfa_tok = rec.get("dflash_token")
+                    if dfa_tok is not None and dfa_tok == gt_tok:
+                        if new_p is None:
+                            new_p = topk_p.clone()
+                            new_idx = topk_index.clone()
+                        new_idx[r, 0] = dfa_tok
+                        new_p[r, 0] = 1.0
+                        chosen_tok = dfa_tok
+                        rec["chosen"] = "dflash"
+                        hit = "dflash"
             rec["oracle_hit"] = hit
             chain.append(chosen_tok)
             st.pending.append(rec)
@@ -892,6 +1095,63 @@ def _decide_and_inject(st: _ChainHybridState, depth: int, topk_p, topk_index):
                                             match_len=rec.get("match_len"))
                 rec["suffix_p_cal"] = round(suffix_cmp, 6)
 
+        # 3-WAY select (27B in-loop DFlash-aux): argmax prob among {eagle(MTP),
+        # dflash(block[depth]), suffix}. RAW (calib/disc 3-way = future). Inject the
+        # chosen into topk so the chain follows it; verify gives the realized accept.
+        dfa_tok = rec.get("dflash_token")
+        if getattr(st, "_dfa_enabled", False) and dfa_tok is not None:
+            dfp = rec.get("dflash_p") or 0.0
+            if getattr(st, "_consensus_first", False):
+                # CONSENSUS-FIRST -> dominant(MTP): if >=2 of {MTP, DFlash, suffix}
+                # propose the SAME token, pick it (decisive-position consensus is
+                # 90-96% == gt); else fall back to the dominant proposer
+                # (MTP=eagle_tok). Training-free; matches the GBM/calib ceiling and,
+                # unlike raw argmax, is not hijacked by an over-confident weak one.
+                cands = [eagle_tok, dfa_tok]
+                if suffix_tok is not None:
+                    cands.append(suffix_tok)
+                cons_tok = next((t for t in cands if cands.count(t) >= 2), None)
+                if cons_tok is not None:
+                    best_tok, best_name = cons_tok, "consensus"
+                    best_p = max(p for t, p in
+                                 ((eagle_tok, eagle_p), (dfa_tok, dfp),
+                                  (suffix_tok, suffix_p or 0.0))
+                                 if t == cons_tok)
+                else:
+                    best_tok, best_p, best_name = eagle_tok, eagle_p, "eagle3"
+            elif _SEL3 is not None:
+                # 3-way CALIBRATED select: argmax P(token==gt) over present proposers
+                # (served realization of the offline per-proposer bayes/calib).
+                lcnt = math.log1p(suffix_count) if suffix_count else 0.0
+                cand = [("eagle3", eagle_tok, eagle_p,
+                         _SEL3.score(_SEL3.main_name, eagle_p, depth)),
+                        ("dflash", dfa_tok, dfp,
+                         _SEL3.score("dflash", dfp, depth))]
+                if suffix_tok is not None:
+                    cand.append(("suffix", suffix_tok, suffix_p or 0.0,
+                                 _SEL3.score("suffix", suffix_p or 0.0, depth,
+                                             match_len=rec.get("match_len"), lcnt=lcnt)))
+                best_name, best_tok, best_p, _bs = max(cand, key=lambda c: c[3])
+                rec["sel3_scores"] = {c[0]: round(c[3], 6) for c in cand}
+            else:
+                best_name, best_tok, best_p = "eagle3", eagle_tok, eagle_p
+                if dfp > best_p:
+                    best_name, best_tok, best_p = "dflash", dfa_tok, dfp
+                if suffix_tok is not None and (suffix_p or 0.0) > best_p:
+                    best_name, best_tok, best_p = "suffix", suffix_tok, suffix_p
+            if suffix_tok is not None:
+                rec["agreement"] = suffix_tok == eagle_tok
+            rec["chosen"] = best_name
+            chosen_tok = best_tok
+            if best_tok != eagle_tok:
+                if new_p is None:
+                    new_p = topk_p.clone(); new_idx = topk_index.clone()
+                new_idx[r, 0] = best_tok
+                new_p[r, 0] = min(max(best_p, 0.0), 1.0)
+            chain.append(chosen_tok)
+            st.pending.append(rec)
+            continue
+
         chosen_tok = eagle_tok
         if suffix_tok is not None:
             rec["agreement"] = suffix_tok == eagle_tok
@@ -908,6 +1168,11 @@ def _decide_and_inject(st: _ChainHybridState, depth: int, topk_p, topk_index):
                     rec["disc_p"] = round(float(pick_p), 6)
                     take = pick_p > 0.5
                     score_val = suffix_p
+                elif _HANDRULE is not None and suffix_p is not None:
+                    # transparent linear boundary: suffix iff suffix_p > A*eagle_p + B
+                    a, b = _HANDRULE
+                    take = suffix_p > a * eagle_p + b
+                    score_val = suffix_p
                 else:
                     take = (suffix_cmp is not None and suffix_cmp > eagle_cmp)
                     score_val = suffix_cmp
@@ -921,6 +1186,43 @@ def _decide_and_inject(st: _ChainHybridState, depth: int, topk_p, topk_index):
                     new_p[r, 0] = min(max(score_val, 0.0), 1.0)
                     chosen_tok = suffix_tok
                     rec["chosen"] = "suffix"
+
+                # BRANCH candidate (select1_branch): at an uncertain differ-
+                # depth, stash the LOSER token + its trie-drafted side run;
+                # _branch_append hangs them as verify siblings after the chain
+                # draft completes. The MAIN chain is untouched (pick above).
+                if (st.branch_m > 0 and st.branch_cands is not None
+                        and r < len(st.branch_cands)
+                        and len(st.branch_cands[r]) < st.branch_m):
+                    e_cmp = eagle_cmp if eagle_cmp is not None else eagle_p
+                    s_cmp = suffix_cmp if suffix_cmp is not None else 0.0
+                    if abs(float(e_cmp) - float(s_cmp)) < st.branch_band:
+                        loser = int(eagle_tok if chosen_tok == suffix_tok
+                                    else suffix_tok)
+                        side = [loser]
+                        cap = min(int(st.branch_len),
+                                  int(st.worker.speculative_num_steps)
+                                  - 1 - depth)
+                        if cap > 0 and rid in st.active:
+                            try:
+                                ext = list(chain) + [loser]
+                                ctx2 = (list(ctx_tail)
+                                        + ext)[-st.cache.max_tree_depth:]
+                                with st.cache.temporary_extension(rid, ext):
+                                    d2 = st.cache.speculate(
+                                        rid, ctx2, max_spec_tokens=cap,
+                                        max_spec_factor=st.tail_factor,
+                                        min_token_prob=st.tail_min_prob,
+                                        use_tree_spec=False)
+                                if not d2.is_empty:
+                                    side += [int(x)
+                                             for x in d2.token_ids[:cap]]
+                            except Exception as e:
+                                st.warn_once("branch-speculate", str(e))
+                        st.branch_cands[r].append(
+                            {"depth": depth, "main_tok": int(chosen_tok),
+                             "side": side})
+                        rec["branch"] = True
 
         # PIN: log the GT comparison (oracle_hit/gt_token) for analysis WITHOUT
         # changing the served pick -- gt is precomputed when pin is active, so any
@@ -1375,6 +1677,177 @@ def _tail_append(st: _ChainHybridState, spec_info) -> None:
         })
 
 
+def _build_branch_tree_tensors(n_tokens, parent, depth_arr, seq_len, dev,
+                               dtypes):
+    """Verify tensors for an explicit (parent, depth) node list (bs=1).
+
+    Node 0 is the root; children keep insertion order (main-path child first,
+    then side heads), which fixes retrive_next_token (first child) and
+    retrive_next_sibling (next child of the same parent). Mask row i =
+    [ones(seq_len), ancestors-of-i (incl. self) over the node set], flattened
+    — the same layout _rebuild_chain_tensors produces for the linear case.
+    """
+    import torch
+    ndt = n_tokens
+    positions = torch.tensor([seq_len + d for d in depth_arr],
+                             dtype=dtypes["positions"], device=dev)
+    ri = torch.arange(ndt, dtype=dtypes["retrive"], device=dev).view(1, -1)
+    nxt = torch.full((1, ndt), -1, dtype=dtypes["retrive"], device=dev)
+    sib = torch.full((1, ndt), -1, dtype=dtypes["retrive"], device=dev)
+    kids: dict = {}
+    for i in range(1, ndt):
+        kids.setdefault(parent[i], []).append(i)
+    for p, ks in kids.items():
+        nxt[0, p] = ks[0]
+        for a, b in zip(ks, ks[1:]):
+            sib[0, a] = b
+    anc = torch.zeros(ndt, ndt, dtype=dtypes["mask"], device=dev)
+    for i in range(ndt):
+        j = i
+        while j >= 0:
+            anc[i, j] = 1
+            j = parent[j]
+    mask = torch.cat(
+        [torch.ones(ndt, seq_len, dtype=dtypes["mask"], device=dev), anc],
+        dim=1).flatten()
+    return positions, ri, nxt, sib, mask
+
+
+def _branch_append(st: _ChainHybridState, spec_info) -> None:
+    """Hang the collected branch candidates as verify SIBLINGS (tree surgery).
+
+    Runs after _tail_append (the current spec_info may already be
+    tail-extended; sides attach to HEAD nodes only). On any guard failure it
+    returns, leaving the linear verify input untouched.
+    """
+    import torch
+
+    if st.branch_m <= 0 or st.stash is None or st.branch_cands is None:
+        return
+    if len(st.stash) != 1:
+        st.warn_once("branch-bs>1", "branch append only supports bs=1; skip")
+        return
+    if getattr(spec_info, "topk", None) != 1:
+        return
+    rid, _ctx = st.stash[0]
+    cands = [c for c in (st.branch_cands[0] or []) if c.get("side")]
+    if not cands:
+        return
+
+    ndt_old = int(spec_info.draft_token_num)
+    if spec_info.draft_token.numel() != ndt_old:
+        st.warn_once("branch-shape", "draft_token numel != draft_token_num; "
+                                     "skip")
+        return
+    mask_numel = spec_info.custom_mask.numel()
+    if mask_numel % ndt_old != 0:
+        st.warn_once("branch-mask", "unexpected custom_mask size; skip")
+        return
+    seq_len = mask_numel // ndt_old - ndt_old
+    if seq_len <= 0 or seq_len != int(spec_info.seq_lens_sum):
+        st.warn_once("branch-seqlen", "mask-derived seq_len mismatch; skip")
+        return
+
+    total_side = sum(len(c["side"]) for c in cands)
+    alloc = getattr(st.worker, "token_to_kv_pool_allocator", None)
+    if alloc is not None:
+        try:
+            if alloc.available_size() < ndt_old + total_side + 64:
+                st.warn_once("branch-headroom", "KV pool nearly full; skip")
+                return
+        except Exception:
+            pass
+
+    dev = spec_info.draft_token.device
+    _ri = ("retrieve_index" if hasattr(spec_info, "retrieve_index")
+           else "retrive_index")
+    _nx = ("retrieve_next_token" if hasattr(spec_info, "retrieve_next_token")
+           else "retrive_next_token")
+    _sb = ("retrieve_next_sibling"
+           if hasattr(spec_info, "retrieve_next_sibling")
+           else "retrive_next_sibling")
+    dtypes = {
+        "positions": spec_info.positions.dtype,
+        "retrive": getattr(spec_info, _ri).dtype,
+        "mask": spec_info.custom_mask.dtype,
+    }
+
+    tokens = [int(x) for x in spec_info.draft_token.tolist()]
+    # Existing verify input is a linear chain (head + optional tail):
+    # node i's parent is i-1, node depth == i.
+    parent = [i - 1 for i in range(ndt_old)]
+    depth_arr = list(range(ndt_old))
+    n_steps = int(st.worker.speculative_num_steps)
+
+    new_tokens: list = []
+    used = []
+    for c in sorted(cands, key=lambda c: c["depth"]):
+        d = int(c["depth"])
+        node_main = d + 1                      # decision depth d -> node d+1
+        if node_main >= min(ndt_old, n_steps + 1):
+            continue
+        if tokens[node_main] != int(c["main_tok"]):
+            st.warn_once("branch-mismatch",
+                         "chain token != recorded main_tok; skip cand")
+            continue
+        side = [int(x) for x in c["side"]]
+        if side[0] == tokens[node_main]:
+            continue
+        base = ndt_old + len(new_tokens)
+        for j, t_ in enumerate(side):
+            parent.append((node_main - 1) if j == 0 else base + j - 1)
+            depth_arr.append(d + 1 + j)
+            new_tokens.append(t_)
+        used.append((c, base))
+    if not new_tokens:
+        return
+
+    ndt_new = ndt_old + len(new_tokens)
+    positions, ri, nxt, sib, mask = _build_branch_tree_tensors(
+        ndt_new, parent, depth_arr, seq_len, dev, dtypes)
+    spec_info.draft_token = torch.cat(
+        [spec_info.draft_token,
+         torch.tensor(new_tokens, dtype=spec_info.draft_token.dtype,
+                      device=dev)])
+    spec_info.positions = positions
+    setattr(spec_info, _ri, ri)
+    setattr(spec_info, _nx, nxt)
+    setattr(spec_info, _sb, sib)
+    spec_info.custom_mask = mask
+    spec_info.draft_token_num = ndt_new
+    # spec_steps already covers the longest path (head+tail); side paths are
+    # depth <= n_steps, so accept_index sizing needs no further bump.
+
+    # PIN/oracle gt override is indexed by VERIFY COLUMN; realign it to the
+    # new node order (side node at tree depth D reads the gt at depth D).
+    ov = getattr(st, "gt_predict_override", None)
+    if ov is not None and len(ov) == 1:
+        row = ov[0]
+        new_row = [row[i] if i < len(row) else -1 for i in range(ndt_old)]
+        for i in range(ndt_old, ndt_new):
+            dpt = depth_arr[i]
+            new_row.append(row[dpt] if dpt < len(row) else -1)
+        st.gt_predict_override = [new_row]
+
+    decode_step = st.decode_step.get(rid, 0)
+    # NOT type:"decision" — side rows carry no gt/eagle fields and share depths
+    # with head rows, so (rid, decode_step, depth)-grouped decision loaders
+    # (eagle_dist_probe, replay_ladder, calib fitters) must never see them.
+    for c, base in used:
+        for j, t_ in enumerate(c["side"]):
+            st.pending.append({
+                "type": "branch_side", "rid": rid,
+                "decode_step": decode_step, "depth": int(c["depth"]) + j,
+                "token": int(t_), "parent_depth": int(c["depth"]),
+                "side_index": j,
+            })
+    st.pending.append({
+        "type": "branch_meta", "rid": rid, "decode_step": decode_step,
+        "n_branches": len(used), "n_side_nodes": len(new_tokens),
+        "ndt": ndt_new,
+    })
+
+
 # ---------------------------------------------------------------------------
 # Draft wrapper: per-request context capture + lazy lifecycle
 # ---------------------------------------------------------------------------
@@ -1389,6 +1862,7 @@ def _patch_draft(eagle_worker) -> None:
             if batch.forward_mode.is_idle():
                 st.stash = None
                 st.chains = None
+                st.branch_cands = None
                 st.fallback_runs = None
                 st.fallback_meta = None
             else:
@@ -1397,6 +1871,7 @@ def _patch_draft(eagle_worker) -> None:
                     st.last_decisions = {}  # fresh per step (consumed post-verify)
                 stash = []
                 chains = []
+                bcands = []
                 fb_runs = []
                 fb_meta = []
                 gt_pos = []
@@ -1407,6 +1882,7 @@ def _patch_draft(eagle_worker) -> None:
                         # the forward hook dumps GT at request finish.
                         stash.append((rid, ()))
                         chains.append([])
+                        bcands.append([])
                         continue
                     if rid not in st.active:
                         try:
@@ -1450,6 +1926,7 @@ def _patch_draft(eagle_worker) -> None:
                            + list(req.output_ids))[-st.cache.max_tree_depth:]
                     stash.append((rid, ctx))
                     chains.append([])
+                    bcands.append([])
                     gt_pos.append(len(req.output_ids or []))
                     # score_fallback: ONE suffix run per step from the
                     # committed context (sim hybrid_e3 semantics: suffix iff
@@ -1483,6 +1960,9 @@ def _patch_draft(eagle_worker) -> None:
                         f"written batch-safe but only validated at bs=1")
                 st.stash = stash
                 st.chains = chains
+                st.branch_cands = (bcands if st.branch_m > 0
+                                   and st.mode not in ("record", "oracle")
+                                   else None)
                 st.fallback_runs = fb_runs if st.mode == "score_fallback" else None
                 st.fallback_meta = fb_meta if st.mode == "score_fallback" else None
                 st.gt_pos = (gt_pos if (st.mode == "oracle" or st.pin_active)
@@ -1513,17 +1993,42 @@ def _patch_draft(eagle_worker) -> None:
         except Exception as e:
             st.stash = None
             st.chains = None
+            st.branch_cands = None
             st.fallback_runs = None
             st.fallback_meta = None
             st.warn_once("draft-stash", str(e))
+        # Tail oversizes server speculative_num_draft_tokens (num_steps+1+tail_max)
+        # so the Mamba spec cache is big enough for the extended verify. But
+        # sglang's draft_forward -> eagle_utils.organize_draft_results does
+        # topk(score_list, speculative_num_draft_tokens - 1), and in chain mode
+        # (topk=1) score_list has only num_steps entries -> the oversized value
+        # overflows topk ("selected index k out of range"). Restore the REAL
+        # chain size for the draft only; _tail_append and the verify-time
+        # num_draft override both read spec_info.draft_token_num (not this
+        # attribute), and the Mamba cache was sized from server_args at startup,
+        # so this is safe. (Drift fix: older sglang passed num_steps+1 here.)
+        _saved_ndt = getattr(eagle_worker, "speculative_num_draft_tokens", None)
+        if st.tail_max > 0 and _saved_ndt is not None:
+            eagle_worker.speculative_num_draft_tokens = \
+                int(eagle_worker.speculative_num_steps) + 1
         try:
-            result = original_draft(batch)
+            try:
+                result = original_draft(batch)
+            finally:
+                if st.tail_max > 0 and _saved_ndt is not None:
+                    eagle_worker.speculative_num_draft_tokens = _saved_ndt
             if st.tail_max > 0 and st.stash is not None \
                     and st.mode != "record":
                 try:
                     _tail_append(st, result)
                 except Exception as e:
                     st.warn_once("tail", str(e))
+            if st.branch_m > 0 and st.stash is not None \
+                    and st.mode not in ("record", "oracle"):
+                try:
+                    _branch_append(st, result)
+                except Exception as e:
+                    st.warn_once("branch", str(e))
             if st.online is not None:
                 # draft_token_num gives the per-request stride into the verify
                 # logits (req_offset = i*num_draft) for the post-verify q join.
@@ -1532,6 +2037,7 @@ def _patch_draft(eagle_worker) -> None:
         finally:
             st.stash = None
             st.chains = None
+            st.branch_cands = None
             st.fallback_runs = None
             st.fallback_meta = None
             st.flush()
@@ -1563,6 +2069,11 @@ def _dump_gt(st: _ChainHybridState, req) -> None:
     try:
         with open(st.gt_out_path, "a") as f:
             f.write(json.dumps({
+                # rid tags each row so parallel/batched collection (interleaved
+                # append) is regroupable per request; input_ids is also a unique
+                # self-identifying key (each step's prompt is distinct), so the
+                # oracle/replay matching stays order-independent either way.
+                "rid": getattr(req, "rid", None),
                 "input_ids": [int(x) for x in req.origin_input_ids],
                 "output_ids": [int(x) for x in (req.output_ids or [])],
             }) + "\n")
@@ -1943,6 +2454,38 @@ def patch_chain_hybrid(eagle_worker: "EAGLEWorker") -> None:
         enable_undo=True,
     )
 
+    # Optional: PRE-WARM the global suffix tree with a corpus of complete
+    # responses before serving (SGLANG_CHAIN_HYBRID_SUFFIX_PREWARM=<jsonl>,
+    # one {"input_ids":[...], "output_ids":[...]} per line). The cache then
+    # matches against the whole corpus from step 0 instead of warming online —
+    # used to SERVE the "full corpus" suffix regime (incl self-match) for the
+    # chain-tail speedup study. The per-request local tree still builds
+    # incrementally during decode, so this is purely additive. Responses go in
+    # under throwaway __pw__ ids; stop_request retains them in the global tree.
+    _prewarm = os.environ.get("SGLANG_CHAIN_HYBRID_SUFFIX_PREWARM")
+    if _prewarm and os.path.exists(_prewarm):
+        _n = 0
+        try:
+            with open(_prewarm) as _f:
+                for _line in _f:
+                    try:
+                        _r = json.loads(_line)
+                    except Exception:
+                        continue
+                    _out = _r.get("output_ids") or []
+                    if not _out:
+                        continue
+                    _bg = f"__pw__{_n}"
+                    suffix_cache.start_request(_bg, _r.get("input_ids") or [])
+                    suffix_cache.add_active_response(_bg, list(_out))
+                    suffix_cache.stop_request(_bg)
+                    _n += 1
+        except Exception as _e:  # noqa: BLE001
+            logger.warning(f"chain-hybrid suffix PREWARM failed: {_e}")
+        logger.warning(
+            f"chain-hybrid suffix PREWARM: loaded {_n} complete responses into "
+            f"the global suffix tree from {_prewarm}")
+
     log_path = os.environ.get(
         "SGLANG_CHAIN_HYBRID_LOG", "/tmp/sglang_chain_hybrid_decisions.jsonl")
 
@@ -1990,6 +2533,42 @@ def patch_chain_hybrid(eagle_worker: "EAGLEWorker") -> None:
                 f"spec cache (num_draft_tokens={server_ndt} >= {need}). "
                 "EXPERIMENTAL — sanity-check accept lengths.")
 
+    # Cross-proposer branch config: SGLANG_CHAIN_HYBRID_BRANCH="band,m[,len]"
+    # (select1_branch arm; unset/m=0 = off). Shares the tail surgery
+    # constraints: bs=1 + a target attention backend with num_draft_tokens.
+    branch_band, branch_m, branch_len = 0.3, 0, 16
+    _br = os.environ.get("SGLANG_CHAIN_HYBRID_BRANCH")
+    if _br:
+        _parts = _br.split(",")
+        branch_band = float(_parts[0])
+        branch_m = int(_parts[1]) if len(_parts) > 1 else 1
+        if len(_parts) > 2:
+            branch_len = int(_parts[2])
+    if branch_m > 0:
+        if getattr(eagle_worker.server_args, "max_running_requests", None) != 1:
+            raise RuntimeError(
+                "SGLANG_CHAIN_HYBRID_BRANCH requires --max-running-requests 1 "
+                "(branch tensor surgery only supports bs=1).")
+        _backend = _resolve_target_attn_backend(eagle_worker)
+        if not hasattr(_backend, "num_draft_tokens"):
+            raise RuntimeError(
+                "SGLANG_CHAIN_HYBRID_BRANCH requires a target attention "
+                "backend exposing num_draft_tokens (triton); got "
+                f"{type(_backend).__name__}.")
+        if hasattr(_backend, "linear_attn_backend") or hasattr(
+                eagle_worker.target_worker.model_runner.attn_backend,
+                "linear_attn_backend"):
+            server_ndt = int(getattr(
+                eagle_worker.server_args, "speculative_num_draft_tokens", 0) or 0)
+            need = (int(eagle_worker.speculative_num_steps) + 1 + tail_max
+                    + branch_m * branch_len)
+            if server_ndt < need:
+                raise RuntimeError(
+                    "SGLANG_CHAIN_HYBRID_BRANCH on Mamba-hybrid needs the mamba "
+                    f"spec cache oversized: server num_draft_tokens={server_ndt}"
+                    f" < num_steps+1+tail_max+m*len={need}. Re-launch with "
+                    f"--speculative-num-draft-tokens {need}.")
+
     # Decision mode (default per-depth select-1). "score_fallback" mirrors
     # the simulator's hybrid_e3:t baseline; "record" dumps GT trajectories;
     # "oracle" is the per-depth selection ceiling driven by a GT dump.
@@ -2008,6 +2587,9 @@ def patch_chain_hybrid(eagle_worker: "EAGLEWorker") -> None:
         tail_min_prob=tail_min_prob, tail_check=tail_check,
         mode=mode, score_threshold=score_threshold,
         fb_factor=fb_factor, fb_min_prob=fb_min_prob)
+    _STATE.branch_band = branch_band
+    _STATE.branch_m = branch_m
+    _STATE.branch_len = branch_len
 
     # Optional TRAJECTORY PIN. SGLANG_CHAIN_HYBRID_PIN points at a standalone
     # gt_tokens.jsonl; when set on a select1/score_fallback arm, the committed
@@ -2097,6 +2679,18 @@ def patch_chain_hybrid(eagle_worker: "EAGLEWorker") -> None:
     else:
         _DISC = None
 
+    # Transparent hand-rule linear boundary (overrides the suffix_cmp>eagle_cmp test
+    # when set, but not _DISC). suffix iff suffix_p > A*eagle_p + B.
+    global _HANDRULE
+    _ha = os.environ.get("SGLANG_CHAIN_HYBRID_HANDRULE_A")
+    if _ha is not None:
+        _HANDRULE = (float(_ha),
+                     float(os.environ.get("SGLANG_CHAIN_HYBRID_HANDRULE_B", "0.0")))
+        calib_desc = (f"hand-rule (suffix iff suffix_p > {_HANDRULE[0]}*eagle_p "
+                      f"+ {_HANDRULE[1]})")
+    else:
+        _HANDRULE = None
+
     _install_select_wrapper()
     _STATE.log_eagle_dist = (
         os.environ.get("SGLANG_CHAIN_HYBRID_LOG_EAGLE_DIST", "0") == "1")
@@ -2106,11 +2700,27 @@ def patch_chain_hybrid(eagle_worker: "EAGLEWorker") -> None:
         _install_verify_greedy_oracle()
     _patch_draft(eagle_worker)
     _patch_forward(eagle_worker)
-    if tail_max > 0:
+    # 27B 3-way: DFlash as in-process aux (installed AFTER _patch_forward so its
+    # forward wrapper is outermost and sees the committed output_ids). Gated.
+    _STATE._dfa_enabled = os.environ.get("SGLANG_CHAIN_HYBRID_DFLASH_AUX") == "1"
+    # 3-way select rule: raw argmax-prob (default) vs consensus-first->dominant vs
+    # SEL3 calibrated argmax (per-proposer bayes/calib bundle).
+    _STATE._consensus_first = os.environ.get("SGLANG_CHAIN_HYBRID_CONSENSUS") == "1"
+    global _SEL3
+    sel3_path = os.environ.get("SGLANG_CHAIN_HYBRID_SEL3")
+    if sel3_path:
+        sel3_method = os.environ.get("SGLANG_CHAIN_HYBRID_SEL3_METHOD", "gbm")
+        _SEL3 = _Sel3Selector.load(sel3_path, sel3_method)
+        print(f"[chain_hybrid] 3-way SEL3 calibrated selector: method={sel3_method} "
+              f"main={_SEL3.main_name} path={sel3_path}", flush=True)
+    if _STATE._dfa_enabled:
+        _install_dflash_aux(eagle_worker, _STATE)
+    if tail_max > 0 or branch_m > 0:
         _patch_verify_for_tail(eagle_worker)
         _patch_draft_extend_for_tail(eagle_worker)
         tail_desc = (f"tail=on (T_max={tail_max}, factor={tail_factor}, "
-                     f"min_p={tail_min_prob}, check={tail_check})")
+                     f"min_p={tail_min_prob}, check={tail_check})"
+                     if tail_max > 0 else "tail=off")
     else:
         tail_desc = "tail=off"
 
@@ -2135,8 +2745,10 @@ def patch_chain_hybrid(eagle_worker: "EAGLEWorker") -> None:
     if _STATE.pin_active:
         mode_desc += (f" [PINNED to {len(_STATE.gt_map)} standalone "
                       f"trajectories from {pin_path}]")
+    branch_desc = (f"branch=on (band={branch_band}, m={branch_m}, "
+                   f"len={branch_len})" if branch_m > 0 else "branch=off")
     logger.info(
-        f"Chain-hybrid patch applied: {mode_desc}, {tail_desc}, "
+        f"Chain-hybrid patch applied: {mode_desc}, {tail_desc}, {branch_desc}, "
         f"steps={eagle_worker.speculative_num_steps}, "
         f"decision log -> {log_path}")
 
@@ -2444,6 +3056,41 @@ def _decide_block_dflash(st, dt_gpu, dt_cpu, dfp_2d, bs, b):
                 except Exception as ex:
                     st.warn_once("e3-seed", str(ex))
                     e3 = None
+        # HAND-OFF: precompute the head length k* = run of leading depths whose
+        # DFlash confidence dflash_p >= a*. a*(t) = T(t)/(1+T(t)), where the tail
+        # value T(t) is the SUFFIX RUN SCORE at this position (a b-1-token suffix
+        # speculation; its score == the expected accepted tail length). depths
+        # [0,k*) stay DFlash (head); depths [k*, b-1) are filled by the suffix
+        # tail (chain-conditioned, in the loop below).
+        kstar = b - 1
+        if getattr(st, "handoff", False):
+            if st.handoff_fixed_astar is not None:
+                a_star = st.handoff_fixed_astar
+                T_est = None
+            else:
+                T_est = 0.0
+                if rid in st.active:
+                    try:
+                        ctxr = list(ctx_tail)[-st.cache.max_tree_depth:]
+                        rd = st.cache.speculate(
+                            rid, ctxr, max_spec_tokens=max(1, b - 1),
+                            max_spec_factor=4.0, min_token_prob=0.0,
+                            use_tree_spec=False)
+                        T_est = float(getattr(rd, "score", 0.0) or 0.0)
+                    except Exception as _e:
+                        st.warn_once("handoff-Tscore", str(_e))
+                a_star = T_est / (1.0 + T_est)
+            st._handoff_last = {"a_star": round(float(a_star), 4),
+                                "T": (round(float(T_est), 3)
+                                      if T_est is not None else None)}
+            kstar = 0
+            if dfp_2d is not None:
+                _dmax = min(b - 1, dfp_2d.shape[1])
+                for _d in range(_dmax):
+                    if float(dfp_2d[r, _d]) >= a_star:
+                        kstar += 1
+                    else:
+                        break
         for bp in range(1, b):
             depth = bp - 1
             eagle_tok = int(dt_cpu[r, bp])
@@ -2585,6 +3232,31 @@ def _decide_block_dflash(st, dt_gpu, dt_cpu, dfp_2d, bs, b):
                 if best_tok != eagle_tok:
                     dt_gpu[r, bp] = best_tok
                 chain.append(best_tok)
+                recs_by_depth[depth] = rec
+                st.pending.append(rec)
+                continue
+
+            # HAND-OFF (Extension O3-deployable): depths [0,k*) keep the DFlash
+            # head; depths [k*, b-1) take the suffix tail token (chain-conditioned
+            # suffix speculation already ran above with the growing chain, so this
+            # is a genuine suffix continuation, not a per-depth contest).
+            if getattr(st, "handoff", False):
+                if depth < kstar:
+                    chosen_tok = eagle_tok
+                elif suffix_tok is not None:
+                    chosen_tok = suffix_tok
+                    dt_gpu[r, bp] = suffix_tok
+                    rec["chosen"] = "suffix"
+                else:
+                    chosen_tok = eagle_tok   # no suffix available -> keep DFlash
+                rec["agreement"] = (suffix_tok == eagle_tok
+                                    if suffix_tok is not None else None)
+                rec["handoff_kstar"] = int(kstar)
+                _hl = getattr(st, "_handoff_last", None)
+                if _hl is not None:
+                    rec["handoff_astar"] = _hl.get("a_star")
+                    rec["handoff_T"] = _hl.get("T")
+                chain.append(chosen_tok)
                 recs_by_depth[depth] = rec
                 st.pending.append(rec)
                 continue
@@ -2911,6 +3583,33 @@ def patch_chain_hybrid_dflash(worker) -> None:
         max_spec_factor=1.0, max_spec_offset=0.0, min_token_prob=0.1,
         use_tree_spec=False, enable_undo=True)
 
+    # PRE-WARM the global suffix tree with a corpus before serving (same as the
+    # EAGLE path) — serves the full/LOO suffix regime for the DFlash+suffix
+    # speedup study. SGLANG_CHAIN_HYBRID_SUFFIX_PREWARM=<jsonl {input_ids,output_ids}>.
+    _prewarm = os.environ.get("SGLANG_CHAIN_HYBRID_SUFFIX_PREWARM")
+    if _prewarm and os.path.exists(_prewarm):
+        _n = 0
+        try:
+            with open(_prewarm) as _f:
+                for _line in _f:
+                    try:
+                        _r = json.loads(_line)
+                    except Exception:
+                        continue
+                    _out = _r.get("output_ids") or []
+                    if not _out:
+                        continue
+                    _bg = f"__pw__{_n}"
+                    suffix_cache.start_request(_bg, _r.get("input_ids") or [])
+                    suffix_cache.add_active_response(_bg, list(_out))
+                    suffix_cache.stop_request(_bg)
+                    _n += 1
+        except Exception as _e:  # noqa: BLE001
+            logger.warning(f"chain-hybrid(dflash) suffix PREWARM failed: {_e}")
+        logger.warning(
+            f"chain-hybrid(dflash) suffix PREWARM: loaded {_n} complete "
+            f"responses into the global suffix tree from {_prewarm}")
+
     log_path = os.environ.get(
         "SGLANG_CHAIN_HYBRID_LOG",
         "/tmp/sglang_chain_hybrid_dflash_decisions.jsonl")
@@ -2924,6 +3623,33 @@ def patch_chain_hybrid_dflash(worker) -> None:
     _STATE._dflash_recidx = {}
     _STATE._dflash_gtpos = {}
     _STATE._dflash_p_flat = None
+
+    # HAND-OFF mode (the Extension O3-deployable rule): instead of per-depth
+    # select-1, extend the DFlash HEAD while its confidence a_k=dflash_p >= a*
+    # (a* = T/(1+T), T = tail value estimate), then hand off to a SUFFIX tail for
+    # the rest of the block. SGLANG_CHAIN_HYBRID_HANDOFF=1 enables it; a* comes
+    # from SGLANG_CHAIN_HYBRID_HANDOFF_ASTAR or, if unset, T via
+    # SGLANG_CHAIN_HYBRID_HANDOFF_T (a*=T/(1+T)).
+    _STATE.handoff = os.environ.get("SGLANG_CHAIN_HYBRID_HANDOFF") == "1"
+    _ha = os.environ.get("SGLANG_CHAIN_HYBRID_HANDOFF_ASTAR")
+    _hT = os.environ.get("SGLANG_CHAIN_HYBRID_HANDOFF_T")
+    # DEFAULT: per-position T(t) = the suffix run's score (expected tail length,
+    # validated: a b-1-token suffix run returns score == expected accepted tail
+    # length). a*(t) = T(t)/(1+T(t)). A fixed T or a* (env) is an ablation
+    # override that pins a*(t) to a constant for all positions.
+    _STATE.handoff_fixed_astar = None
+    if _ha is not None:
+        _STATE.handoff_fixed_astar = float(_ha)
+    elif _hT is not None:
+        _t = float(_hT)
+        _STATE.handoff_fixed_astar = _t / (1.0 + _t)
+    if _STATE.handoff:
+        _mode = (f"FIXED a*={_STATE.handoff_fixed_astar:.4f}"
+                 if _STATE.handoff_fixed_astar is not None
+                 else "per-position a*=T/(1+T), T=suffix run score")
+        logger.warning(
+            f"chain-hybrid(dflash) HAND-OFF mode ({_mode}): extend DFlash head "
+            f"while dflash_p >= a*, then suffix tail.")
 
     # Trajectory PIN (select1/calib/disc arms): force committed tokens onto a
     # standalone GT dump so every arm follows the identical trajectory. oracle

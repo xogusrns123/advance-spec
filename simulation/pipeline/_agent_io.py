@@ -1,4 +1,4 @@
-"""Shared helpers for reading Stage 1 agent_results JSON and reconstructing
+"""Shared helpers for reading Stage 1 agent_trajectory JSON and reconstructing
 per-call token/tree data + prompt ids for the downstream pipeline stages.
 
 Used by:

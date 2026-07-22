@@ -23,7 +23,7 @@ per-method local_cache).
 
 Usage:
   python3 -m simulation.evaluation.analyze_extension_synergy \\
-      --agent-results .../agent_results_eagle3.json \\
+      --agent-trajectory .../agent_results_eagle3.json \\
       --dataset .../dataset.jsonl \\
       --model Qwen/Qwen3-14B \\
       --budget 64 --steps 2 --topk 16 --F 4.0 --T 0.0 \\
@@ -175,7 +175,7 @@ def aggregate(a_e: np.ndarray, a_s: np.ndarray, a_ext: np.ndarray) -> dict:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--agent-results", required=True)
+    ap.add_argument("--agent-trajectory", required=True)
     ap.add_argument("--dataset", default=None)
     ap.add_argument("--responses", default=None)
     ap.add_argument("--model", default="Qwen/Qwen3-14B")
@@ -190,10 +190,10 @@ def main():
                     help="omit per-step arrays (smaller output)")
     args = ap.parse_args()
 
-    print(f"Loading capture: {args.agent_results}", file=sys.stderr)
+    print(f"Loading capture: {args.agent_trajectory}", file=sys.stderr)
     t0 = time.time()
     records = assemble_records_from_artifacts(
-        agent_results_path=args.agent_results,
+        agent_trajectory_path=args.agent_trajectory,
         dataset_path=args.dataset,
         responses_path=args.responses,
         model=args.model,
@@ -213,7 +213,7 @@ def main():
 
     out = {
         "metadata": {
-            "agent_results": args.agent_results,
+            "agent_trajectory": args.agent_trajectory,
             "dataset": args.dataset,
             "model": args.model,
             "budget": args.budget,

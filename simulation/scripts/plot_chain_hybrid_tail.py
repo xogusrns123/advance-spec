@@ -4,7 +4,7 @@
 Inputs (out_dir = simulation/results/chain_hybrid_tail):
   run_s16_tail.json            arm headline metrics (accept_length_mean, ...)
   timing_<arm>.jsonl           per-step decode records with accept_lengths
-  agent_results_<arm>.json     agent step metrics (completion_tokens, latency_s)
+  agent_trajectory_<arm>.json     agent step metrics (completion_tokens, latency_s)
   agent_results_vanilla.json   vanilla (no-spec) reference for speedup
 
 Outputs (out_dir/figures):
@@ -162,7 +162,7 @@ def main() -> None:
         van_tps, van_tok, van_lat = agent_throughput(van_path)
         rows = []
         for a in ARMS:
-            ares = out_dir / f"agent_results_{a}.json"
+            ares = out_dir / f"agent_trajectory_{a}.json"
             tps, tok, lat = agent_throughput(ares)
             rows.append((a, tps, tps / van_tps))
         fig, ax = plt.subplots(figsize=(7.2, 4.4))

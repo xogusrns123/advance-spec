@@ -209,7 +209,7 @@ python -m <agent_module> \
 ## 6. Resume 동작
 
 각 agent 가 자체 checkpoint 패턴을 갖는다 (`save_results.py`:
-`save_agent_results`, `load_checkpoint`, `done_ids`, `append_to_checkpoint`,
+`save_agent_trajectory`, `load_checkpoint`, `done_ids`, `append_to_checkpoint`,
 `finalize_checkpoint`):
 
 - partial 산출 = `agent_results_eagle3.json.partial` 에 append

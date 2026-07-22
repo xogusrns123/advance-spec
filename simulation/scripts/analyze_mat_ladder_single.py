@@ -74,6 +74,51 @@ def single_proposer_mat(oracle_path, clean):
     return sum(Ld) / max(len(Ld), 1), sum(Ls) / max(len(Ls), 1)
 
 
+def roundrobin_mat(oracle_path, clean):
+    """Simulate BLIND round-robin (no-score alternation) accept length from the
+    oracle log: at each depth the chosen proposer is set purely by depth parity
+    (eagle/suffix), NOT by any score. A proposer with no candidate at that depth
+    (e.g. suffix made no match) can't be forced, so we fall back to the only
+    available one. A depth is accepted iff the chosen proposer's token == gt
+    (read from oracle_hit); the chain stops at the first miss. Averaged over both
+    starting phases to remove the arbitrary-start artifact. Same counterfactual
+    family as single_proposer_mat (draft-only / suffix-only) — this is the
+    "does selection beat blind alternation?" floor the MAT ladder was missing."""
+    chains = defaultdict(list); dec_n = defaultdict(int)
+    for line in open(oracle_path):
+        line = line.strip()
+        if not line: continue
+        o = json.loads(line)
+        if o.get("type") == "decision" and not o.get("tail"):
+            chains[(o["rid"], o["decode_step"])].append(o); dec_n[str(o["rid"])] += 1
+    exclude = {r for r, c in dec_n.items() if c > RUNAWAY_MIN} if clean else set()
+    for k in chains: chains[k].sort(key=lambda r: r["depth"])
+
+    def run(start):
+        Ls = []
+        for (rid, ds), rs in chains.items():
+            if str(rid) in exclude: continue
+            acc = 0
+            for i, r in enumerate(rs):
+                want_suffix = ((i + start) % 2 == 1)
+                has_e = r.get("eagle_token") is not None
+                has_s = r.get("suffix_token") is not None
+                if want_suffix and has_s: chosen = "suffix"
+                elif (not want_suffix) and has_e: chosen = "eagle"
+                elif has_e: chosen = "eagle"      # scheduled proposer absent ->
+                elif has_s: chosen = "suffix"     # fall back to the only candidate
+                else: break                       # no proposal at all this depth
+                h = r.get("oracle_hit")
+                hit = (h in ("eagle", "both")) if chosen == "eagle" \
+                    else (h in ("suffix", "both"))
+                if hit: acc += 1
+                else: break
+            Ls.append(acc)
+        return sum(Ls) / max(len(Ls), 1)
+
+    return 0.5 * (run(0) + run(1))
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser()
@@ -83,23 +128,26 @@ def main():
     for key, c in items:
         d = c["dir"]
         draft_color = ROLE[c["draft"]]
-        colors = [draft_color, ROLE["suffix"], ROLE["raw"], ROLE["histogram"],
-                  ROLE["isotonic"], ROLE["logistic"], ROLE["beta"], ROLE["oracle"]]
-        labels = [f"{c['draft']}\nonly", "suffix\nonly", "raw\n(sp>ep)",
-                  "calib\nhistogram", "calib\nisotonic", "calib\nlogistic",
-                  "calib\nbeta", "oracle\n(GT)"]
+        colors = [draft_color, ROLE["suffix"], ROLE["roundrobin"], ROLE["raw"],
+                  ROLE["histogram"], ROLE["isotonic"], ROLE["logistic"],
+                  ROLE["beta"], ROLE["oracle"]]
+        labels = [f"{c['draft']}\nonly", "suffix\nonly", "round\nrobin",
+                  "raw\n(sp>ep)", "calib\nhistogram", "calib\nisotonic",
+                  "calib\nlogistic", "calib\nbeta", "oracle\n(GT)"]
         cl = False  # include all tasks
-        draft_mat, suffix_mat = single_proposer_mat(f"{d}/decisions_select1_oracle.jsonl", cl)
+        oracle_log = f"{d}/decisions_select1_oracle.jsonl"
+        draft_mat, suffix_mat = single_proposer_mat(oracle_log, cl)
+        rr = roundrobin_mat(oracle_log, cl)
         raw = served_mat(f"{d}/decisions_select1.jsonl", cl)
         calibs = [served_mat(f"{d}/decisions_select1_calib_{m}_cond-trained.jsonl", cl) for m in CALIB]
-        oracle = served_mat(f"{d}/decisions_select1_oracle.jsonl", cl)
-        vals = [draft_mat, suffix_mat, raw] + calibs + [oracle]
+        oracle = served_mat(oracle_log, cl)
+        vals = [draft_mat, suffix_mat, rr, raw] + calibs + [oracle]
         print(f"=== {key} {c['title']} (all 20 tasks) ===  " +
               "  ".join(f"{l.replace(chr(10),' ')}={v:.3f}" for l, v in zip(labels, vals)))
         ladder_bar(vals, labels, "MAT (per-step accept length)",
-                   f"MAT: single-proposer vs select-1 (raw / calibration ×4 / oracle)\n"
-                   f"({c['title']}, all 20 tasks incl. 42/44; single-proposer = sim)",
-                   f"{FIGDIR}/{c['out']}", fmt="{:.3f}", colors=colors, star_idx=7)
+                   f"MAT: single-proposer / round-robin vs select-1 (raw / calibration ×4 / oracle)\n"
+                   f"({c['title']}, all 20 tasks incl. 42/44; single-proposer & round-robin = sim)",
+                   f"{FIGDIR}/{c['out']}", fmt="{:.3f}", colors=colors, star_idx=8)
 
 
 if __name__ == "__main__":

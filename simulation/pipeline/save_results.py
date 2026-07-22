@@ -95,7 +95,7 @@ def append_to_checkpoint(output_path: str | os.PathLike, question: dict,
 
 def finalize_checkpoint(output_path: str | os.PathLike,
                         metadata: dict | None = None) -> dict | None:
-    """Move the partial to the final path via save_agent_results.
+    """Move the partial to the final path via save_agent_trajectory.
 
     Returns the saved dict, or None if no checkpoint existed.
     """
@@ -104,7 +104,7 @@ def finalize_checkpoint(output_path: str | os.PathLike,
         return None
     if metadata:
         cp["metadata"] = metadata
-    save_agent_results(cp, output_path)
+    save_agent_trajectory(cp, output_path)
     try:
         checkpoint_path(output_path).unlink()
     except FileNotFoundError:
@@ -112,7 +112,7 @@ def finalize_checkpoint(output_path: str | os.PathLike,
     return cp
 
 
-def save_agent_results(data: dict, output_path: str) -> None:
+def save_agent_trajectory(data: dict, output_path: str) -> None:
     """Save agent results as two files:
 
     1. {name}.json — full data with oracle entries (for pipeline)

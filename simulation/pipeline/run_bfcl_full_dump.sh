@@ -21,8 +21,8 @@ run_one() {
   echo "[run] BFCLv4 (s=$s, k=16, B=64) basic extension, force-1"
   cd $ROOT && SIM_FORCE_ADVANCE_1=1 SIM_PER_STEP_JSONL=$dump \
     python3 -m simulation.evaluation.run_tree_oracle_sim \
-      --agent-results $CAP_DIR/agent_results_eagle3.json \
-      --latency-config $CAP_DIR/latency_config.json \
+      --agent-trajectory $CAP_DIR/agent_results_eagle3.json \
+      --latency-data $CAP_DIR/latency_data.json \
       --exclude $STEP_ROOT/_exclude/bfcl_v4.txt \
       --methods 'extension:4.0:0.0' \
       --budgets 64 \

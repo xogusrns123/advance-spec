@@ -1,6 +1,6 @@
 """Build per-benchmark exclude files for first-10-task sim runs.
 
-For each benchmark, reads the captured agent_results to enumerate all
+For each benchmark, reads the captured agent_trajectory to enumerate all
 request_ids and the _completed.tsv from step_dataset to identify our
 already-processed 10 tasks. Writes an exclude file listing all OTHER
 request_ids (= every task EXCEPT our chosen 10).

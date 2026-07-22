@@ -35,7 +35,7 @@ Output: gzipped JSONL, one row per position:
 
 Usage (inside sglang-bench container, from /workspace):
   python3 -m simulation.scripts.experiments.extract_signal_features \
-      --agent-results .../bfcl_v4_steps16_topk1_capture/agent_results_eagle3.json \
+      --agent-trajectory .../bfcl_v4_steps16_topk1_capture/agent_results_eagle3.json \
       --dataset data/bfcl_agent/dataset_stratified_interleaved.jsonl \
       --model Qwen/Qwen3-14B \
       --output simulation/results/calib_verify/features_14b.jsonl.gz
@@ -176,7 +176,7 @@ def _suffix_cols(token_ids, parents, counts, probs, gt):
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--agent-results", required=True)
+    ap.add_argument("--agent-trajectory", required=True)
     ap.add_argument("--dataset", required=True)
     ap.add_argument("--model", default="Qwen/Qwen3-14B")
     ap.add_argument("--output", required=True)
@@ -206,8 +206,8 @@ def main() -> None:
         assemble_records_from_artifacts,
     )
     records = assemble_records_from_artifacts(
-        agent_results_path=args.agent_results, suffix_drafts_path=None,
-        draft_model_drafts_path=None, mtp_agent_results_path=None,
+        agent_trajectory_path=args.agent_trajectory, suffix_drafts_path=None,
+        draft_model_drafts_path=None, mtp_agent_trajectory_path=None,
         exclude_path=None, model=args.model, dataset_path=args.dataset,
         responses_path=None,
         eagle3_reslice=(args.capture_steps, args.capture_topk,

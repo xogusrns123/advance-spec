@@ -9,7 +9,7 @@
 # Prerequisites (done by caller):
 #   - data/swebench/dataset.jsonl has ≥4 instances
 #   - data/swebench/repos_steps{2,4,6,8}/ each hold the full repo set
-#   - simulation/results/qwen3_8b/latency_config.json pre-seeded
+#   - simulation/results/qwen3_8b/latency_data.json pre-seeded
 #
 # Usage:
 #   bash simulation/scripts/drive_qwen3_8b_swebench_steps_parallel.sh

@@ -1,6 +1,6 @@
 """Trace anchor prediction quality (independent of dedup).
 
-For each per-step record in an agent_results capture, runs the extension
+For each per-step record in an agent_trajectory capture, runs the extension
 speculate logic and records, per anchor:
   * depth (in base tree; root anchor uses depth=0 sentinel)
   * path_p_t (cumulative EAGLE3 draft path probability at the anchor's
@@ -21,7 +21,7 @@ for designing a keep/drop filter on anchors.
 
 Usage:
     python3 -m simulation.scripts.trace_accepted_extension \
-        --agent-results <path> \
+        --agent-trajectory <path> \
         --budget 128 --F 4.0 --T 0.0 \
         --max-records 5000 --output trace.json
 """
@@ -245,7 +245,7 @@ def stats(values):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--agent-results", required=True)
+    ap.add_argument("--agent-trajectory", required=True)
     ap.add_argument("--budget", type=int, default=32)
     ap.add_argument("--F", type=float, default=4.0)
     ap.add_argument("--T", type=float, default=0.0)
@@ -266,9 +266,9 @@ def main():
                           args.reslice_steps, args.reslice_topk)
         print(f"Reslice: {eagle3_reslice}", file=sys.stderr)
 
-    print(f"Assembling records from {args.agent_results} ...", file=sys.stderr)
+    print(f"Assembling records from {args.agent_trajectory} ...", file=sys.stderr)
     records = assemble_records_from_artifacts(
-        agent_results_path=args.agent_results,
+        agent_trajectory_path=args.agent_trajectory,
         model=args.model,
         dataset_path=args.dataset,
         responses_path=args.responses,
@@ -337,7 +337,7 @@ def main():
 
     out = {
         "config": {"budget": args.budget, "F": args.F, "T": args.T,
-                   "agent_results": args.agent_results,
+                   "agent_trajectory": args.agent_trajectory,
                    "n_records_processed": n_records_processed,
                    "n_total_steps": n_total_steps},
         "considered_all": {k: stats(v) for k, v in considered.items()},

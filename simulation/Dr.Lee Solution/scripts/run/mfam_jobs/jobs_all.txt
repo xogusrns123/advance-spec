@@ -1,0 +1,265 @@
+specbench hs30_rawtail --head-cal scale --head-scale 3.0 --tail-cal raw
+bfcl hs30_rawtail --head-cal scale --head-scale 3.0 --tail-cal raw
+swebench hs30_rawtail --head-cal scale --head-scale 3.0 --tail-cal raw
+spider hs30_rawtail --head-cal scale --head-scale 3.0 --tail-cal raw
+tau2 hs30_rawtail --head-cal scale --head-scale 3.0 --tail-cal raw
+specbench hs40_rawtail --head-cal scale --head-scale 4.0 --tail-cal raw
+bfcl hs40_rawtail --head-cal scale --head-scale 4.0 --tail-cal raw
+swebench hs40_rawtail --head-cal scale --head-scale 4.0 --tail-cal raw
+spider hs40_rawtail --head-cal scale --head-scale 4.0 --tail-cal raw
+tau2 hs40_rawtail --head-cal scale --head-scale 4.0 --tail-cal raw
+specbench hs50_rawtail --head-cal scale --head-scale 5.0 --tail-cal raw
+bfcl hs50_rawtail --head-cal scale --head-scale 5.0 --tail-cal raw
+swebench hs50_rawtail --head-cal scale --head-scale 5.0 --tail-cal raw
+spider hs50_rawtail --head-cal scale --head-scale 5.0 --tail-cal raw
+tau2 hs50_rawtail --head-cal scale --head-scale 5.0 --tail-cal raw
+specbench rawhead_fix001 --head-cal raw --tail-cal fixed --tail-scale 0.01
+bfcl rawhead_fix001 --head-cal raw --tail-cal fixed --tail-scale 0.01
+swebench rawhead_fix001 --head-cal raw --tail-cal fixed --tail-scale 0.01
+spider rawhead_fix001 --head-cal raw --tail-cal fixed --tail-scale 0.01
+tau2 rawhead_fix001 --head-cal raw --tail-cal fixed --tail-scale 0.01
+specbench rawhead_fix002 --head-cal raw --tail-cal fixed --tail-scale 0.02
+bfcl rawhead_fix002 --head-cal raw --tail-cal fixed --tail-scale 0.02
+swebench rawhead_fix002 --head-cal raw --tail-cal fixed --tail-scale 0.02
+spider rawhead_fix002 --head-cal raw --tail-cal fixed --tail-scale 0.02
+tau2 rawhead_fix002 --head-cal raw --tail-cal fixed --tail-scale 0.02
+specbench rawhead_fix003 --head-cal raw --tail-cal fixed --tail-scale 0.03
+bfcl rawhead_fix003 --head-cal raw --tail-cal fixed --tail-scale 0.03
+swebench rawhead_fix003 --head-cal raw --tail-cal fixed --tail-scale 0.03
+spider rawhead_fix003 --head-cal raw --tail-cal fixed --tail-scale 0.03
+tau2 rawhead_fix003 --head-cal raw --tail-cal fixed --tail-scale 0.03
+specbench h25w003 --head-cal scale --head-scale 2.5 --tail-cal fixed --tail-scale 0.03
+bfcl h25w003 --head-cal scale --head-scale 2.5 --tail-cal fixed --tail-scale 0.03
+swebench h25w003 --head-cal scale --head-scale 2.5 --tail-cal fixed --tail-scale 0.03
+spider h25w003 --head-cal scale --head-scale 2.5 --tail-cal fixed --tail-scale 0.03
+tau2 h25w003 --head-cal scale --head-scale 2.5 --tail-cal fixed --tail-scale 0.03
+specbench h25w005 --head-cal scale --head-scale 2.5 --tail-cal fixed --tail-scale 0.05
+bfcl h25w005 --head-cal scale --head-scale 2.5 --tail-cal fixed --tail-scale 0.05
+swebench h25w005 --head-cal scale --head-scale 2.5 --tail-cal fixed --tail-scale 0.05
+spider h25w005 --head-cal scale --head-scale 2.5 --tail-cal fixed --tail-scale 0.05
+tau2 h25w005 --head-cal scale --head-scale 2.5 --tail-cal fixed --tail-scale 0.05
+specbench rawhead_succ --head-cal raw --tail-cal succession
+bfcl rawhead_succ --head-cal raw --tail-cal succession
+swebench rawhead_succ --head-cal raw --tail-cal succession
+spider rawhead_succ --head-cal raw --tail-cal succession
+tau2 rawhead_succ --head-cal raw --tail-cal succession
+specbench onl_beta_raw_w8k --online-calib --online-window 8000 --online-refit 200 --online-head beta --online-tail raw
+bfcl onl_beta_raw_w8k --online-calib --online-window 8000 --online-refit 200 --online-head beta --online-tail raw
+swebench onl_beta_raw_w8k --online-calib --online-window 8000 --online-refit 200 --online-head beta --online-tail raw
+spider onl_beta_raw_w8k --online-calib --online-window 8000 --online-refit 200 --online-head beta --online-tail raw
+tau2 onl_beta_raw_w8k --online-calib --online-window 8000 --online-refit 200 --online-head beta --online-tail raw
+specbench onl_beta_raw_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head beta --online-tail raw
+bfcl onl_beta_raw_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head beta --online-tail raw
+swebench onl_beta_raw_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head beta --online-tail raw
+spider onl_beta_raw_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head beta --online-tail raw
+tau2 onl_beta_raw_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head beta --online-tail raw
+specbench onl_beta_raw_w4k --online-calib --online-window 4000 --online-refit 200 --online-head beta --online-tail raw
+bfcl onl_beta_raw_w4k --online-calib --online-window 4000 --online-refit 200 --online-head beta --online-tail raw
+swebench onl_beta_raw_w4k --online-calib --online-window 4000 --online-refit 200 --online-head beta --online-tail raw
+spider onl_beta_raw_w4k --online-calib --online-window 4000 --online-refit 200 --online-head beta --online-tail raw
+tau2 onl_beta_raw_w4k --online-calib --online-window 4000 --online-refit 200 --online-head beta --online-tail raw
+specbench onl_beta_raw_w1k --online-calib --online-window 1000 --online-refit 200 --online-head beta --online-tail raw
+bfcl onl_beta_raw_w1k --online-calib --online-window 1000 --online-refit 200 --online-head beta --online-tail raw
+swebench onl_beta_raw_w1k --online-calib --online-window 1000 --online-refit 200 --online-head beta --online-tail raw
+spider onl_beta_raw_w1k --online-calib --online-window 1000 --online-refit 200 --online-head beta --online-tail raw
+tau2 onl_beta_raw_w1k --online-calib --online-window 1000 --online-refit 200 --online-head beta --online-tail raw
+specbench onl_log_raw_w8k --online-calib --online-window 8000 --online-refit 200 --online-head logistic --online-tail raw
+bfcl onl_log_raw_w8k --online-calib --online-window 8000 --online-refit 200 --online-head logistic --online-tail raw
+swebench onl_log_raw_w8k --online-calib --online-window 8000 --online-refit 200 --online-head logistic --online-tail raw
+spider onl_log_raw_w8k --online-calib --online-window 8000 --online-refit 200 --online-head logistic --online-tail raw
+tau2 onl_log_raw_w8k --online-calib --online-window 8000 --online-refit 200 --online-head logistic --online-tail raw
+specbench onl_log_raw_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head logistic --online-tail raw
+bfcl onl_log_raw_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head logistic --online-tail raw
+swebench onl_log_raw_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head logistic --online-tail raw
+spider onl_log_raw_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head logistic --online-tail raw
+tau2 onl_log_raw_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head logistic --online-tail raw
+specbench onl_log_raw_w4k --online-calib --online-window 4000 --online-refit 200 --online-head logistic --online-tail raw
+bfcl onl_log_raw_w4k --online-calib --online-window 4000 --online-refit 200 --online-head logistic --online-tail raw
+swebench onl_log_raw_w4k --online-calib --online-window 4000 --online-refit 200 --online-head logistic --online-tail raw
+spider onl_log_raw_w4k --online-calib --online-window 4000 --online-refit 200 --online-head logistic --online-tail raw
+tau2 onl_log_raw_w4k --online-calib --online-window 4000 --online-refit 200 --online-head logistic --online-tail raw
+specbench onl_log_raw_w1k --online-calib --online-window 1000 --online-refit 200 --online-head logistic --online-tail raw
+bfcl onl_log_raw_w1k --online-calib --online-window 1000 --online-refit 200 --online-head logistic --online-tail raw
+swebench onl_log_raw_w1k --online-calib --online-window 1000 --online-refit 200 --online-head logistic --online-tail raw
+spider onl_log_raw_w1k --online-calib --online-window 1000 --online-refit 200 --online-head logistic --online-tail raw
+tau2 onl_log_raw_w1k --online-calib --online-window 1000 --online-refit 200 --online-head logistic --online-tail raw
+specbench onl_lin_raw_w8k --online-calib --online-window 8000 --online-refit 200 --online-head linear --online-tail raw
+bfcl onl_lin_raw_w8k --online-calib --online-window 8000 --online-refit 200 --online-head linear --online-tail raw
+swebench onl_lin_raw_w8k --online-calib --online-window 8000 --online-refit 200 --online-head linear --online-tail raw
+spider onl_lin_raw_w8k --online-calib --online-window 8000 --online-refit 200 --online-head linear --online-tail raw
+tau2 onl_lin_raw_w8k --online-calib --online-window 8000 --online-refit 200 --online-head linear --online-tail raw
+specbench onl_lin_raw_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head linear --online-tail raw
+bfcl onl_lin_raw_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head linear --online-tail raw
+swebench onl_lin_raw_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head linear --online-tail raw
+spider onl_lin_raw_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head linear --online-tail raw
+tau2 onl_lin_raw_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head linear --online-tail raw
+specbench onl_lin_raw_w4k --online-calib --online-window 4000 --online-refit 200 --online-head linear --online-tail raw
+bfcl onl_lin_raw_w4k --online-calib --online-window 4000 --online-refit 200 --online-head linear --online-tail raw
+swebench onl_lin_raw_w4k --online-calib --online-window 4000 --online-refit 200 --online-head linear --online-tail raw
+spider onl_lin_raw_w4k --online-calib --online-window 4000 --online-refit 200 --online-head linear --online-tail raw
+tau2 onl_lin_raw_w4k --online-calib --online-window 4000 --online-refit 200 --online-head linear --online-tail raw
+specbench onl_lin_raw_w1k --online-calib --online-window 1000 --online-refit 200 --online-head linear --online-tail raw
+bfcl onl_lin_raw_w1k --online-calib --online-window 1000 --online-refit 200 --online-head linear --online-tail raw
+swebench onl_lin_raw_w1k --online-calib --online-window 1000 --online-refit 200 --online-head linear --online-tail raw
+spider onl_lin_raw_w1k --online-calib --online-window 1000 --online-refit 200 --online-head linear --online-tail raw
+tau2 onl_lin_raw_w1k --online-calib --online-window 1000 --online-refit 200 --online-head linear --online-tail raw
+specbench onl_raw_iso_w8k --online-calib --online-window 8000 --online-refit 200 --online-head raw --online-tail isotonic
+bfcl onl_raw_iso_w8k --online-calib --online-window 8000 --online-refit 200 --online-head raw --online-tail isotonic
+swebench onl_raw_iso_w8k --online-calib --online-window 8000 --online-refit 200 --online-head raw --online-tail isotonic
+spider onl_raw_iso_w8k --online-calib --online-window 8000 --online-refit 200 --online-head raw --online-tail isotonic
+tau2 onl_raw_iso_w8k --online-calib --online-window 8000 --online-refit 200 --online-head raw --online-tail isotonic
+specbench onl_raw_iso_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head raw --online-tail isotonic
+bfcl onl_raw_iso_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head raw --online-tail isotonic
+swebench onl_raw_iso_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head raw --online-tail isotonic
+spider onl_raw_iso_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head raw --online-tail isotonic
+tau2 onl_raw_iso_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head raw --online-tail isotonic
+specbench onl_raw_iso_w4k --online-calib --online-window 4000 --online-refit 200 --online-head raw --online-tail isotonic
+bfcl onl_raw_iso_w4k --online-calib --online-window 4000 --online-refit 200 --online-head raw --online-tail isotonic
+swebench onl_raw_iso_w4k --online-calib --online-window 4000 --online-refit 200 --online-head raw --online-tail isotonic
+spider onl_raw_iso_w4k --online-calib --online-window 4000 --online-refit 200 --online-head raw --online-tail isotonic
+tau2 onl_raw_iso_w4k --online-calib --online-window 4000 --online-refit 200 --online-head raw --online-tail isotonic
+specbench onl_raw_iso_w1k --online-calib --online-window 1000 --online-refit 200 --online-head raw --online-tail isotonic
+bfcl onl_raw_iso_w1k --online-calib --online-window 1000 --online-refit 200 --online-head raw --online-tail isotonic
+swebench onl_raw_iso_w1k --online-calib --online-window 1000 --online-refit 200 --online-head raw --online-tail isotonic
+spider onl_raw_iso_w1k --online-calib --online-window 1000 --online-refit 200 --online-head raw --online-tail isotonic
+tau2 onl_raw_iso_w1k --online-calib --online-window 1000 --online-refit 200 --online-head raw --online-tail isotonic
+specbench onl_raw_lin_w8k --online-calib --online-window 8000 --online-refit 200 --online-head raw --online-tail linear
+bfcl onl_raw_lin_w8k --online-calib --online-window 8000 --online-refit 200 --online-head raw --online-tail linear
+swebench onl_raw_lin_w8k --online-calib --online-window 8000 --online-refit 200 --online-head raw --online-tail linear
+spider onl_raw_lin_w8k --online-calib --online-window 8000 --online-refit 200 --online-head raw --online-tail linear
+tau2 onl_raw_lin_w8k --online-calib --online-window 8000 --online-refit 200 --online-head raw --online-tail linear
+specbench onl_raw_lin_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head raw --online-tail linear
+bfcl onl_raw_lin_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head raw --online-tail linear
+swebench onl_raw_lin_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head raw --online-tail linear
+spider onl_raw_lin_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head raw --online-tail linear
+tau2 onl_raw_lin_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head raw --online-tail linear
+specbench onl_raw_lin_w4k --online-calib --online-window 4000 --online-refit 200 --online-head raw --online-tail linear
+bfcl onl_raw_lin_w4k --online-calib --online-window 4000 --online-refit 200 --online-head raw --online-tail linear
+swebench onl_raw_lin_w4k --online-calib --online-window 4000 --online-refit 200 --online-head raw --online-tail linear
+spider onl_raw_lin_w4k --online-calib --online-window 4000 --online-refit 200 --online-head raw --online-tail linear
+tau2 onl_raw_lin_w4k --online-calib --online-window 4000 --online-refit 200 --online-head raw --online-tail linear
+specbench onl_raw_lin_w1k --online-calib --online-window 1000 --online-refit 200 --online-head raw --online-tail linear
+bfcl onl_raw_lin_w1k --online-calib --online-window 1000 --online-refit 200 --online-head raw --online-tail linear
+swebench onl_raw_lin_w1k --online-calib --online-window 1000 --online-refit 200 --online-head raw --online-tail linear
+spider onl_raw_lin_w1k --online-calib --online-window 1000 --online-refit 200 --online-head raw --online-tail linear
+tau2 onl_raw_lin_w1k --online-calib --online-window 1000 --online-refit 200 --online-head raw --online-tail linear
+specbench onl_beta_iso_w8k --online-calib --online-window 8000 --online-refit 200 --online-head beta --online-tail isotonic
+bfcl onl_beta_iso_w8k --online-calib --online-window 8000 --online-refit 200 --online-head beta --online-tail isotonic
+swebench onl_beta_iso_w8k --online-calib --online-window 8000 --online-refit 200 --online-head beta --online-tail isotonic
+spider onl_beta_iso_w8k --online-calib --online-window 8000 --online-refit 200 --online-head beta --online-tail isotonic
+tau2 onl_beta_iso_w8k --online-calib --online-window 8000 --online-refit 200 --online-head beta --online-tail isotonic
+specbench onl_beta_iso_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head beta --online-tail isotonic
+bfcl onl_beta_iso_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head beta --online-tail isotonic
+swebench onl_beta_iso_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head beta --online-tail isotonic
+spider onl_beta_iso_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head beta --online-tail isotonic
+tau2 onl_beta_iso_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head beta --online-tail isotonic
+specbench onl_beta_lin_w8k --online-calib --online-window 8000 --online-refit 200 --online-head beta --online-tail linear
+bfcl onl_beta_lin_w8k --online-calib --online-window 8000 --online-refit 200 --online-head beta --online-tail linear
+swebench onl_beta_lin_w8k --online-calib --online-window 8000 --online-refit 200 --online-head beta --online-tail linear
+spider onl_beta_lin_w8k --online-calib --online-window 8000 --online-refit 200 --online-head beta --online-tail linear
+tau2 onl_beta_lin_w8k --online-calib --online-window 8000 --online-refit 200 --online-head beta --online-tail linear
+specbench onl_beta_lin_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head beta --online-tail linear
+bfcl onl_beta_lin_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head beta --online-tail linear
+swebench onl_beta_lin_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head beta --online-tail linear
+spider onl_beta_lin_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head beta --online-tail linear
+tau2 onl_beta_lin_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head beta --online-tail linear
+specbench onl_log_iso_w8k --online-calib --online-window 8000 --online-refit 200 --online-head logistic --online-tail isotonic
+bfcl onl_log_iso_w8k --online-calib --online-window 8000 --online-refit 200 --online-head logistic --online-tail isotonic
+swebench onl_log_iso_w8k --online-calib --online-window 8000 --online-refit 200 --online-head logistic --online-tail isotonic
+spider onl_log_iso_w8k --online-calib --online-window 8000 --online-refit 200 --online-head logistic --online-tail isotonic
+tau2 onl_log_iso_w8k --online-calib --online-window 8000 --online-refit 200 --online-head logistic --online-tail isotonic
+specbench onl_log_iso_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head logistic --online-tail isotonic
+bfcl onl_log_iso_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head logistic --online-tail isotonic
+swebench onl_log_iso_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head logistic --online-tail isotonic
+spider onl_log_iso_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head logistic --online-tail isotonic
+tau2 onl_log_iso_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head logistic --online-tail isotonic
+specbench onl_log_lin_w8k --online-calib --online-window 8000 --online-refit 200 --online-head logistic --online-tail linear
+bfcl onl_log_lin_w8k --online-calib --online-window 8000 --online-refit 200 --online-head logistic --online-tail linear
+swebench onl_log_lin_w8k --online-calib --online-window 8000 --online-refit 200 --online-head logistic --online-tail linear
+spider onl_log_lin_w8k --online-calib --online-window 8000 --online-refit 200 --online-head logistic --online-tail linear
+tau2 onl_log_lin_w8k --online-calib --online-window 8000 --online-refit 200 --online-head logistic --online-tail linear
+specbench onl_log_lin_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head logistic --online-tail linear
+bfcl onl_log_lin_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head logistic --online-tail linear
+swebench onl_log_lin_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head logistic --online-tail linear
+spider onl_log_lin_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head logistic --online-tail linear
+tau2 onl_log_lin_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head logistic --online-tail linear
+specbench onl_lin_iso_w8k --online-calib --online-window 8000 --online-refit 200 --online-head linear --online-tail isotonic
+bfcl onl_lin_iso_w8k --online-calib --online-window 8000 --online-refit 200 --online-head linear --online-tail isotonic
+swebench onl_lin_iso_w8k --online-calib --online-window 8000 --online-refit 200 --online-head linear --online-tail isotonic
+spider onl_lin_iso_w8k --online-calib --online-window 8000 --online-refit 200 --online-head linear --online-tail isotonic
+tau2 onl_lin_iso_w8k --online-calib --online-window 8000 --online-refit 200 --online-head linear --online-tail isotonic
+specbench onl_lin_iso_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head linear --online-tail isotonic
+bfcl onl_lin_iso_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head linear --online-tail isotonic
+swebench onl_lin_iso_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head linear --online-tail isotonic
+spider onl_lin_iso_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head linear --online-tail isotonic
+tau2 onl_lin_iso_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head linear --online-tail isotonic
+specbench onl_lin_lin_w8k --online-calib --online-window 8000 --online-refit 200 --online-head linear --online-tail linear
+bfcl onl_lin_lin_w8k --online-calib --online-window 8000 --online-refit 200 --online-head linear --online-tail linear
+swebench onl_lin_lin_w8k --online-calib --online-window 8000 --online-refit 200 --online-head linear --online-tail linear
+spider onl_lin_lin_w8k --online-calib --online-window 8000 --online-refit 200 --online-head linear --online-tail linear
+tau2 onl_lin_lin_w8k --online-calib --online-window 8000 --online-refit 200 --online-head linear --online-tail linear
+specbench onl_lin_lin_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head linear --online-tail linear
+bfcl onl_lin_lin_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head linear --online-tail linear
+swebench onl_lin_lin_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head linear --online-tail linear
+spider onl_lin_lin_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head linear --online-tail linear
+tau2 onl_lin_lin_wcum --online-calib --online-window 100000000 --online-refit 200 --online-head linear --online-tail linear
+specbench onl_beta_iso_w4k --online-calib --online-window 4000 --online-refit 200 --online-head beta --online-tail isotonic
+bfcl onl_beta_iso_w4k --online-calib --online-window 4000 --online-refit 200 --online-head beta --online-tail isotonic
+swebench onl_beta_iso_w4k --online-calib --online-window 4000 --online-refit 200 --online-head beta --online-tail isotonic
+spider onl_beta_iso_w4k --online-calib --online-window 4000 --online-refit 200 --online-head beta --online-tail isotonic
+tau2 onl_beta_iso_w4k --online-calib --online-window 4000 --online-refit 200 --online-head beta --online-tail isotonic
+specbench onl_beta_iso_w1k --online-calib --online-window 1000 --online-refit 200 --online-head beta --online-tail isotonic
+bfcl onl_beta_iso_w1k --online-calib --online-window 1000 --online-refit 200 --online-head beta --online-tail isotonic
+swebench onl_beta_iso_w1k --online-calib --online-window 1000 --online-refit 200 --online-head beta --online-tail isotonic
+spider onl_beta_iso_w1k --online-calib --online-window 1000 --online-refit 200 --online-head beta --online-tail isotonic
+tau2 onl_beta_iso_w1k --online-calib --online-window 1000 --online-refit 200 --online-head beta --online-tail isotonic
+specbench onl_beta_lin_w4k --online-calib --online-window 4000 --online-refit 200 --online-head beta --online-tail linear
+bfcl onl_beta_lin_w4k --online-calib --online-window 4000 --online-refit 200 --online-head beta --online-tail linear
+swebench onl_beta_lin_w4k --online-calib --online-window 4000 --online-refit 200 --online-head beta --online-tail linear
+spider onl_beta_lin_w4k --online-calib --online-window 4000 --online-refit 200 --online-head beta --online-tail linear
+tau2 onl_beta_lin_w4k --online-calib --online-window 4000 --online-refit 200 --online-head beta --online-tail linear
+specbench onl_beta_lin_w1k --online-calib --online-window 1000 --online-refit 200 --online-head beta --online-tail linear
+bfcl onl_beta_lin_w1k --online-calib --online-window 1000 --online-refit 200 --online-head beta --online-tail linear
+swebench onl_beta_lin_w1k --online-calib --online-window 1000 --online-refit 200 --online-head beta --online-tail linear
+spider onl_beta_lin_w1k --online-calib --online-window 1000 --online-refit 200 --online-head beta --online-tail linear
+tau2 onl_beta_lin_w1k --online-calib --online-window 1000 --online-refit 200 --online-head beta --online-tail linear
+specbench onl_log_iso_w4k --online-calib --online-window 4000 --online-refit 200 --online-head logistic --online-tail isotonic
+bfcl onl_log_iso_w4k --online-calib --online-window 4000 --online-refit 200 --online-head logistic --online-tail isotonic
+swebench onl_log_iso_w4k --online-calib --online-window 4000 --online-refit 200 --online-head logistic --online-tail isotonic
+spider onl_log_iso_w4k --online-calib --online-window 4000 --online-refit 200 --online-head logistic --online-tail isotonic
+tau2 onl_log_iso_w4k --online-calib --online-window 4000 --online-refit 200 --online-head logistic --online-tail isotonic
+specbench onl_log_iso_w1k --online-calib --online-window 1000 --online-refit 200 --online-head logistic --online-tail isotonic
+bfcl onl_log_iso_w1k --online-calib --online-window 1000 --online-refit 200 --online-head logistic --online-tail isotonic
+swebench onl_log_iso_w1k --online-calib --online-window 1000 --online-refit 200 --online-head logistic --online-tail isotonic
+spider onl_log_iso_w1k --online-calib --online-window 1000 --online-refit 200 --online-head logistic --online-tail isotonic
+tau2 onl_log_iso_w1k --online-calib --online-window 1000 --online-refit 200 --online-head logistic --online-tail isotonic
+specbench onl_log_lin_w4k --online-calib --online-window 4000 --online-refit 200 --online-head logistic --online-tail linear
+bfcl onl_log_lin_w4k --online-calib --online-window 4000 --online-refit 200 --online-head logistic --online-tail linear
+swebench onl_log_lin_w4k --online-calib --online-window 4000 --online-refit 200 --online-head logistic --online-tail linear
+spider onl_log_lin_w4k --online-calib --online-window 4000 --online-refit 200 --online-head logistic --online-tail linear
+tau2 onl_log_lin_w4k --online-calib --online-window 4000 --online-refit 200 --online-head logistic --online-tail linear
+specbench onl_log_lin_w1k --online-calib --online-window 1000 --online-refit 200 --online-head logistic --online-tail linear
+bfcl onl_log_lin_w1k --online-calib --online-window 1000 --online-refit 200 --online-head logistic --online-tail linear
+swebench onl_log_lin_w1k --online-calib --online-window 1000 --online-refit 200 --online-head logistic --online-tail linear
+spider onl_log_lin_w1k --online-calib --online-window 1000 --online-refit 200 --online-head logistic --online-tail linear
+tau2 onl_log_lin_w1k --online-calib --online-window 1000 --online-refit 200 --online-head logistic --online-tail linear
+specbench onl_lin_iso_w4k --online-calib --online-window 4000 --online-refit 200 --online-head linear --online-tail isotonic
+bfcl onl_lin_iso_w4k --online-calib --online-window 4000 --online-refit 200 --online-head linear --online-tail isotonic
+swebench onl_lin_iso_w4k --online-calib --online-window 4000 --online-refit 200 --online-head linear --online-tail isotonic
+spider onl_lin_iso_w4k --online-calib --online-window 4000 --online-refit 200 --online-head linear --online-tail isotonic
+tau2 onl_lin_iso_w4k --online-calib --online-window 4000 --online-refit 200 --online-head linear --online-tail isotonic
+specbench onl_lin_iso_w1k --online-calib --online-window 1000 --online-refit 200 --online-head linear --online-tail isotonic
+bfcl onl_lin_iso_w1k --online-calib --online-window 1000 --online-refit 200 --online-head linear --online-tail isotonic
+swebench onl_lin_iso_w1k --online-calib --online-window 1000 --online-refit 200 --online-head linear --online-tail isotonic
+spider onl_lin_iso_w1k --online-calib --online-window 1000 --online-refit 200 --online-head linear --online-tail isotonic
+tau2 onl_lin_iso_w1k --online-calib --online-window 1000 --online-refit 200 --online-head linear --online-tail isotonic
+specbench onl_lin_lin_w4k --online-calib --online-window 4000 --online-refit 200 --online-head linear --online-tail linear
+bfcl onl_lin_lin_w4k --online-calib --online-window 4000 --online-refit 200 --online-head linear --online-tail linear
+swebench onl_lin_lin_w4k --online-calib --online-window 4000 --online-refit 200 --online-head linear --online-tail linear
+spider onl_lin_lin_w4k --online-calib --online-window 4000 --online-refit 200 --online-head linear --online-tail linear
+tau2 onl_lin_lin_w4k --online-calib --online-window 4000 --online-refit 200 --online-head linear --online-tail linear
+specbench onl_lin_lin_w1k --online-calib --online-window 1000 --online-refit 200 --online-head linear --online-tail linear
+bfcl onl_lin_lin_w1k --online-calib --online-window 1000 --online-refit 200 --online-head linear --online-tail linear
+swebench onl_lin_lin_w1k --online-calib --online-window 1000 --online-refit 200 --online-head linear --online-tail linear
+spider onl_lin_lin_w1k --online-calib --online-window 1000 --online-refit 200 --online-head linear --online-tail linear
+tau2 onl_lin_lin_w1k --online-calib --online-window 1000 --online-refit 200 --online-head linear --online-tail linear

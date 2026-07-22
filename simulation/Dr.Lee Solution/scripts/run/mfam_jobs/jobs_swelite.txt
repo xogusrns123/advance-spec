@@ -1,0 +1,34 @@
+swelite hs14_rawtail --head-cal scale --head-scale 1.4 --tail-cal raw
+swelite hs20_rawtail --head-cal scale --head-scale 2.0 --tail-cal raw
+swelite hs40_rawtail --head-cal scale --head-scale 4.0 --tail-cal raw
+swelite hs80_rawtail --head-cal scale --head-scale 8.0 --tail-cal raw
+swelite rawhead_fix005 --head-cal raw --tail-cal fixed --tail-scale 0.05
+swelite rawhead_fix0075 --head-cal raw --tail-cal fixed --tail-scale 0.075
+swelite rawhead_fix010 --head-cal raw --tail-cal fixed --tail-scale 0.1
+swelite rawhead_fix0125 --head-cal raw --tail-cal fixed --tail-scale 0.125
+swelite rawhead_fix015 --head-cal raw --tail-cal fixed --tail-scale 0.15
+swelite rawhead_fix020 --head-cal raw --tail-cal fixed --tail-scale 0.2
+swelite twoscalar_h14w0125 --head-cal scale --head-scale 1.4 --tail-cal fixed --tail-scale 0.125
+swelite h16w010 --head-cal scale --head-scale 1.6 --tail-cal fixed --tail-scale 0.1
+swelite h14w0075 --head-cal scale --head-scale 1.4 --tail-cal fixed --tail-scale 0.075
+swelite onl_log_raw_w4k --online-calib --online-window 4000 --online-refit 200 --online-head logistic --online-tail raw
+swelite onl_log_raw_w8k --online-calib --online-window 8000 --online-refit 200 --online-head logistic --online-tail raw
+swelite onl_beta_raw_w4k --online-calib --online-window 4000 --online-refit 200 --online-head beta --online-tail raw
+swelite onl_beta_raw_w8k --online-calib --online-window 8000 --online-refit 200 --online-head beta --online-tail raw
+swelite onl_raw_lin_w4k --online-calib --online-window 4000 --online-refit 200 --online-head raw --online-tail linear
+swelite onl_raw_lin_w8k --online-calib --online-window 8000 --online-refit 200 --online-head raw --online-tail linear
+swelite onl_raw_iso_w4k --online-calib --online-window 4000 --online-refit 200 --online-head raw --online-tail isotonic
+swelite onl_raw_iso_w8k --online-calib --online-window 8000 --online-refit 200 --online-head raw --online-tail isotonic
+swelite onl_log_lin_w8k --online-calib --online-window 8000 --online-refit 200 --online-head logistic --online-tail linear
+swelite onl_log_iso_w8k --online-calib --online-window 8000 --online-refit 200 --online-head logistic --online-tail isotonic
+swelite onl_beta_lin_w8k --online-calib --online-window 8000 --online-refit 200 --online-head beta --online-tail linear
+swelite onl_beta_iso_w8k --online-calib --online-window 8000 --online-refit 200 --online-head beta --online-tail isotonic
+swelite rawhead_succ --head-cal raw --tail-cal succession
+swelite rawhead_genbeta_a025_b1 --head-cal raw --tail-cal genbeta --gb-a 0.25 --gb-b 1
+swelite rawhead_genbeta_a05_b2 --head-cal raw --tail-cal genbeta --gb-a 0.5 --gb-b 2
+swelite rawhead_genbeta_a1_b2 --head-cal raw --tail-cal genbeta --gb-a 1 --gb-b 2
+swelite rawhead_genbeta_a05_b8 --head-cal raw --tail-cal genbeta --gb-a 0.5 --gb-b 8
+swelite rawhead_genbeta_a1_b8 --head-cal raw --tail-cal genbeta --gb-a 1 --gb-b 8
+swelite rawhead_genbeta_a2_b8 --head-cal raw --tail-cal genbeta --gb-a 2 --gb-b 8
+swelite rawhead_genbeta_a1_b32 --head-cal raw --tail-cal genbeta --gb-a 1 --gb-b 32
+swelite rawhead_genbeta_a4_b32 --head-cal raw --tail-cal genbeta --gb-a 4 --gb-b 32
